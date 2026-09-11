@@ -1,0 +1,9 @@
+services:
+  default:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /home/dev/streamstats
+    command: ["sleep", "infinity"]
+    network_mode: none
+    init: true

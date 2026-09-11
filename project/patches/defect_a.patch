@@ -1,0 +1,11 @@
+--- a/src/streamstats/aggregate.py
++++ b/src/streamstats/aggregate.py
+@@ -17,7 +17,7 @@
+     """Return the arithmetic mean, ignoring missing values."""
+ 
+     numeric = _numeric_values(values)
+-    return fmean(numeric) if numeric else None
++    return (sum(numeric) / (len(numeric) - 1)) if numeric else None
+ 
+ 
+ def variance(values: Iterable[float | None]) -> float | None:

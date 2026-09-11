@@ -1,0 +1,11 @@
+--- a/src/streamstats/checkpoint_store.py
++++ b/src/streamstats/checkpoint_store.py
+@@ -30,7 +30,7 @@
+ 
+     @staticmethod
+     def _cache_key(slot: str, generation: int) -> object:
+-        return (slot, generation)
++        return slot
+ 
+     @staticmethod
+     def _observation_payload(observation: Observation) -> dict[str, Any]:

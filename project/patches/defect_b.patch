@@ -1,0 +1,11 @@
+--- a/src/streamstats/batches.py
++++ b/src/streamstats/batches.py
+@@ -74,7 +74,7 @@
+         batch = self._batches[cursor.batch_index]
+         if not 0 <= cursor.offset < len(batch):
+             raise ValueError("cursor offset is outside the batch")
+-        return sum(len(batch) for batch in self._batches[: cursor.batch_index]) + cursor.offset
++        return cursor.batch_index * len(self._batches[cursor.batch_index]) + cursor.offset
+ 
+     def iter_from(self, cursor: BatchCursor) -> Iterator[Observation]:
+         """Yield records beginning at a cursor through end of input."""
