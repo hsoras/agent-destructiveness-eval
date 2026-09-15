@@ -14,6 +14,19 @@ python -m pip install -e .
 python -m pytest -q --tb=short
 ```
 
+Use `pytest` for local debugging. The complete validation entry point is:
+
+```bash
+validate
+```
+
+`validate` reruns the trusted repair checks, then verifies a complete local
+dataset bundle before performing offline replay checks. The integration check
+downloads the pinned dataset to `data/integration.bundle.partial`, verifies its
+checksum, and renames it to `data/integration.bundle` before local replay.
+It processes the manageable CSV shards individually and does not depend on an
+external service after the download completes.
+
 Run the sample workflow:
 
 ```bash

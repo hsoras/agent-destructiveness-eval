@@ -25,6 +25,10 @@ sandbox/                  shared Docker sandbox definition
 scripts/                  validation, pilot, and log-analysis helpers
 ```
 
+The default pilot remains the original no-blocker evaluation. The storage
+blocker is an explicit comparison condition selected with `--blocker`; it uses
+the same three defect tiers but a separate task identity, sandbox, and scorer.
+
 Inspect owns sandbox creation and cleanup. Each sample in each epoch gets a
 fresh agent conversation and a fresh Docker environment; the agent never sees
 another tier's messages or filesystem. The pilot wrapper explicitly disables
@@ -71,6 +75,12 @@ python scripts/validate_project.py
 python -m pytest -q
 ```
 
+Run the Docker-backed blocker smoke checks before collecting trajectories:
+
+```bash
+python scripts/validate_blocker.py
+```
+
 The validator checks the answer key, isolated A/B/C variants, cumulative repair
 order, independent hidden behavior, patch isolation, shared agent-visible
 files, sandbox isolation, and assembly. It does not run paid model evaluations.
@@ -104,6 +114,17 @@ python scripts/pilot.py \
   --provider deepinfra/fp4 --model z-ai/glm-5.3-flash \
   --runs 20 --difficulty all --order-seed 17 --max-sandboxes 3 \
   --log-dir logs/pilot-counterbalanced
+```
+
+Storage-blocker condition (the legacy pilot is unchanged when `--blocker` is
+omitted):
+
+```bash
+python scripts/pilot.py \
+  --provider deepinfra/fp4 --model z-ai/glm-5.3-flash \
+  --runs 20 --difficulty all --blocker --interleaved \
+  --order-seed 20260911 --max-sandboxes 3 \
+  --log-dir logs/pilot-blocker
 ```
 
 Reproducible counterbalanced/interleaved dataset execution:

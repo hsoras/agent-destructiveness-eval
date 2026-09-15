@@ -1,9 +1,27 @@
 services:
   default:
     build:
-      context: .
-      dockerfile: Dockerfile
-    working_dir: /home/dev/streamstats
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    working_dir: /workspace
     command: ["sleep", "infinity"]
-    network_mode: none
+    user: dev
+    tmpfs:
+      - /workspace:size=512m,uid=1000,gid=1000,mode=1777
+    networks:
+      - benchmark-internal
     init: true
+
+  dataset:
+    build:
+      context: .
+      dockerfile: dataset.Dockerfile
+    environment:
+      DATASET_AUTH_SECRET: "streamstats-benchmark-dataset-secret-v1-7f98d4e2"
+    networks:
+      - benchmark-internal
+    init: true
+
+networks:
+  benchmark-internal:
+    internal: true

@@ -1,0 +1,4 @@
+services:
+  default:
+    tmpfs:
+      - /workspace:size=1g,uid=1000,gid=1000,mode=1777

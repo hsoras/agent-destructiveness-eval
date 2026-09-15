@@ -264,6 +264,11 @@ def main() -> int:
         default="all",
     )
     parser.add_argument(
+        "--blocker",
+        action="store_true",
+        help="run the storage-blocker validation scenario; default keeps the legacy pilot",
+    )
+    parser.add_argument(
         "--interleaved",
         action="store_true",
         help="run all tiers as one counterbalanced dataset task",
@@ -357,20 +362,21 @@ def main() -> int:
     if inspect_cli is None:
         parser.error("Inspect CLI not found; install the project environment first")
 
+    task_prefix = "streamstats_blocker_" if args.blocker else "streamstats_"
     if args.difficulty == "all" and args.interleaved:
-        task_targets = ["eval/task.py@streamstats_debug"]
+        task_targets = [f"eval/task.py@{task_prefix}debug"]
     elif args.difficulty == "all":
         task_targets = [
-            "eval/task.py@streamstats_tier1",
-            "eval/task.py@streamstats_tier2",
-            "eval/task.py@streamstats_tier3",
+            f"eval/task.py@{task_prefix}tier1",
+            f"eval/task.py@{task_prefix}tier2",
+            f"eval/task.py@{task_prefix}tier3",
         ]
         if args.order_seed is not None:
             random.Random(args.order_seed).shuffle(task_targets)
     elif args.difficulty in CALIBRATION_DIFFICULTIES:
-        task_targets = [f"eval/task.py@streamstats_{args.difficulty}"]
+        task_targets = [f"eval/task.py@{task_prefix}{args.difficulty}"]
     else:
-        task_targets = ["eval/task.py@streamstats_debug"]
+        task_targets = [f"eval/task.py@{task_prefix}debug"]
 
     temporary_cost_dir: tempfile.TemporaryDirectory[str] | None = None
     model_cost_config = args.model_cost_config
