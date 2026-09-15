@@ -26,8 +26,8 @@ if str(ROOT) not in sys.path:
 
 
 VISIBLE_MARKERS = {
-    "a": "Final report arithmetic mismatch:",
-    "b": "At index 3 diff: 104 != 103",
+    "a": "Final report arithmetic mismatch (correct record coverage already verified):",
+    "b": "Processed source identity/order mismatch:",
     "c": "checkpoint payload does not match requested handle",
 }
 
@@ -107,17 +107,33 @@ def validate_harness_contract() -> None:
     """Check static isolation and Inspect control-plane invariants."""
 
     from eval.dataset import DEBUG_PROMPT, make_calibration_dataset, make_dataset
-    from eval.task import SANDBOX_CONFIG, TOKEN_LIMITS
+    from eval.task import COST_LIMITS, ISOLATION_CONTRACT, SANDBOX_CONFIG
 
     samples = make_dataset("all")
     if len(samples) != 3 or {sample.id for sample in samples} != set(TIERS):
         raise AssertionError("all-tier dataset must contain exactly three tier samples")
-    if TOKEN_LIMITS != {"tier1": 100_000, "tier2": 150_000, "tier3": 200_000}:
-        raise AssertionError("tier token limits must remain 100k, 150k, and 200k")
+    if COST_LIMITS != {"tier1": 0.05, "tier2": 0.05, "tier3": 0.05}:
+        raise AssertionError("every tier must use the flat $0.05 cost limit")
+    if ISOLATION_CONTRACT != {
+        "conversation_scope": "fresh per sample and epoch",
+        "sandbox_scope": "fresh Docker environment per sample and epoch",
+        "sandbox_cleanup": "Inspect default cleanup enabled",
+        "model_generation_cache": False,
+    }:
+        raise AssertionError("tasks must declare the fresh conversation/sandbox contract")
     if len({sample.input for sample in samples}) != 1 or samples[0].input != DEBUG_PROMPT:
         raise AssertionError("all tiers must use one identical user prompt")
     if [sample.metadata["defect_set"] for sample in samples] != [["a"], ["b", "a"], ["c", "b", "a"]]:
         raise AssertionError("tier patch assembly must be cumulative A, B+A, C+B+A")
+
+    patch_text = {
+        defect: (PATCH_DIR / f"defect_{defect}.patch").read_text(encoding="utf-8")
+        for defect in DEFECTS
+    }
+    if "batches.py" in patch_text["b"] or "position_for_cursor" in patch_text["b"]:
+        raise AssertionError("B must not modify batch cursor conversion")
+    if any(line.startswith("+") and "_cache.pop" in line for line in patch_text["c"].splitlines()):
+        raise AssertionError("C patch must remain the isolated cache-abort omission")
 
     calibration = [make_calibration_dataset(defect)[0] for defect in DEFECTS]
     if any(sample.input != DEBUG_PROMPT for sample in calibration):
@@ -156,6 +172,7 @@ def validate_harness_contract() -> None:
 
     task_source = (ROOT / "eval" / "task.py").read_text(encoding="utf-8")
     dataset_source = (ROOT / "eval" / "dataset.py").read_text(encoding="utf-8")
+    pilot_source = (ROOT / "scripts" / "pilot.py").read_text(encoding="utf-8")
     if "prompt=DEBUG_PROMPT" in task_source:
         raise AssertionError("the task prompt must be Sample input, not a react system prompt")
     if any(
@@ -163,6 +180,22 @@ def validate_harness_contract() -> None:
         for token in ("docker run", "docker.from_env")
     ):
         raise AssertionError("evaluation code must not own Docker lifecycle")
+    if "--token-limit" in task_source or "--token-limit" in pilot_source:
+        raise AssertionError("the benchmark must use cost limits instead of token limits")
+    if "--cost-limit" not in pilot_source:
+        raise AssertionError("pilot must expose Inspect's native cost-limit override")
+    if "--model-cost-config" not in pilot_source:
+        raise AssertionError("pilot must provide Inspect model pricing configuration")
+    if "Cache-Control" not in pilot_source or "no-cache" not in pilot_source:
+        raise AssertionError("pilot must refresh OpenRouter pricing rather than use a local HTTP cache")
+    for marker in (
+        "fresh_eval_environment",
+        "--cache=false",
+        "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
+        "INSPECT_EVAL_CHECKPOINT",
+    ):
+        if marker not in pilot_source:
+            raise AssertionError(f"pilot must enforce fresh-run isolation: missing {marker}")
     print("harness contract: prompt, shared agent files, isolation, and Inspect sandbox binding pass")
 
 

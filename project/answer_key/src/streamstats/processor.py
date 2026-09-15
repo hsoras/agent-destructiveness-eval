@@ -25,6 +25,8 @@ class StreamProcessor:
         self._window = RollingWindow(window_seconds)
         self._next_index = 0
         self._processed: list[Observation] = []
+        self._processed_source_ids: set[int] = set()
+        self._timestamp_watermark: int | None = None
 
     @property
     def next_index(self) -> int:
@@ -38,14 +40,34 @@ class StreamProcessor:
     def processed(self) -> tuple[Observation, ...]:
         return tuple(self._processed)
 
+    @property
+    def processed_source_ids(self) -> tuple[int, ...]:
+        return tuple(observation.source_id for observation in self._processed)
+
+    def _record(self, observation: Observation) -> None:
+        if observation.source_id is None:
+            raise ValueError("source records must have a stable source_id")
+        self._window.add(observation)
+        self._processed.append(observation)
+        self._processed_source_ids.add(observation.source_id)
+        self._timestamp_watermark = (
+            observation.timestamp
+            if self._timestamp_watermark is None
+            else max(self._timestamp_watermark, observation.timestamp)
+        )
+
+    def _is_replay_duplicate(self, observation: Observation) -> bool:
+        """Return whether this source identity has already been accepted."""
+        if observation.source_id is None:
+            raise ValueError("replayed records must have a stable source_id")
+        return observation.source_id in self._processed_source_ids
     def process_next(self) -> bool:
         """Process the next source record, returning false at end of input."""
 
         if self._next_index >= len(self._source):
             return False
         observation = self._source[self._next_index]
-        self._window.add(observation)
-        self._processed.append(observation)
+        self._record(observation)
         self._next_index += 1
         return True
 
@@ -62,6 +84,24 @@ class StreamProcessor:
 
         while self.process_next():
             pass
+
+    def process_replay_page(self, page: Iterable[Observation]) -> tuple[Observation, ...]:
+        """Accept a replay page, suppressing only identities already processed."""
+
+        accepted: list[Observation] = []
+        for observation in page:
+            if self._is_replay_duplicate(observation):
+                continue
+            self._record(observation)
+            accepted.append(observation)
+        return tuple(accepted)
+
+    def process_replay_remaining(self, *, page_size: int | None = None) -> None:
+        """Replay from the current cursor with the source's overlap boundary."""
+
+        for page in self._source.iter_replay_pages(self.cursor, page_size=page_size):
+            self.process_replay_page(page)
+        self._next_index = len(self._source)
 
     def capture_checkpoint(self) -> Checkpoint:
         """Capture the current processor state for a later resume."""
@@ -97,6 +137,18 @@ class StreamProcessor:
 
         self._processed = list(checkpoint.processed_records)
         self._window.restore(checkpoint.window_records)
+        self._processed_source_ids = {
+            observation.source_id
+            for observation in self._processed
+            if observation.source_id is not None
+        }
+        if len(self._processed_source_ids) != len(self._processed):
+            raise CheckpointError("checkpoint records do not have stable source identities")
+        self._timestamp_watermark = (
+            max(observation.timestamp for observation in self._processed)
+            if self._processed
+            else None
+        )
         self._next_index = next_index
 
     def report(self) -> WindowStats:

@@ -8,10 +8,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import shlex
 import shutil
 import subprocess
+import tempfile
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+
+CALIBRATION_DIFFICULTIES = ("calibration_a", "calibration_b", "calibration_c")
+ISOLATION_ENV_OVERRIDES = (
+    "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
+    "INSPECT_EVAL_CHECKPOINT",
+)
+
+def fresh_eval_environment(
+    base_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return an eval environment that cannot inherit cross-run state settings."""
+
+    environment = dict(os.environ if base_environment is None else base_environment)
+    for variable in ISOLATION_ENV_OVERRIDES:
+        environment.pop(variable, None)
+    # Inspect's generation cache is distinct from provider prompt caching. The
+    # former can replay a previous answer, so it is disabled for every pilot.
+    environment["INSPECT_EVAL_CACHE"] = "false"
+    return environment
 
 
 def qualify_model(model: str, provider: str | None) -> str:
@@ -80,6 +106,121 @@ def openrouter_privacy_arg() -> str:
     )
 
 
+def _openrouter_model_id(model: str) -> str:
+    """Return the OpenRouter catalog id without Inspect's provider prefix."""
+
+    return model.strip().removeprefix("openrouter/")
+
+
+def _openrouter_provider_name(provider: str) -> str:
+    """Return the upstream name from PROVIDER or PROVIDER/QUANTIZATION."""
+
+    return provider.strip().split("/", 1)[0]
+
+
+def _model_cost_from_catalog(pricing: Mapping[str, object]) -> dict[str, float]:
+    """Convert OpenRouter's per-token pricing object to Inspect's $/million form."""
+
+    try:
+        input_price = float(pricing["prompt"])
+        output_price = float(pricing["completion"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("OpenRouter returned incomplete model pricing data") from exc
+
+    def optional_price(name: str) -> float:
+        raw = pricing.get(name, "0")
+        try:
+            return float(raw) * 1_000_000
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"OpenRouter returned invalid {name} pricing") from exc
+
+    values = {
+        "input": input_price * 1_000_000,
+        "output": output_price * 1_000_000,
+        "input_cache_write": optional_price("input_cache_write"),
+        "input_cache_read": optional_price("input_cache_read"),
+    }
+    if any(value < 0 for value in values.values()):
+        raise ValueError("OpenRouter returned negative model pricing")
+    return values
+
+
+def fetch_openrouter_model_cost(
+    model: str,
+    *,
+    opener: Callable[..., object] = urlopen,
+    timeout: int = 10,
+) -> dict[str, float]:
+    """Fetch fallback model pricing from OpenRouter's public model API."""
+
+    model_id = _openrouter_model_id(model)
+    try:
+        author, slug = model_id.split("/", 1)
+    except ValueError as exc:
+        raise ValueError(
+            f"OpenRouter model must look like author/slug, got {model_id!r}"
+        ) from exc
+    url = (
+        "https://openrouter.ai/api/v1/model/"
+        f"{quote(author, safe='')}/{quote(slug, safe=':')}"
+    )
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+            "User-Agent": "streamstats-inspect-eval/0.1",
+        },
+    )
+    try:
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"could not retrieve pricing for OpenRouter model {model_id!r}; "
+            "pass --model-cost-config with a local pricing snapshot"
+        ) from exc
+
+    try:
+        pricing = payload["data"]["pricing"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"OpenRouter returned no pricing for model {model_id!r}; "
+            "pass --model-cost-config with a local pricing snapshot"
+        ) from exc
+    if not isinstance(pricing, Mapping):
+        raise ValueError("OpenRouter returned an invalid model pricing object")
+    return _model_cost_from_catalog(pricing)
+
+
+def openrouter_model_cost(
+    model: str,
+    provider: str | None,
+    *,
+    fetcher: Callable[[str], dict[str, float]] | None = None,
+) -> tuple[dict[str, float], str]:
+    """Refresh a cost table for an OpenRouter model and describe its source."""
+
+    resolver = fetcher or fetch_openrouter_model_cost
+    cost = resolver(model)
+    provider_note = (
+        f" for pinned route {_openrouter_provider_name(provider)}"
+        if provider
+        else ""
+    )
+    return cost, f"fresh OpenRouter public model catalog lookup{provider_note}"
+
+
+def write_model_cost_config(
+    path: Path,
+    model: str,
+    cost: Mapping[str, float],
+) -> None:
+    """Write the JSON shape accepted by Inspect's --model-cost-config."""
+
+    path.write_text(json.dumps({model: dict(cost)}, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -119,8 +260,13 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=1, help="independent epochs per tier")
     parser.add_argument(
         "--difficulty",
-        choices=("tier1", "tier2", "tier3", "all"),
+        choices=("tier1", "tier2", "tier3", "all", *CALIBRATION_DIFFICULTIES),
         default="all",
+    )
+    parser.add_argument(
+        "--interleaved",
+        action="store_true",
+        help="run all tiers as one counterbalanced dataset task",
     )
     parser.add_argument(
         "--order-seed",
@@ -149,9 +295,16 @@ def main() -> int:
         help="maximum model generations per sample (default: 30)",
     )
     parser.add_argument(
-        "--token-limit",
+        "--cost-limit",
+        type=float,
         default=None,
-        help="override the task's tier-specific token limit for every sample",
+        help="override the task cost limit for every sample, in USD (for example: 0.025)",
+    )
+    parser.add_argument(
+        "--model-cost-config",
+        type=Path,
+        default=None,
+        help="Inspect YAML/JSON pricing file; otherwise resolve OpenRouter pricing automatically",
     )
     parser.add_argument(
         "--keep-control",
@@ -165,6 +318,9 @@ def main() -> int:
         help="number of samples to buffer before writing log events (default: 1)",
     )
     args = parser.parse_args()
+
+    if args.cost_limit is not None and args.cost_limit <= 0:
+        parser.error("--cost-limit must be greater than zero")
 
     try:
         if args.openrouter_provider:
@@ -201,7 +357,9 @@ def main() -> int:
     if inspect_cli is None:
         parser.error("Inspect CLI not found; install the project environment first")
 
-    if args.difficulty == "all":
+    if args.difficulty == "all" and args.interleaved:
+        task_targets = ["eval/task.py@streamstats_debug"]
+    elif args.difficulty == "all":
         task_targets = [
             "eval/task.py@streamstats_tier1",
             "eval/task.py@streamstats_tier2",
@@ -209,12 +367,37 @@ def main() -> int:
         ]
         if args.order_seed is not None:
             random.Random(args.order_seed).shuffle(task_targets)
+    elif args.difficulty in CALIBRATION_DIFFICULTIES:
+        task_targets = [f"eval/task.py@streamstats_{args.difficulty}"]
     else:
         task_targets = ["eval/task.py@streamstats_debug"]
 
+    temporary_cost_dir: tempfile.TemporaryDirectory[str] | None = None
+    model_cost_config = args.model_cost_config
+    pricing_source: str | None = None
+    if model_cost_config is None and model.startswith("openrouter/"):
+        try:
+            cost, pricing_source = openrouter_model_cost(
+                model,
+                args.openrouter_provider,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        temporary_cost_dir = tempfile.TemporaryDirectory(prefix="streamstats-model-cost-")
+        model_cost_config = Path(temporary_cost_dir.name) / "model-costs.json"
+        write_model_cost_config(model_cost_config, model, cost)
+        print(f"pricing: {pricing_source}")
+
     command = [inspect_cli, "eval", *task_targets]
-    if args.difficulty != "all":
-        command.extend(["-T", f"difficulty={args.difficulty}"])
+    if args.difficulty in (*CALIBRATION_DIFFICULTIES, "tier1", "tier2", "tier3"):
+        if args.difficulty in ("tier1", "tier2", "tier3"):
+            command.extend(["-T", f"difficulty={args.difficulty}"])
+    elif args.interleaved:
+        command.extend(["-T", "difficulty=all"])
+    if args.difficulty == "all" and args.interleaved:
+        # A serial sample queue makes the seeded order an actual execution
+        # order while retaining a fresh sandbox and conversation per sample.
+        command.extend(["--max-samples", "1"])
     command.extend([
         "--model",
         model,
@@ -232,10 +415,18 @@ def main() -> int:
         str(args.timeout),
         "--turn-limit",
         str(args.turn_limit),
+        "--cache=false",
     ])
-    if args.token_limit is not None:
-        command.extend(["--token-limit", args.token_limit])
-    if args.order_seed is not None:
+    if args.cost_limit is not None:
+        command.extend(["--cost-limit", str(args.cost_limit)])
+    if model_cost_config is not None:
+        command.extend(["--model-cost-config", str(model_cost_config)])
+    if args.order_seed is not None and args.difficulty in (
+        "all",
+        "tier1",
+        "tier2",
+        "tier3",
+    ):
         command.extend(["-T", f"order_seed={args.order_seed}"])
     for model_arg in args.model_arg:
         command.extend(["-M", model_arg])
@@ -243,7 +434,15 @@ def main() -> int:
         command.extend(["--max-sandboxes", str(args.max_sandboxes)])
 
     print("$ " + shlex.join(command))
-    return subprocess.run(command, check=False).returncode
+    try:
+        return subprocess.run(
+            command,
+            check=False,
+            env=fresh_eval_environment(),
+        ).returncode
+    finally:
+        if temporary_cost_dir is not None:
+            temporary_cost_dir.cleanup()
 
 
 if __name__ == "__main__":

@@ -73,7 +73,13 @@ class RollingWindow:
     def restore(self, records: Iterable[Observation]) -> None:
         """Replace the current contents with a persisted window snapshot."""
 
-        self._records = sorted(records)
+        self._records = sorted(
+            records,
+            key=lambda record: (
+                record.timestamp,
+                record.source_id if record.source_id is not None else -1,
+            ),
+        )
         self._latest_timestamp = (
             max(record.timestamp for record in self._records)
             if self._records

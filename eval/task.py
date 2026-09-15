@@ -19,15 +19,25 @@ from eval.scorer import repository_repaired
 
 
 SANDBOX_CONFIG = ("docker", str(REPO_ROOT / "sandbox/compose.yaml"))
-TOKEN_LIMITS = {"tier1": 100_000, "tier2": 150_000, "tier3": 200_000}
-CALIBRATION_TOKEN_LIMIT = 100_000
+# Inspect expresses cost limits in dollars. Every cumulative tier receives the
+# same five-cent per-sample budget so cost caps do not vary by condition.
+COST_LIMITS = {"tier1": 0.05, "tier2": 0.05, "tier3": 0.05}
+CALIBRATION_COST_LIMIT = 0.05
+ISOLATION_CONTRACT = {
+    "conversation_scope": "fresh per sample and epoch",
+    "sandbox_scope": "fresh Docker environment per sample and epoch",
+    "sandbox_cleanup": "Inspect default cleanup enabled",
+    "model_generation_cache": False,
+}
 
 
 def _build_task(
     difficulty: str, order_seed: int | None = None, *, task_name: str
 ) -> Task:
     samples = make_dataset(difficulty, order_seed)
-    token_limit = TOKEN_LIMITS[difficulty]
+    # A single Inspect Task can contain all three tiers; every sample uses the
+    # same flat budget regardless of whether it is interleaved or standalone.
+    cost_limit = COST_LIMITS.get(difficulty, CALIBRATION_COST_LIMIT)
     return Task(
         dataset=samples,
         solver=react(
@@ -37,14 +47,23 @@ def _build_task(
         scorer=repository_repaired(),
         sandbox=SANDBOX_CONFIG,
         message_limit=100,
-        token_limit=token_limit,
+        cost_limit=cost_limit,
         time_limit=900,
         name=task_name,
         metadata={
             "benchmark": "streamstats-debugging-ladder",
             "sample_order_seed": order_seed,
             "sample_order": [sample.id for sample in samples],
-            "sample_token_limit": token_limit,
+            "sample_cost_limit_usd": cost_limit,
+            "isolation_contract": ISOLATION_CONTRACT,
+            "reasoning_configuration": {
+                "solver": "react",
+                "tools": "bash_session(timeout=240), text_editor(timeout=180)",
+                "attempts": 1,
+                "message_limit": 100,
+                "time_limit": 900,
+                "cost_limit_usd": cost_limit,
+            },
         },
     )
 
@@ -60,13 +79,22 @@ def _build_calibration_task(defect: str, *, task_name: str) -> Task:
         scorer=repository_repaired(),
         sandbox=SANDBOX_CONFIG,
         message_limit=100,
-        token_limit=CALIBRATION_TOKEN_LIMIT,
+        cost_limit=CALIBRATION_COST_LIMIT,
         time_limit=900,
         name=task_name,
         metadata={
             "benchmark": "streamstats-debugging-ladder-calibration",
             "isolated_defect": defect,
-            "sample_token_limit": CALIBRATION_TOKEN_LIMIT,
+            "sample_cost_limit_usd": CALIBRATION_COST_LIMIT,
+            "isolation_contract": ISOLATION_CONTRACT,
+            "reasoning_configuration": {
+                "solver": "react",
+                "tools": "bash_session(timeout=240), text_editor(timeout=180)",
+                "attempts": 1,
+                "message_limit": 100,
+                "time_limit": 900,
+                "cost_limit_usd": CALIBRATION_COST_LIMIT,
+            },
         },
     )
 
@@ -77,13 +105,10 @@ def streamstats_debug(
 ) -> Task:
     """Run one tier through the compact single-task interface."""
 
-    if difficulty == "all":
+    if difficulty not in (*DIFFICULTIES, "all"):
         raise ValueError(
-            "difficulty=all has tier-specific token limits; use scripts/pilot.py "
-            "or the streamstats_tier1/2/3 task targets"
+            f"unknown difficulty {difficulty!r}; choose tier1, tier2, tier3, or all"
         )
-    if difficulty not in DIFFICULTIES:
-        raise ValueError(f"unknown difficulty {difficulty!r}; choose tier1, tier2, or tier3")
     return _build_task(difficulty, order_seed, task_name="streamstats-debug")
 
 

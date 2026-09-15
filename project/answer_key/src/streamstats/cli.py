@@ -46,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RECORDS",
         help="maximum records in each source batch (default: 3)",
     )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        metavar="RECORDS",
+        help="records per resumed replay page (default: batch size)",
+    )
     return parser
 
 
@@ -65,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             window_seconds=args.window,
             checkpoint_after=args.checkpoint_after,
             batch_size=args.batch_size,
+            page_size=args.page_size,
         )
     except (OSError, ParseError, CheckpointError, ValueError) as exc:
         print(f"streamstats: {exc}", file=sys.stderr)

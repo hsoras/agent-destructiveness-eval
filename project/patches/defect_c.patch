@@ -1,11 +1,9 @@
 --- a/src/streamstats/checkpoint_store.py
 +++ b/src/streamstats/checkpoint_store.py
-@@ -30,7 +30,7 @@
- 
-     @staticmethod
-     def _cache_key(slot: str, generation: int) -> object:
--        return (slot, generation)
-+        return slot
- 
-     @staticmethod
-     def _observation_payload(observation: Observation) -> dict[str, Any]:
+@@ -222,5 +222,4 @@
+             handle_state = self._handles.pop(handle.handle_id, None)
+             if handle_state is not None:
+                 self._payloads.pop(handle_state.key, None)
+-                self._cache.pop(handle_state.key, None)
+         self._committed_generations = dict(state.committed_generations)
+         state.active = False

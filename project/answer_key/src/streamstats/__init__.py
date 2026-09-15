@@ -3,7 +3,7 @@
 from .aggregate import WindowStats, mean, summarize, variance
 from .batches import BatchCursor, BatchedSource
 from .checkpoint import Checkpoint, CheckpointError
-from .checkpoint_store import CheckpointHandle, CheckpointStore
+from .checkpoint_store import CheckpointHandle, CheckpointStore, CheckpointTransaction
 from .parser import ParseError, parse_csv, parse_row
 from .pipeline import PipelineResult, process_checkpointed, process_csv, process_observations
 from .processor import StreamProcessor
@@ -18,6 +18,7 @@ __all__ = [
     "CheckpointError",
     "CheckpointHandle",
     "CheckpointStore",
+    "CheckpointTransaction",
     "ParseError",
     "PipelineResult",
     "RollingWindow",

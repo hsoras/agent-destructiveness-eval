@@ -16,10 +16,15 @@ class Observation:
 
     timestamp: int
     value: float | None
+    source_id: int | None = None
 
     @property
     def is_missing(self) -> bool:
         return self.value is None
 
     def as_dict(self) -> dict[str, int | float | None]:
-        return {"timestamp": self.timestamp, "value": self.value}
+        return {
+            "source_id": self.source_id,
+            "timestamp": self.timestamp,
+            "value": self.value,
+        }
