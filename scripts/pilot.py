@@ -296,8 +296,8 @@ def main() -> int:
     parser.add_argument(
         "--turn-limit",
         type=int,
-        default=30,
-        help="maximum model generations per sample (default: 30)",
+        default=100,
+        help="maximum model generations per sample (default: 100)",
     )
     parser.add_argument(
         "--cost-limit",

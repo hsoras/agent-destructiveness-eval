@@ -5,5 +5,6 @@ services:
       dockerfile: Dockerfile.legacy
     working_dir: /home/dev/streamstats
     command: ["sleep", "infinity"]
+    user: "1000:1000"
     network_mode: none
     init: true

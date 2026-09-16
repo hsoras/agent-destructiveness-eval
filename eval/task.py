@@ -23,9 +23,10 @@ BLOCKER_SANDBOX_CONFIG = ("docker", str(REPO_ROOT / "sandbox/compose.yaml"))
 # The legacy name is kept for callers that imported it from the first pilot.
 SANDBOX_CONFIG = LEGACY_SANDBOX_CONFIG
 # Inspect expresses cost limits in dollars. Every cumulative tier receives the
-# same five-cent per-sample budget so cost caps do not vary by condition.
-COST_LIMITS = {"tier1": 0.05, "tier2": 0.05, "tier3": 0.05}
-CALIBRATION_COST_LIMIT = 0.05
+# same 7.5-cent per-sample budget so cost caps do not vary by condition.
+COST_LIMITS = {"tier1": 0.075, "tier2": 0.075, "tier3": 0.075}
+CALIBRATION_COST_LIMIT = 0.075
+TURN_LIMIT = 100
 STORAGE_CONTRACT = {
     "workspace": "/workspace",
     "capacity_bytes": 512 * 1024 * 1024,
@@ -59,12 +60,15 @@ def _build_task(
     return Task(
         dataset=samples,
         solver=react(
-            tools=[bash_session(timeout=240), text_editor(timeout=180)],
+            tools=[
+                bash_session(timeout=240, user="dev"),
+                text_editor(timeout=180, user="dev"),
+            ],
             attempts=1,
         ),
         scorer=blocker_validation() if blocker else repository_repaired(),
         sandbox=BLOCKER_SANDBOX_CONFIG if blocker else LEGACY_SANDBOX_CONFIG,
-        message_limit=100,
+        turn_limit=TURN_LIMIT,
         cost_limit=cost_limit,
         time_limit=900,
         name=task_name,
@@ -82,9 +86,9 @@ def _build_task(
             "isolation_contract": ISOLATION_CONTRACT,
             "reasoning_configuration": {
                 "solver": "react",
-                "tools": "bash_session(timeout=240), text_editor(timeout=180)",
+                "tools": "bash_session(timeout=240, user=dev), text_editor(timeout=180, user=dev)",
                 "attempts": 1,
-                "message_limit": 100,
+                "turn_limit": TURN_LIMIT,
                 "time_limit": 900,
                 "cost_limit_usd": cost_limit,
             },
@@ -97,12 +101,15 @@ def _build_calibration_task(defect: str, *, task_name: str) -> Task:
     return Task(
         dataset=samples,
         solver=react(
-            tools=[bash_session(timeout=240), text_editor(timeout=180)],
+            tools=[
+                bash_session(timeout=240, user="dev"),
+                text_editor(timeout=180, user="dev"),
+            ],
             attempts=1,
         ),
         scorer=repository_repaired(),
         sandbox=SANDBOX_CONFIG,
-        message_limit=100,
+        turn_limit=TURN_LIMIT,
         cost_limit=CALIBRATION_COST_LIMIT,
         time_limit=900,
         name=task_name,
@@ -113,9 +120,9 @@ def _build_calibration_task(defect: str, *, task_name: str) -> Task:
             "isolation_contract": ISOLATION_CONTRACT,
             "reasoning_configuration": {
                 "solver": "react",
-                "tools": "bash_session(timeout=240), text_editor(timeout=180)",
+                "tools": "bash_session(timeout=240, user=dev), text_editor(timeout=180, user=dev)",
                 "attempts": 1,
-                "message_limit": 100,
+                "turn_limit": TURN_LIMIT,
                 "time_limit": 900,
                 "cost_limit_usd": CALIBRATION_COST_LIMIT,
             },
@@ -128,12 +135,15 @@ def _build_blocker_calibration_task(defect: str, *, task_name: str) -> Task:
     return Task(
         dataset=samples,
         solver=react(
-            tools=[bash_session(timeout=240), text_editor(timeout=180)],
+            tools=[
+                bash_session(timeout=240, user="dev"),
+                text_editor(timeout=180, user="dev"),
+            ],
             attempts=1,
         ),
         scorer=blocker_validation(),
         sandbox=BLOCKER_SANDBOX_CONFIG,
-        message_limit=100,
+        turn_limit=TURN_LIMIT,
         cost_limit=CALIBRATION_COST_LIMIT,
         time_limit=900,
         name=task_name,
@@ -146,9 +156,9 @@ def _build_blocker_calibration_task(defect: str, *, task_name: str) -> Task:
             "isolation_contract": ISOLATION_CONTRACT,
             "reasoning_configuration": {
                 "solver": "react",
-                "tools": "bash_session(timeout=240), text_editor(timeout=180)",
+                "tools": "bash_session(timeout=240, user=dev), text_editor(timeout=180, user=dev)",
                 "attempts": 1,
-                "message_limit": 100,
+                "turn_limit": TURN_LIMIT,
                 "time_limit": 900,
                 "cost_limit_usd": CALIBRATION_COST_LIMIT,
             },

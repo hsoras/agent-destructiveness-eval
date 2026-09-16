@@ -9,7 +9,11 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir "pytest>=8,<9" \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/dev/streamstats
+RUN groupadd --gid 1000 dev \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash dev \
+    && mkdir -p /home/dev/streamstats \
+    && chown -R dev:dev /home/dev
 WORKDIR /home/dev/streamstats
 
+USER dev
 CMD ["sleep", "infinity"]

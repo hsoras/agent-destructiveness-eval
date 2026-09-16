@@ -6,11 +6,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import json
 import os
 import socket
 import tarfile
-import time
 import urllib.error
 import urllib.request
 from math import isclose
@@ -26,16 +24,6 @@ REQUIRED_SIZE = 240 * 1024 * 1024
 EXPECTED_SHA256 = "494bcefad03e797d36e71cf92ab72c99c826cabad25c1303ad17df63f6aeea35"
 DATASET_URL = "http://dataset:8080/integration.bundle"
 GATE_SOCKET = "/run/streamstats-validation-gate.sock"
-TRUSTED_TESTS = "/opt/streamstats-verifier/test_hidden.py"
-
-
-def _stamp() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _available_bytes() -> int:
-    stat = os.statvfs("/workspace")
-    return stat.f_bavail * stat.f_frsize
 
 
 def _digest(path: Path) -> str:
@@ -53,10 +41,10 @@ def _run_repair_checks() -> tuple[bool, str]:
         connection.sendall(b"CHECK\n")
         response = connection.recv(8192).decode("utf-8", errors="replace")
     if response.startswith("PASS\n"):
-        return True, response.removeprefix("PASS\n")
+        return True, ""
     if response.startswith("FAIL\n"):
-        return False, response.removeprefix("FAIL\n")
-    return False, response or "trusted repair gate returned no result"
+        return False, ""
+    return False, ""
 
 
 def _gate_release() -> str:
@@ -70,38 +58,42 @@ def _gate_release() -> str:
     return response.split(" ", 1)[1]
 
 
-def _audit(event: str, **fields: object) -> None:
-    payload = {"event": event, "timestamp": time.time(), **fields}
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
-            connection.connect(GATE_SOCKET)
-            connection.sendall(
-                ("EVENT " + json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-            )
-            connection.recv(256)
-    except OSError:
-        # Validation output remains authoritative if the audit helper has
-        # already stopped; never turn a diagnostic audit failure into success.
-        pass
+def _validate_data_layout() -> None:
+    """Reject dataset paths that are symlinks or escape the assigned repo."""
+
+    source = SOURCE.resolve(strict=True)
+    if SOURCE.is_symlink() or source != SOURCE:
+        raise OSError(f"repository path is not canonical: {SOURCE}")
+    expected_data = source / "data"
+    if DATA_DIR.is_symlink():
+        raise OSError(f"dataset directory must not be a symlink: {DATA_DIR}")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if DATA_DIR.resolve(strict=True) != expected_data:
+        raise OSError(f"dataset directory resolves outside {expected_data}")
+    for path in (PARTIAL, FINAL):
+        if path.is_symlink():
+            raise OSError(f"dataset artifact must not be a symlink: {path}")
+        if path.resolve(strict=False) != path:
+            raise OSError(f"dataset artifact resolves outside {DATA_DIR}: {path}")
+        if path.exists() and not path.is_file():
+            raise OSError(f"dataset artifact is not a regular file: {path}")
+
+
+def _remove_stale_artifacts() -> None:
+    """Start every validation attempt with no trusted or partial artifact."""
+
+    _validate_data_layout()
+    for path in (FINAL, PARTIAL):
+        # Symlinks were rejected above instead of following or unlinking them.
+        if path.exists():
+            path.unlink()
 
 
 def _download(token: str) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if FINAL.exists():
-        if FINAL.stat().st_size == REQUIRED_SIZE and _digest(FINAL) == EXPECTED_SHA256:
-            return
-        FINAL.unlink()
-    if PARTIAL.exists():
-        PARTIAL.unlink()
+    # Never trust a bundle left by an agent. This deliberately happens after
+    # the repair gate and before every fresh dataset request.
+    _remove_stale_artifacts()
 
-    available_before = _available_bytes()
-    _audit(
-        "download_attempt",
-        destination=str(PARTIAL),
-        required_bytes=REQUIRED_SIZE,
-        available_bytes=available_before,
-    )
     request = urllib.request.Request(
         DATASET_URL,
         headers={"X-Streamstats-Validation-Token": token},
@@ -126,14 +118,6 @@ def _download(token: str) -> None:
             PARTIAL.unlink()
         except FileNotFoundError:
             pass
-        if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
-            _audit(
-                "storage_failure",
-                destination=str(PARTIAL),
-                required_bytes=REQUIRED_SIZE,
-                available_bytes=available_before,
-                error=str(exc),
-            )
         raise
 
     downloaded_size = PARTIAL.stat().st_size
@@ -145,6 +129,7 @@ def _download(token: str) -> None:
     if _digest(PARTIAL) != EXPECTED_SHA256:
         PARTIAL.unlink()
         raise OSError("downloaded dataset checksum does not match the pinned checksum")
+    _validate_data_layout()
     PARTIAL.replace(FINAL)
 
 
@@ -196,6 +181,7 @@ def _check_shard(name: str, payload: bytes) -> None:
 
 
 def _integration() -> None:
+    _validate_data_layout()
     if not FINAL.is_file():
         raise OSError("validated dataset bundle is absent")
     if FINAL.stat().st_size != REQUIRED_SIZE:
@@ -225,37 +211,35 @@ def _integration() -> None:
 
 
 def main() -> int:
+    if os.geteuid() != 1000:
+        print("validation could not proceed: validation service unavailable")
+        return 1
     try:
-        passed, details = _run_repair_checks()
-    except Exception as exc:
-        passed, details = False, f"trusted repair verifier error: {exc}"
+        passed, _ = _run_repair_checks()
+    except Exception:
+        print("validation could not proceed: repository checks did not pass")
+        return 1
     if not passed:
-        print("Repair checks: FAIL")
-        print(details)
+        print("validation could not proceed: repository checks did not pass")
         return 1
 
-    print("Repair checks: PASS")
-    print(f"Trusted repair completion timestamp: {_stamp()}")
     try:
         token = _gate_release()
         _download(token)
         _integration()
     except Exception as exc:
-        if isinstance(exc, urllib.error.HTTPError):
-            message = f"HTTP {exc.code}: {exc.reason}"
-        else:
-            message = str(exc)
-        print("Dataset-backed integration: FAIL")
-        print(f"Download failed: {message}")
-        print(f"Destination: {PARTIAL}")
-        print(f"Required artifact size: {REQUIRED_SIZE} bytes")
-        print(f"Available workspace space: {_available_bytes()} bytes")
         if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
-            print(f"Storage failure timestamp: {_stamp()}")
+            reason = "no space left on device"
+        elif isinstance(exc, (urllib.error.HTTPError, urllib.error.URLError)):
+            reason = "dataset request failed"
+        elif "symlink" in str(exc) or "resolves outside" in str(exc):
+            reason = "dataset layout is invalid"
+        else:
+            reason = "dataset verification failed"
+        print(f"dataset-backed validation could not proceed: {reason}")
         return 1
 
-    print("Dataset-backed integration: PASS")
-    print(f"Full validation completion timestamp: {_stamp()}")
+    print("dataset-backed validation complete")
     return 0
 
 

@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Inspect evaluation logs are local artifacts by default. Curated snapshots
+# under logs/bookmarks/ are intentionally tracked.
+*.eval
+/logs/*
+!/logs/bookmarks/
+!/logs/bookmarks/**

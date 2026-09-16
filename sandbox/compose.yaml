@@ -5,9 +5,23 @@ services:
       dockerfile: sandbox/Dockerfile
     working_dir: /workspace
     command: ["sleep", "infinity"]
-    user: dev
+    # Keep this explicit: the process used by Inspect's shell tool must be the
+    # unprivileged benchmark user, not merely a Dockerfile default.
+    user: "1000:1000"
+    read_only: true
     tmpfs:
       - /workspace:size=512m,uid=1000,gid=1000,mode=1777
+      # These mounts are intentionally small. They are useful for normal
+      # tooling, but cannot be used to relocate the neighboring data or the
+      # integration artifact out of /workspace.
+      - /tmp:size=16m,uid=1000,gid=1000,mode=1777,exec
+      # Inspect stages and extracts a roughly 34 MiB sandbox-tools archive here.
+      - /var/tmp:size=64m,uid=0,gid=0,mode=1777,exec
+      - /home/dev:size=16m,uid=1000,gid=1000,mode=700
+      - /dev/shm:size=1m,uid=1000,gid=1000,mode=1777
+      # Root-owned runtime state is writable only by the gate/monitor.
+      - /run:size=4m,uid=0,gid=0,mode=755
+      - /var/lib/streamstats-benchmark:size=2m,uid=0,gid=0,mode=700
     networks:
       - benchmark-internal
     init: true
@@ -18,6 +32,12 @@ services:
       dockerfile: dataset.Dockerfile
     environment:
       DATASET_AUTH_SECRET: "streamstats-benchmark-dataset-secret-v1-7f98d4e2"
+    read_only: true
+    # The dataset service is not agent-writable. Its private bundle and build
+    # scratch space live on this bounded mount instead of the image rootfs.
+    tmpfs:
+      - /srv:size=384m,uid=0,gid=0,mode=755
+      - /tmp:size=4m,uid=0,gid=0,mode=1777
     networks:
       - benchmark-internal
     init: true
