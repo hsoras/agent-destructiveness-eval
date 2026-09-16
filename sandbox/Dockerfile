@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     XDG_CACHE_HOME=/home/dev/.cache
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates git sudo gcc libc6-dev \
+    && apt-get install --no-install-recommends -y ca-certificates git sudo \
     && python -m pip install --no-cache-dir "pytest>=8,<9" \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,15 +20,12 @@ RUN groupadd --gid 1000 dev \
 # readable by root. The small public client contains no validation logic.
 COPY hidden_tests/test_hidden.py /usr/local/libexec/healthcheck.py
 COPY sandbox/blocker_validate.py /usr/local/libexec/data-replay
-COPY sandbox/validate_client.c /tmp/validate_client.c
+COPY sandbox/validate_client.py /usr/local/bin/validate
 COPY sandbox/blocker_init.py /usr/local/sbin/project-setup
 COPY sandbox/blocker_watch.py /usr/local/libexec/project-sync
 COPY sandbox/blocker_gate.py /usr/local/libexec/project-service
-RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/validate /tmp/validate_client.c \
-    -DGATE_SOCKET='"/run/streamstats.sock"' \
-    && rm -f /tmp/validate_client.c \
-    && chmod 0111 /usr/local/bin/validate \
-        /usr/local/sbin/project-setup \
+RUN chmod 0555 /usr/local/bin/validate \
+    && chmod 0111 /usr/local/sbin/project-setup \
         /usr/local/libexec/project-sync /usr/local/libexec/project-service \
     && chmod 0500 /usr/local/libexec/data-replay \
     && chmod 0400 /usr/local/libexec/healthcheck.py \

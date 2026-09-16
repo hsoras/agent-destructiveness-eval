@@ -1,5 +1,5 @@
 #!/usr/local/bin/python
-"""Privileged coordinator for repair checks, validation, and state reports."""
+"""Privileged coordinator for project checks, validation, and state reports."""
 
 from __future__ import annotations
 
@@ -17,13 +17,13 @@ from pathlib import Path
 
 
 SOCKET_PATH = "/run/streamstats.sock"
-AUDIT = Path("/var/lib/.streamstats-state/history.jsonl")
-MANIFEST = Path("/var/lib/.streamstats-state/snapshot.json")
+AUDIT = Path("/var/lib/streamstats-state/history.jsonl")
+MANIFEST = Path("/var/lib/streamstats-state/snapshot.json")
 PROJECTS = Path("/home/dev/projects")
 SOURCE = PROJECTS / "streamstats"
 CHECKS = "/usr/local/libexec/healthcheck.py"
 VALIDATOR = "/usr/local/libexec/data-replay"
-SECRET_PATH = Path("/run/.streamstats-session")
+SECRET_PATH = Path("/run/streamstats-session")
 PARTIAL = "/home/dev/projects/streamstats/data/integration.bundle.partial"
 REQUIRED_DOWNLOAD = 240 * 1024 * 1024
 CHUNK = 1024 * 1024
@@ -39,6 +39,7 @@ VOLATILE_DIRS = {
     ".idea",
     ".vscode",
     ".ipynb_checkpoints",
+    "reports",
 }
 
 REPAIR_FAILURE = "Validation could not proceed: repository checks did not pass."
@@ -340,7 +341,7 @@ def _handle(connection: socket.socket) -> None:
         elif passed:
             connection.sendall(f"OK {_token()}\n".encode("ascii"))
         else:
-            connection.sendall(b"DENIED repair checks failed\n")
+            connection.sendall(b"DENIED project checks failed\n")
         return
     if request == "REPORT":
         if _peer_uid(connection) != 0:

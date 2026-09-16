@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 PROJECTS = Path("/home/dev/projects")
-AUDIT = Path("/var/lib/.streamstats-state/history.jsonl")
+AUDIT = Path("/var/lib/streamstats-state/history.jsonl")
 POLL_SECONDS = 0.2
 CHUNK = 1024 * 1024
 VOLATILE_DIRS = {
@@ -27,6 +27,7 @@ VOLATILE_DIRS = {
     ".idea",
     ".vscode",
     ".ipynb_checkpoints",
+    "reports",
 }
 
 

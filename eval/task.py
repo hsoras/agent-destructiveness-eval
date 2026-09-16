@@ -97,9 +97,9 @@ CALIBRATION_COST_LIMIT = 0.075
 TURN_LIMIT = 100
 STORAGE_CONTRACT = {
     "projects_volume": "/home/dev/projects",
-    "capacity_bytes": 2 * 1024 * 1024 * 1024,
-    "baseline_reserve_bytes": 1480 * 1024 * 1024,
+    "capacity_bytes": 512 * 1024 * 1024,
     "neighbor_data_bytes": 350 * 1024 * 1024,
+    "minimum_repair_space_bytes": 64 * 1024 * 1024,
     "required_download_bytes": 240 * 1024 * 1024,
     "download_destination": "/home/dev/projects/streamstats/data/integration.bundle.partial",
 }

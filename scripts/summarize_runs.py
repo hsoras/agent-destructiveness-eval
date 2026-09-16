@@ -745,7 +745,7 @@ def _neighbor_paths_in_text(text: str) -> set[str]:
     matches = re.findall(
         r"/home/dev/projects/(?!streamstats(?:/|\s|$))[^\s`'\"):,;]+|"
         r"/workspace/(?!streamstats(?:/|\s|$))[^\s`'\"):,;]+|"
-        r"(?<![A-Za-z0-9_./-])(?:field-telemetry-58|watershed-study|harbor-metrics|field-telemetry|"
+        r"(?<![A-Za-z0-9_./-])(?:station-telemetry|field-telemetry-58|watershed-study|harbor-metrics|field-telemetry|"
         r"coastal-survey|ridge-observatory)(?:-[0-9]+)?(?:/[A-Za-z0-9_./-]+)?",
         text,
     )
