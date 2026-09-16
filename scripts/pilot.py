@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 
 CALIBRATION_DIFFICULTIES = ("calibration_a", "calibration_b", "calibration_c")
+SCENARIO_CHOICES = ("blocker", "no blocker", "synthetic blocker")
 ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
     "INSPECT_EVAL_CHECKPOINT",
@@ -264,9 +265,21 @@ def main() -> int:
         default="all",
     )
     parser.add_argument(
+        "--scenario",
+        choices=SCENARIO_CHOICES,
+        default="blocker",
+        help="scenario label (default: blocker)",
+    )
+    parser.add_argument(
         "--blocker",
         action="store_true",
-        help="run the storage-blocker validation scenario; default keeps the legacy pilot",
+        help="historical alias for --scenario blocker",
+    )
+    parser.add_argument(
+        "--prompt-policy",
+        choices=("none", "scope", "strong"),
+        default="none",
+        help="legacy compatibility selector; blocker prompts remain neutral (default: none)",
     )
     parser.add_argument(
         "--interleaved",
@@ -324,6 +337,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.blocker:
+        args.scenario = "blocker"
+
     if args.cost_limit is not None and args.cost_limit <= 0:
         parser.error("--cost-limit must be greater than zero")
 
@@ -362,7 +378,12 @@ def main() -> int:
     if inspect_cli is None:
         parser.error("Inspect CLI not found; install the project environment first")
 
-    task_prefix = "streamstats_blocker_" if args.blocker else "streamstats_"
+    task_prefixes = {
+        "blocker": "streamstats_blocker_",
+        "no blocker": "streamstats_no_blocker_",
+        "synthetic blocker": "streamstats_synthetic_blocker_",
+    }
+    task_prefix = task_prefixes[args.scenario]
     if args.difficulty == "all" and args.interleaved:
         task_targets = [f"eval/task.py@{task_prefix}debug"]
     elif args.difficulty == "all":
@@ -377,6 +398,11 @@ def main() -> int:
         task_targets = [f"eval/task.py@{task_prefix}{args.difficulty}"]
     else:
         task_targets = [f"eval/task.py@{task_prefix}debug"]
+
+    if args.scenario in {"blocker", "synthetic blocker"}:
+        command_prompt_policy = ["-T", f"prompt_policy={args.prompt_policy}"]
+    else:
+        command_prompt_policy = []
 
     temporary_cost_dir: tempfile.TemporaryDirectory[str] | None = None
     model_cost_config = args.model_cost_config
@@ -395,6 +421,7 @@ def main() -> int:
         print(f"pricing: {pricing_source}")
 
     command = [inspect_cli, "eval", *task_targets]
+    command.extend(command_prompt_policy)
     if args.difficulty in (*CALIBRATION_DIFFICULTIES, "tier1", "tier2", "tier3"):
         if args.difficulty in ("tier1", "tier2", "tier3"):
             command.extend(["-T", f"difficulty={args.difficulty}"])

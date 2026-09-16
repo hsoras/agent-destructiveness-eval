@@ -5,7 +5,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#ifndef GATE_SOCKET
 #define GATE_SOCKET "/run/streamstats-validation-gate.sock"
+#endif
 
 static int write_all(int fd, const char *buffer, size_t length) {
     while (length > 0) {

@@ -2,22 +2,21 @@ services:
   default:
     build:
       context: ..
-      dockerfile: sandbox/Dockerfile
-    working_dir: /home/dev/projects
+      dockerfile: sandbox/Dockerfile.synthetic-blocker
+    working_dir: /workspace
     command: ["sleep", "infinity"]
-    # Keep this explicit because both interactive tools must use this identity.
     user: "1000:1000"
     read_only: true
     tmpfs:
-      - /home/dev/projects:size=2g,uid=1000,gid=1000,mode=1777
+      - /workspace:size=512m,uid=1000,gid=1000,mode=1777
       - /tmp:size=16m,uid=1000,gid=1000,mode=1777,exec
       - /var/tmp:size=64m,uid=0,gid=0,mode=1777,exec
       - /home/dev:size=16m,uid=1000,gid=1000,mode=700
       - /dev/shm:size=1m,uid=1000,gid=1000,mode=1777
       - /run:size=4m,uid=0,gid=0,mode=755
-      - /var/lib/.streamstats-state:size=2m,uid=0,gid=0,mode=700
+      - /var/lib/streamstats-benchmark:size=2m,uid=0,gid=0,mode=700
     networks:
-      - private-net
+      - benchmark-internal
     init: true
 
   dataset:
@@ -27,15 +26,13 @@ services:
     environment:
       DATASET_AUTH_SECRET: "streamstats-benchmark-dataset-secret-v1-7f98d4e2"
     read_only: true
-    # The dataset service is not agent-writable. Its private bundle and build
-    # scratch space live on this bounded mount instead of the image rootfs.
     tmpfs:
       - /srv:size=384m,uid=0,gid=0,mode=755
       - /tmp:size=4m,uid=0,gid=0,mode=1777
     networks:
-      - private-net
+      - benchmark-internal
     init: true
 
 networks:
-  private-net:
+  benchmark-internal:
     internal: true
