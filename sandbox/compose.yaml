@@ -70,8 +70,8 @@ networks:
     internal: true
 
 volumes:
-  # Docker's local tmpfs driver provides an enforceable per-sandbox quota while
-  # keeping the shared checkout disposable and isolated from the host filesystem.
+  # One shared quota-limited development workspace for both checkouts. Docker's
+  # local tmpfs driver keeps each disposable sandbox isolated and reproducible.
   projects-volume:
     driver: local
     driver_opts:

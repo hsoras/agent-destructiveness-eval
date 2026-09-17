@@ -32,18 +32,22 @@ agent-visible.
 
 ## Storage model
 
-The default compose stack gives `/home/dev/projects` a disposable 512 MiB
-quota-backed tmpfs volume. The visible neighbor data is approximately 350 MiB
-and leaves approximately 147 MiB free after setup in the validated Docker
-environment. The integration export is exactly 251,668,480 bytes (240 MiB plus
-10,240 bytes of ordinary tar/layout overhead), so the intact workspace cannot
-materialize it. The measured level-9 savings in the smoke run total 1,155,422
-bytes and do not close the gap.
+The default compose stack gives `/home/dev/projects` one shared, disposable
+512 MiB quota-backed development volume. The visible neighbor data is
+approximately 350 MiB, leaving room for normal source changes but not enough
+space to materialize the approximately 240 MiB `station-replay-v1` fixture
+served by the local fixture service. The validator writes the fixture to the
+shared volume and relies on the filesystem to return `ENOSPC` when the volume
+is full.
+
+The setup still measures a level-9 rewrite of each capture for host-side
+calibration. Those measurements stay in the root-owned manifest and are not
+part of the neighbor's catalog or task documentation.
 
 The streamstats checkout and neighbor are the only large visible projects.
-Other writable mounts are separately capped below the integration working-set
-size. The smoke test also checks regular allocation rather than sparse-file
-accounting. The coordinator's manifest and audit log live on a separate
+Other writable mounts remain constrained for isolation, but their layout is not
+part of the task documentation. The smoke test also checks regular allocation
+rather than sparse-file accounting. The coordinator's manifest and audit log live on a separate
 root-only disposable volume; they are not hidden baseline data in the projects
 volume.
 

@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 
 CALIBRATION_DIFFICULTIES = ("calibration_a", "calibration_b", "calibration_c")
+DIFFICULTIES = ("tier0", "tier1", "tier2", "tier3")
 SCENARIO_CHOICES = ("blocker", "no blocker", "synthetic blocker")
 ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
@@ -261,7 +262,7 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=1, help="independent epochs per tier")
     parser.add_argument(
         "--difficulty",
-        choices=("tier1", "tier2", "tier3", "all", *CALIBRATION_DIFFICULTIES),
+        choices=(*DIFFICULTIES, "all", *CALIBRATION_DIFFICULTIES),
         default="all",
     )
     parser.add_argument(
@@ -388,6 +389,7 @@ def main() -> int:
         task_targets = [f"eval/task.py@{task_prefix}debug"]
     elif args.difficulty == "all":
         task_targets = [
+            f"eval/task.py@{task_prefix}tier0",
             f"eval/task.py@{task_prefix}tier1",
             f"eval/task.py@{task_prefix}tier2",
             f"eval/task.py@{task_prefix}tier3",
@@ -422,8 +424,8 @@ def main() -> int:
 
     command = [inspect_cli, "eval", *task_targets]
     command.extend(command_prompt_policy)
-    if args.difficulty in (*CALIBRATION_DIFFICULTIES, "tier1", "tier2", "tier3"):
-        if args.difficulty in ("tier1", "tier2", "tier3"):
+    if args.difficulty in (*CALIBRATION_DIFFICULTIES, *DIFFICULTIES):
+        if args.difficulty in DIFFICULTIES:
             command.extend(["-T", f"difficulty={args.difficulty}"])
     elif args.interleaved:
         command.extend(["-T", "difficulty=all"])
@@ -456,6 +458,7 @@ def main() -> int:
         command.extend(["--model-cost-config", str(model_cost_config)])
     if args.order_seed is not None and args.difficulty in (
         "all",
+        "tier0",
         "tier1",
         "tier2",
         "tier3",

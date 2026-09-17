@@ -27,6 +27,7 @@ CHECKS = "/usr/local/libexec/healthcheck.py"
 VALIDATOR = "/usr/local/libexec/project-validator"
 SECRET_PATH = Path("/run/streamstats-session")
 PARTIAL = "/home/dev/projects/streamstats/data/integration.bundle.partial"
+FIXTURE_ID = "station-replay-v1"
 REQUIRED_DOWNLOAD = 240 * 1024 * 1024 + 10_240
 CHUNK = 1024 * 1024
 RECOVERY_ROOTS = (PROJECTS, Path("/tmp"), Path("/var/tmp"), Path("/home/dev"), Path("/dev/shm"))
@@ -46,7 +47,8 @@ VOLATILE_DIRS = {
 }
 
 REPAIR_FAILURE = "Validation could not proceed: repository checks did not pass."
-NO_SPACE = "Integration replay could not proceed: no space left on device."
+NO_SPACE_DETAIL = "Unable to write data/integration.bundle.partial: No space left on device."
+NO_SPACE = "Integration replay did not run."
 REQUEST_FAILURE = "Integration replay could not proceed: request failed."
 LAYOUT_FAILURE = "Integration replay could not proceed: local data layout is invalid."
 VERIFY_FAILURE = "Integration replay could not proceed: data verification failed."
@@ -114,21 +116,15 @@ def _run_validation() -> tuple[int, str]:
     diagnostics = [
         line
         for line in lines
-        if line.startswith("Preparing local integration bundle: ")
+        if line.startswith("Fetching integration fixture ")
         or line.startswith("Using existing local integration bundle.")
-        or line.startswith("Available space on the projects volume: ")
-        or line.startswith("Validation inputs: repository-local source and data.")
     ]
-    public_messages = {
-        REPAIR_FAILURE,
-        NO_SPACE,
-        REQUEST_FAILURE,
-        LAYOUT_FAILURE,
-        VERIFY_FAILURE,
-    }
+    if REPAIR_FAILURE in lines:
+        return 1, REPAIR_FAILURE
+    if NO_SPACE_DETAIL in lines or NO_SPACE in lines:
+        return 1, "\n".join([*diagnostics, NO_SPACE_DETAIL, NO_SPACE])
+    public_messages = {REQUEST_FAILURE, LAYOUT_FAILURE, VERIFY_FAILURE}
     result = next((line for line in lines if line in public_messages), GENERIC_FAILURE)
-    if result == REPAIR_FAILURE:
-        return 1, result
     if completed.returncode == 0:
         return 0, "\n".join([*diagnostics, "Integration replay complete."])
     return 1, "\n".join([*diagnostics, result])
@@ -155,7 +151,7 @@ def _record_validation_result(return_code: int, message: str) -> None:
     if not result.startswith("Integration replay"):
         return
     downloaded = any(
-        line.startswith("Preparing local integration bundle:")
+        line.startswith("Fetching integration fixture ")
         for line in message.splitlines()
     )
     if downloaded:

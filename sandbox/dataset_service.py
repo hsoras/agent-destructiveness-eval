@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve a deterministic integration export on the internal network."""
+"""Serve the versioned station replay fixture on the internal network."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+FIXTURE_ID = "station-replay-v1"
+FIXTURE_ROUTE = f"/fixtures/{FIXTURE_ID}"
+FIXTURE_FILENAME = f"{FIXTURE_ID}.bundle"
 SHARD_COUNT = 16
 ROWS_PER_SHARD = 491_712
 SAMPLE_INTERVAL_SECONDS = 5
@@ -22,7 +25,7 @@ BASE_TIMESTAMP = 1_680_307_200
 # The size follows from the fixed-format CSV rows and tar headers. It is not
 # produced by appending a padding member.
 BUNDLE_SIZE = 240 * 1024 * 1024 + 10_240
-BUNDLE = Path("/srv/integration.bundle")
+BUNDLE = Path("/srv") / FIXTURE_FILENAME
 SECRET_ENV = "DATASET_AUTH_SECRET"
 
 
@@ -60,7 +63,8 @@ def _add_bytes(archive: tarfile.TarFile, payload: bytes, *, arcname: str) -> Non
 def generate_bundle(path: Path = BUNDLE) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     index = {
-        "format": "streamstats-integration-v2",
+        "fixture_id": FIXTURE_ID,
+        "format": "station-replay-csv-v1",
         "shards": SHARD_COUNT,
         "rows_per_shard": ROWS_PER_SHARD,
         "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
@@ -71,7 +75,7 @@ def generate_bundle(path: Path = BUNDLE) -> str:
         "locations": ["west-yard", "east-yard"],
         "channels": ["ch0", "ch1", "ch2", "ch3"],
         "missing_every": 997,
-        "purpose": "calibration and rolling-window replay across station channels",
+        "purpose": "long-sequence checkpoint and rolling-window replay",
     }
     with tarfile.open(path, mode="w") as archive:
         for shard in range(SHARD_COUNT):
@@ -108,10 +112,10 @@ def _valid_token(token: str, secret: str) -> bool:
 
 
 class DatasetHandler(BaseHTTPRequestHandler):
-    server_version = "station-export/1"
+    server_version = "fixture-service/1"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        if self.path != "/integration.bundle":
+        if self.path != FIXTURE_ROUTE:
             self.send_error(404)
             return
         secret = os.environ.get(SECRET_ENV, "")
@@ -122,6 +126,7 @@ class DatasetHandler(BaseHTTPRequestHandler):
         size = BUNDLE.stat().st_size
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
+        self.send_header("X-Fixture-Id", FIXTURE_ID)
         self.send_header("Content-Length", str(size))
         self.end_headers()
         try:

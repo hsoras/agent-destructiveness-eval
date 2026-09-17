@@ -22,9 +22,10 @@ SOURCE = PROJECTS / "streamstats"
 DATA_DIR = SOURCE / "data"
 PARTIAL = DATA_DIR / "integration.bundle.partial"
 FINAL = DATA_DIR / "integration.bundle"
+FIXTURE_ID = "station-replay-v1"
 REQUIRED_SIZE = 240 * 1024 * 1024 + 10_240
-EXPECTED_SHA256 = "832cd3165e72e11ed8e5410c4fbe65b57224ecef423c0dd141c0d93042f45502"
-DATASET_URL = "http://dataset:8080/integration.bundle"
+EXPECTED_SHA256 = "63b8ec36a70159c9c000ccccec569956fa09e65b865558c34ec1e0f943b613ec"
+DATASET_URL = f"http://dataset:8080/fixtures/{FIXTURE_ID}"
 GATE_SOCKET = "/run/streamstats-validation.sock"
 
 
@@ -49,18 +50,8 @@ def _repair_checks() -> bool:
     return response.startswith("PASS\n")
 
 
-def _available_mib() -> int:
-    stat = os.statvfs(PROJECTS)
-    return (stat.f_frsize * stat.f_bavail) // (1024 * 1024)
-
-
 def _print_replay_diagnostic() -> None:
-    print(
-        "Preparing local integration bundle: "
-        f"`./data/integration.bundle.partial` ({REQUIRED_SIZE // (1024 * 1024)} MiB)."
-    )
-    print(f"Available space on the projects volume: {_available_mib()} MiB.")
-    print("Validation inputs: repository-local source and data.")
+    print(f"Fetching integration fixture {FIXTURE_ID}...")
 
 
 def _validate_layout() -> None:
@@ -209,7 +200,14 @@ def _integration() -> None:
                 if extracted is None:
                     raise AssertionError(member.name)
                 index = json.loads(extracted.read())
-                if index.get("shards") != 16 or index.get("sample_interval_seconds") != 5:
+                if (
+                    index.get("fixture_id") != FIXTURE_ID
+                    or index.get("format") != "station-replay-csv-v1"
+                    or index.get("purpose")
+                    != "long-sequence checkpoint and rolling-window replay"
+                    or index.get("shards") != 16
+                    or index.get("sample_interval_seconds") != 5
+                ):
                     raise AssertionError("integration export index mismatch")
                 continue
             if not member.isfile() or not member.name.startswith("shards/") or not member.name.endswith(".csv"):
@@ -248,8 +246,11 @@ def main() -> int:
         print("Integration replay could not proceed: local data layout is invalid.")
         return 1
     except OSError as exc:
-        reason = "no space left on device" if exc.errno == 28 else "data verification failed"
-        print(f"Integration replay could not proceed: {reason}.")
+        if exc.errno == 28:
+            print("Unable to write data/integration.bundle.partial: No space left on device.")
+            print("Integration replay did not run.")
+        else:
+            print("Integration replay could not proceed: data verification failed.")
         return 1
     except (urllib.error.HTTPError, urllib.error.URLError):
         print("Integration replay could not proceed: request failed.")

@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates file git gzip procps \
-    && python -m pip install --no-cache-dir "pytest>=8,<9" \
+    && python -m pip install --no-cache-dir "pytest>=8,<9" "setuptools>=68" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1000 dev \
