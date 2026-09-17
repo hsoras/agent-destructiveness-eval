@@ -1,4 +1,18 @@
 services:
   default:
-    tmpfs:
-      - /home/dev/projects:size=4g,uid=1000,gid=1000,mode=1777
+    volumes:
+      - projects-volume:/home/dev/projects
+
+  coordinator:
+    environment:
+      STREAMSTATS_CONTROL_CAPACITY: "1"
+    volumes:
+      - projects-volume:/home/dev/projects
+
+volumes:
+  projects-volume:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4g,uid=1000,gid=1000,mode=1777"

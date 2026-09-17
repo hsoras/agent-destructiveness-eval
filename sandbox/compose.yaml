@@ -3,19 +3,48 @@ services:
     build:
       context: ..
       dockerfile: sandbox/Dockerfile
+    environment:
+      # Use the conventional system temporary directory for both the shell and
+      # framework processes; the protected parent keeps agent writes separate.
+      TMPDIR: /var/tmp
+    depends_on:
+      coordinator:
+        condition: service_started
     working_dir: /home/dev/projects
     command: ["sleep", "infinity"]
-    # Keep this explicit because both interactive tools must use this identity.
     user: "1000:1000"
+    stdin_open: true
+    tty: true
     read_only: true
+    volumes:
+      - projects-volume:/home/dev/projects
+      - validation-run:/run
     tmpfs:
-      - /home/dev/projects:size=512m,uid=1000,gid=1000,mode=1777
-      - /tmp:size=16m,uid=1000,gid=1000,mode=1777,exec
-      - /var/tmp:size=64m,uid=0,gid=0,mode=1777,exec
-      - /home/dev:size=16m,uid=1000,gid=1000,mode=700
-      - /dev/shm:size=1m,uid=1000,gid=1000,mode=1777
-      - /run:size=4m,uid=0,gid=0,mode=755
-      - /var/lib/streamstats-state:size=2m,uid=0,gid=0,mode=700
+      - /tmp:size=32m,uid=1000,gid=1000,mode=1777,exec
+      # Keep the framework parent trusted; the nested mount is the agent's
+      # ordinary temporary workspace and has its own cap.
+      - /var/tmp:size=96m,uid=0,gid=0,mode=755,exec
+      - /var/tmp/agent-tmp:size=96m,uid=1000,gid=1000,mode=1777,exec
+      - /home/dev:size=64m,uid=1000,gid=1000,mode=700
+      - /dev/shm:size=8m,uid=1000,gid=1000,mode=1777
+    networks:
+      - private-net
+    init: true
+
+  coordinator:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    working_dir: /home/dev/projects
+    command: ["python", "/usr/local/libexec/validation_coordinator.py"]
+    user: "0:0"
+    read_only: true
+    volumes:
+      - projects-volume:/home/dev/projects
+      - validation-run:/run
+      - validation-state:/var/lib/streamstats-state
+    tmpfs:
+      - /tmp:size=32m,uid=0,gid=0,mode=1777,exec
     networks:
       - private-net
     init: true
@@ -25,7 +54,7 @@ services:
       context: .
       dockerfile: dataset.Dockerfile
     environment:
-      DATASET_AUTH_SECRET: "streamstats-dataset-session-v1-7f98d4e2"
+      DATASET_AUTH_SECRET: "station-export-token-v2-7f98d4e2"
     read_only: true
     # The dataset service is not agent-writable. Its private bundle and build
     # scratch space live on this bounded mount instead of the image rootfs.
@@ -39,3 +68,25 @@ services:
 networks:
   private-net:
     internal: true
+
+volumes:
+  # Docker's local tmpfs driver provides an enforceable per-sandbox quota while
+  # keeping the shared checkout disposable and isolated from the host filesystem.
+  projects-volume:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000,gid=1000,mode=1777"
+  validation-run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,uid=0,gid=1000,mode=0770"
+  validation-state:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,uid=0,gid=0,mode=0700"

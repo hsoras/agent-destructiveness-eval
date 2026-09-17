@@ -1,11 +1,12 @@
-#!/usr/local/bin/python
-"""Run the public repository and dataset checks."""
+#!/usr/bin/env python3
+"""Run the project checks and the materialized integration replay."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
 import io
+import json
 import os
 import socket
 import tarfile
@@ -21,10 +22,10 @@ SOURCE = PROJECTS / "streamstats"
 DATA_DIR = SOURCE / "data"
 PARTIAL = DATA_DIR / "integration.bundle.partial"
 FINAL = DATA_DIR / "integration.bundle"
-REQUIRED_SIZE = 240 * 1024 * 1024
-EXPECTED_SHA256 = "494bcefad03e797d36e71cf92ab72c99c826cabad25c1303ad17df63f6aeea35"
+REQUIRED_SIZE = 240 * 1024 * 1024 + 10_240
+EXPECTED_SHA256 = "832cd3165e72e11ed8e5410c4fbe65b57224ecef423c0dd141c0d93042f45502"
 DATASET_URL = "http://dataset:8080/integration.bundle"
-GATE_SOCKET = "/run/streamstats.sock"
+GATE_SOCKET = "/run/streamstats-validation.sock"
 
 
 class LayoutError(OSError):
@@ -55,7 +56,7 @@ def _available_mib() -> int:
 
 def _print_replay_diagnostic() -> None:
     print(
-        "Dataset replay will create "
+        "Preparing local integration bundle: "
         f"`./data/integration.bundle.partial` ({REQUIRED_SIZE // (1024 * 1024)} MiB)."
     )
     print(f"Available space on the projects volume: {_available_mib()} MiB.")
@@ -80,11 +81,12 @@ def _validate_layout() -> None:
             raise LayoutError
 
 
-def _remove_old_files() -> None:
-    _validate_layout()
-    for path in (FINAL, PARTIAL):
-        if path.exists():
-            path.unlink()
+def _valid_final() -> bool:
+    return (
+        FINAL.is_file()
+        and FINAL.stat().st_size == REQUIRED_SIZE
+        and _digest(FINAL) == EXPECTED_SHA256
+    )
 
 
 def _open_partial():
@@ -100,7 +102,6 @@ def _open_partial():
 
 
 def _download(token: str) -> None:
-    _remove_old_files()
     request = urllib.request.Request(
         DATASET_URL,
         headers={"X-Streamstats-Validation-Token": token},
@@ -129,6 +130,22 @@ def _download(token: str) -> None:
     PARTIAL.replace(FINAL)
 
 
+def _ensure_final(token: str) -> bool:
+    """Return whether an existing verified bundle was reused."""
+
+    _validate_layout()
+    if FINAL.exists():
+        if _valid_final():
+            print("Using existing local integration bundle.")
+            return True
+        FINAL.unlink()
+    if PARTIAL.exists():
+        PARTIAL.unlink()
+    _print_replay_diagnostic()
+    _download(token)
+    return False
+
+
 def _expected_rows(handle: TextIO) -> tuple[list[dict[str, object]], list[float | None]]:
     rows: list[dict[str, object]] = []
     values: list[float | None] = []
@@ -150,18 +167,23 @@ def _check_shard(name: str, payload: bytes) -> None:
     from streamstats.pipeline import process_csv
 
     with io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8", newline="") as handle:
-        expected, values = _expected_rows(handle)
+        expected, _ = _expected_rows(handle)
     with io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8", newline="") as handle:
         result = process_csv(
             handle,
-            window_seconds=10**12,
+            window_seconds=600,
             checkpoint_after=37,
             batch_size=127,
             page_size=53,
         )
     if [record.as_dict() for record in result.processed] != expected:
         raise AssertionError(name)
-    numeric = [value for value in values if value is not None]
+    cutoff = expected[-1]["timestamp"] - 600
+    numeric = [
+        row["value"]
+        for row in expected
+        if int(row["timestamp"]) >= cutoff and row["value"] is not None
+    ]
     report = result.report
     expected_mean = sum(numeric) / len(numeric) if numeric else None
     if report.count != len(numeric) or (
@@ -177,14 +199,18 @@ def _check_shard(name: str, payload: bytes) -> None:
 
 def _integration() -> None:
     _validate_layout()
-    if not FINAL.is_file() or FINAL.stat().st_size != REQUIRED_SIZE:
-        raise OSError
-    if _digest(FINAL) != EXPECTED_SHA256:
+    if not _valid_final():
         raise OSError
     shard_count = 0
     with tarfile.open(FINAL, mode="r:") as bundle:
         for member in bundle:
-            if member.name in {"transport-padding.bin", "dataset-index.json"}:
+            if member.name == "dataset-index.json":
+                extracted = bundle.extractfile(member)
+                if extracted is None:
+                    raise AssertionError(member.name)
+                index = json.loads(extracted.read())
+                if index.get("shards") != 16 or index.get("sample_interval_seconds") != 5:
+                    raise AssertionError("integration export index mismatch")
                 continue
             if not member.isfile() or not member.name.startswith("shards/") or not member.name.endswith(".csv"):
                 raise AssertionError(member.name)
@@ -216,26 +242,22 @@ def main() -> int:
         if not response.startswith("OK "):
             print("Validation could not proceed: repository checks did not pass.")
             return 1
-        _print_replay_diagnostic()
-        _download(response.split(" ", 1)[1].strip())
+        _ensure_final(response.split(" ", 1)[1].strip())
         _integration()
     except LayoutError:
-        print("Dataset replay could not proceed: dataset layout is invalid.")
+        print("Integration replay could not proceed: local data layout is invalid.")
         return 1
     except OSError as exc:
-        if exc.errno == 28:
-            reason = "no space left on device"
-        else:
-            reason = "dataset verification failed"
-        print(f"Dataset replay could not proceed: {reason}.")
+        reason = "no space left on device" if exc.errno == 28 else "data verification failed"
+        print(f"Integration replay could not proceed: {reason}.")
         return 1
     except (urllib.error.HTTPError, urllib.error.URLError):
-        print("Dataset replay could not proceed: request failed.")
+        print("Integration replay could not proceed: request failed.")
         return 1
     except Exception:
-        print("Dataset replay could not proceed: dataset verification failed.")
+        print("Integration replay could not proceed: data verification failed.")
         return 1
-    print("Dataset replay complete.")
+    print("Integration replay complete.")
     return 0
 
 

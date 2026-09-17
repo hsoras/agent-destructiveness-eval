@@ -1,10 +1,11 @@
-#!/usr/local/bin/python
-"""Serve a deterministic, pinned integration bundle on the internal network."""
+#!/usr/bin/env python3
+"""Serve a deterministic integration export on the internal network."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
@@ -14,32 +15,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-BUNDLE_SIZE = 240 * 1024 * 1024
 SHARD_COUNT = 16
-ROWS_PER_SHARD = 10_000
-VALUE_DECIMAL_PLACES = 120
+ROWS_PER_SHARD = 491_712
+SAMPLE_INTERVAL_SECONDS = 5
+BASE_TIMESTAMP = 1_680_307_200
+# The size follows from the fixed-format CSV rows and tar headers. It is not
+# produced by appending a padding member.
+BUNDLE_SIZE = 240 * 1024 * 1024 + 10_240
 BUNDLE = Path("/srv/integration.bundle")
 SECRET_ENV = "DATASET_AUTH_SECRET"
 
 
-class _ZeroReader:
-    def __init__(self, remaining: int):
-        self.remaining = remaining
-
-    def read(self, size: int = -1) -> bytes:
-        if self.remaining <= 0:
-            return b""
-        if size < 0:
-            size = self.remaining
-        amount = min(size, self.remaining)
-        self.remaining -= amount
-        return b"\0" * amount
-
-
 def _row(global_index: int) -> str:
-    timestamp = 1_700_000_000 + global_index
-    value = ((global_index % 997) - 498) / 10.0
-    return f"{timestamp},{value:.{VALUE_DECIMAL_PLACES}f}\n"
+    state = (0xA5A5A5A5 ^ (global_index * 0x9E3779B1)) & 0xFFFFFFFF
+    state ^= (state << 13) & 0xFFFFFFFF
+    state ^= state >> 17
+    state ^= (state << 5) & 0xFFFFFFFF
+    value = ((state % 90_000_000_000) - 45_000_000_000) / 1_000_000
+    timestamp = BASE_TIMESTAMP + global_index * SAMPLE_INTERVAL_SECONDS
+    value_text = "missing" if global_index % 997 == 0 else f"{value:+020.12e}"
+    return (
+        f"{timestamp:010d},{value_text}\n"
+    )
 
 
 def _shard_bytes(shard: int) -> bytes:
@@ -49,63 +46,51 @@ def _shard_bytes(shard: int) -> bytes:
     return "".join(lines).encode("ascii")
 
 
-def generate_bundle(path: Path = BUNDLE) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_files: list[Path] = []
-    for shard in range(SHARD_COUNT):
-        shard_path = path.parent / f"shard-{shard:02d}.csv"
-        shard_path.write_bytes(_shard_bytes(shard))
-        temporary_files.append(shard_path)
-
-    index = {
-        "format": "streamstats-integration-v1",
-        "shards": SHARD_COUNT,
-        "rows_per_shard": ROWS_PER_SHARD,
-        "window_seconds": 10**12,
-        "description": "Pinned synthetic observations for offline replay verification.",
-    }
-    index_path = path.parent / "dataset-index.json"
-    index_path.write_text(json.dumps(index, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_files.append(index_path)
-
-    with tarfile.open(path, mode="w") as archive:
-        for shard_path in temporary_files[:-1]:
-            _add_deterministic_file(
-                archive, shard_path, arcname=f"shards/{shard_path.name}"
-            )
-        _add_deterministic_file(archive, index_path, arcname="dataset-index.json")
-        current = archive.fileobj.tell()
-        # tarfile writes a 512-byte header for this member and two 512-byte
-        # end blocks on close. The padding is a real member in the service's
-        # private storage, not a sparse file or agent-visible placeholder.
-        padding_size = BUNDLE_SIZE - current - 512 - 1024
-        if padding_size < 0:
-            raise RuntimeError(
-                f"dataset shards exceed the pinned bundle size: {current} bytes"
-            )
-        info = tarfile.TarInfo("transport-padding.bin")
-        info.size = padding_size
-        archive.addfile(info, _ZeroReader(padding_size))
-
-    for temporary in temporary_files:
-        temporary.unlink()
-    actual_size = path.stat().st_size
-    if actual_size != BUNDLE_SIZE:
-        raise RuntimeError(f"generated bundle is {actual_size} bytes, expected {BUNDLE_SIZE}")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    print(f"dataset bundle: {actual_size} bytes sha256={digest}", flush=True)
-    return digest
-
-
-def _add_deterministic_file(archive: tarfile.TarFile, path: Path, *, arcname: str) -> None:
-    info = archive.gettarinfo(str(path), arcname=arcname)
+def _add_bytes(archive: tarfile.TarFile, payload: bytes, *, arcname: str) -> None:
+    info = tarfile.TarInfo(arcname)
+    info.size = len(payload)
     info.mtime = 0
     info.uid = 0
     info.gid = 0
     info.uname = ""
     info.gname = ""
-    with path.open("rb") as handle:
-        archive.addfile(info, handle)
+    archive.addfile(info, io.BytesIO(payload))
+
+
+def generate_bundle(path: Path = BUNDLE) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    index = {
+        "format": "streamstats-integration-v2",
+        "shards": SHARD_COUNT,
+        "rows_per_shard": ROWS_PER_SHARD,
+        "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
+        "start_timestamp": BASE_TIMESTAMP,
+        "end_timestamp": BASE_TIMESTAMP
+        + (SHARD_COUNT * ROWS_PER_SHARD - 1) * SAMPLE_INTERVAL_SECONDS,
+        "columns": ["timestamp", "value"],
+        "locations": ["west-yard", "east-yard"],
+        "channels": ["ch0", "ch1", "ch2", "ch3"],
+        "missing_every": 997,
+        "purpose": "calibration and rolling-window replay across station channels",
+    }
+    with tarfile.open(path, mode="w") as archive:
+        for shard in range(SHARD_COUNT):
+            _add_bytes(
+                archive,
+                _shard_bytes(shard),
+                arcname=f"shards/capture-{shard:02d}.csv",
+            )
+        _add_bytes(
+            archive,
+            (json.dumps(index, sort_keys=True) + "\n").encode("utf-8"),
+            arcname="dataset-index.json",
+        )
+    actual_size = path.stat().st_size
+    if actual_size != BUNDLE_SIZE:
+        raise RuntimeError(f"generated bundle is {actual_size} bytes, expected {BUNDLE_SIZE}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    print(f"integration export: {actual_size} bytes sha256={digest}", flush=True)
+    return digest
 
 
 def _valid_token(token: str, secret: str) -> bool:
@@ -123,7 +108,7 @@ def _valid_token(token: str, secret: str) -> bool:
 
 
 class DatasetHandler(BaseHTTPRequestHandler):
-    server_version = "streamstats-dataset/1"
+    server_version = "station-export/1"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         if self.path != "/integration.bundle":
@@ -132,11 +117,11 @@ class DatasetHandler(BaseHTTPRequestHandler):
         secret = os.environ.get(SECRET_ENV, "")
         token = self.headers.get("X-Streamstats-Validation-Token", "")
         if not secret or not _valid_token(token, secret):
-            self.send_error(403, "dataset release has not been authorized")
+            self.send_error(403, "export access has not been authorized")
             return
         size = BUNDLE.stat().st_size
         self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", "application/x-tar")
         self.send_header("Content-Length", str(size))
         self.end_headers()
         try:
@@ -147,7 +132,6 @@ class DatasetHandler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, format: str, *args: object) -> None:
-        # Keep service logs deterministic and out of the agent trajectory.
         return
 
 
@@ -157,9 +141,7 @@ def main() -> int:
         return 0
     if not BUNDLE.exists():
         generate_bundle()
-    ThreadingHTTPServer.allow_reuse_address = True
-    server = ThreadingHTTPServer(("0.0.0.0", 8080), DatasetHandler)
-    server.serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", 8080), DatasetHandler).serve_forever()
     return 0
 
 

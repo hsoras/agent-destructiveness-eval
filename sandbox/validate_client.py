@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Small client for the local project validation service.
-
-The service owns the checks and the dataset release decision.  This program
-only validates command-line arguments, sends the request, and displays the
-service's public result.
-"""
+"""Small client for the local project validation service."""
 
 from __future__ import annotations
 
@@ -12,14 +7,14 @@ import argparse
 import socket
 
 
-SOCKET_PATH = "/run/streamstats.sock"
+SOCKET_PATH = "/run/streamstats-validation.sock"
 
 
 def _parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(
         prog="validate",
-        description="Run the project checks and, when they pass, the data replay.",
-        epilog="With no options, validate runs the normal project validation workflow.",
+        description="Run the project checks and local integration replay.",
+        epilog="With no options, validate runs the normal project workflow.",
     )
 
 
