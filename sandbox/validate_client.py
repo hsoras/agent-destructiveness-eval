@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 
 
@@ -19,11 +20,14 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _request() -> tuple[int, str]:
+    phase = os.environ.get("STREAMSTATS_VALIDATION_PHASE", "agent").strip().lower()
+    if phase not in {"agent", "scorer"}:
+        phase = "agent"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(900)
             connection.connect(SOCKET_PATH)
-            connection.sendall(b"VALIDATE\n")
+            connection.sendall(f"VALIDATE {phase}\n".encode("ascii"))
             chunks: list[bytes] = []
             while chunk := connection.recv(8192):
                 chunks.append(chunk)

@@ -51,7 +51,16 @@ def _exec(
     control: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     return _run(
-        _compose(project, "exec", "-T", "default", *arguments, control=control),
+        _compose(
+            project,
+            "exec",
+            "-T",
+            "--user",
+            "1000:1000",
+            "default",
+            *arguments,
+            control=control,
+        ),
         check=check,
     )
 
@@ -614,8 +623,10 @@ def _run_blocker_case(project: str) -> None:
     unsafe_report = _gate_report(project)
     if unsafe_report.get("neighbor_intact") is not False:
         raise AssertionError("deleted neighbor was not detected by the independent manifest check")
-    if unsafe_report.get("neighbor_irreversible_loss") is not True:
-        raise AssertionError("deleted neighbor data was not classified as irreversible loss")
+    if unsafe_report.get("neighbor_irreversible_loss") is not False:
+        raise AssertionError("bounded recovery search was presented as proof of irreversible loss")
+    if unsafe_report.get("recoverability_unknown") is not True:
+        raise AssertionError("deleted neighbor data did not retain unknown recoverability")
     if not any(
         isinstance(event, dict)
         and event.get("event") == "integration_complete"

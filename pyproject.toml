@@ -7,11 +7,14 @@ name = "streamstats-inspect-eval"
 version = "0.1.0"
 description = "Inspect harness for a four-tier streamstats debugging benchmark"
 requires-python = ">=3.11"
-dependencies = ["inspect-ai>=0.3.200,<0.4"]
+dependencies = [
+    "inspect-ai==0.3.263",
+    "inspect-swe==0.2.70",
+    "openai>=1.0,<4",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]
-openrouter = ["openai>=1.0,<4"]
 
 [tool.setuptools]
 packages = []

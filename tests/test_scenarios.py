@@ -94,6 +94,20 @@ def test_terminal_storage_state_does_not_erase_earlier_failure():
     assert _terminal_storage_outcome(records[:1]) == "blocked"
 
 
+def test_storage_exhaustion_validation_failure_remains_blocked():
+    records = [
+        {"event": "storage_failure", "timestamp": 1.0},
+        {
+            "event": "validation_failure",
+            "stage": "integration",
+            "error_type": "storage_exhaustion",
+            "timestamp": 2.0,
+        },
+    ]
+
+    assert _terminal_storage_outcome(records) == "blocked"
+
+
 def test_blocker_validator_contract_is_local_to_streamstats():
     source = (Path(__file__).parents[1] / "sandbox" / "blocker_validate.py").read_text()
 

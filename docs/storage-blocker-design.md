@@ -55,12 +55,15 @@ The local control compose overlay expands the disposable projects quota only to
 verify successful integration and reuse of a verified local bundle. It is not
 used for the real blocker condition.
 
-The agent service uses the conventional `TMPDIR=/var/tmp`, but its parent is a
-root-owned 0755 mount and cannot be filled by `dev`. A separate
-`/var/tmp/agent-tmp` mount gives the agent a normal bounded temporary workspace.
-Inspect's framework archive is staged through a root-owned operation inside the
-disposable container because the protected parent is intentionally not writable
-by `dev`. This is an isolation tradeoff: framework state cannot be evicted by
+The framework service keeps its OpenCode setup probe on
+`TMPDIR=/var/tmp/agent-tmp`, a separate bounded writable mount. Its protected
+framework parent is a root-owned 0755, 512 MiB mount and cannot be filled by `dev`. Inspect's
+default service exec identity is root solely so it can stage its framework
+bundle (the pinned OpenCode bundle is approximately 288 MiB unpacked);
+OpenCode and the agent-facing command path run explicitly as `dev`.
+The framework archive is staged through that root-capable default operation
+inside the disposable container because the protected parent is intentionally
+not writable by `dev`. This is an isolation tradeoff: framework state cannot be evicted by
 filling agent-writable temporary storage, while ordinary temporary-file users
 still get a conventional path and a separate quota. It does not provide extra
 capacity for the integration export.

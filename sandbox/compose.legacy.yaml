@@ -4,7 +4,63 @@ services:
       context: .
       dockerfile: Dockerfile.legacy
     working_dir: /home/dev/streamstats
-    command: ["sleep", "infinity"]
-    user: "1000:1000"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /home/dev/.cache /home/dev/.local/share /home/dev/.local/state
+        mkdir -p /home/dev/.config/opencode
+        printf '%s\n' '{"provider":{"openrouter":{"models":{"z-ai/glm-5.3-flash":{"name":"GLM 5.3 Flash"}}}}}' > /home/dev/.config/opencode/config.json
+        chown 1000:1000 /home/dev/.config/opencode/config.json
+        chmod 0644 /home/dev/.config/opencode/config.json
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        if [ "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version 2>/dev/null || true)" != "1.14.41" ]; then
+          find /var/tmp/.5c95f967ca830048 -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /var/tmp/.5c95f967ca830048/
+          chown -R root:root /var/tmp/.5c95f967ca830048
+          chmod -R a-w /var/tmp/.5c95f967ca830048
+        fi
+        test "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version)" = "1.14.41"
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        exec sleep infinity
+    environment:
+      TMPDIR: /var/tmp/agent-tmp
+    # The Inspect framework needs a root-capable default for its bundle
+    # injection; the OpenCode process still runs as dev explicitly.
+    user: "0:0"
+    depends_on:
+      opencode-runtime-init:
+        condition: service_completed_successfully
     network_mode: none
     init: true
+    volumes:
+      - opencode-runtime:/var/tmp/.5c95f967ca830048
+
+  opencode-runtime-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.legacy
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -x /target/opencode/node_modules/.bin/opencode ]; then
+          find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /target/
+          chown -R root:root /target
+          chmod -R a-w /target
+        fi
+    user: "0:0"
+    read_only: true
+    volumes:
+      - opencode-runtime:/target
+    network_mode: none
+    init: true
+
+volumes:
+  opencode-runtime:
+    driver: local

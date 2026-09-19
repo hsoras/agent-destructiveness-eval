@@ -13,6 +13,7 @@ import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -27,6 +28,39 @@ ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
     "INSPECT_EVAL_CHECKPOINT",
 )
+
+
+def resolve_inspect_command(project_root: Path) -> list[str] | None:
+    """Select an Inspect CLI that can import the pinned OpenCode adapter.
+
+    It is common for ``inspect`` to resolve to an older pyenv environment while
+    the repository's locked dependencies live in ``.venv``. In that case use
+    ``uv run`` for the child CLI so task loading and solver construction happen
+    in the same environment. This keeps ``python scripts/pilot.py`` reliable
+    without mutating a global interpreter.
+    """
+
+    try:
+        import inspect_swe  # noqa: F401
+    except ImportError:
+        inspect_swe_available = False
+    else:
+        inspect_swe_available = True
+
+    interpreter_cli = Path(sys.executable).with_name("inspect")
+    if inspect_swe_available and interpreter_cli.is_file():
+        return [str(interpreter_cli)]
+
+    uv = shutil.which("uv")
+    local_cli = project_root / ".venv" / "bin" / "inspect"
+    if uv and local_cli.is_file():
+        return [uv, "run", "--frozen", "inspect"]
+
+    if inspect_swe_available:
+        inspect_cli = shutil.which("inspect")
+        if inspect_cli:
+            return [inspect_cli]
+    return None
 
 def fresh_eval_environment(
     base_environment: Mapping[str, str] | None = None,
@@ -352,6 +386,12 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
+    if not model.startswith("openrouter/"):
+        parser.error(
+            "this harness runs OpenCode through the Inspect model bridge; "
+            "--model must be an OpenRouter route (for example z-ai/glm-5.3-flash)"
+        )
+
     if args.openrouter_provider:
         if any(argument.strip().startswith("provider=") for argument in args.model_arg):
             parser.error("use --provider or --model-arg provider=..., not both")
@@ -375,9 +415,12 @@ def main() -> int:
             parser.error("use --privacy or --model-arg provider=..., not both")
         args.model_arg.insert(0, openrouter_privacy_arg())
 
-    inspect_cli = shutil.which("inspect")
-    if inspect_cli is None:
-        parser.error("Inspect CLI not found; install the project environment first")
+    inspect_command = resolve_inspect_command(Path(__file__).resolve().parents[1])
+    if inspect_command is None:
+        parser.error(
+            "Inspect SWE is unavailable in the active interpreter and no synced "
+            "project .venv was found; run `uv sync --frozen` first"
+        )
 
     task_prefixes = {
         "blocker": "streamstats_blocker_",
@@ -422,7 +465,7 @@ def main() -> int:
         write_model_cost_config(model_cost_config, model, cost)
         print(f"pricing: {pricing_source}")
 
-    command = [inspect_cli, "eval", *task_targets]
+    command = [*inspect_command, "eval", *task_targets]
     command.extend(command_prompt_policy)
     if args.difficulty in (*CALIBRATION_DIFFICULTIES, *DIFFICULTIES):
         if args.difficulty in DIFFICULTIES:
@@ -470,11 +513,16 @@ def main() -> int:
         command.extend(["--max-sandboxes", str(args.max_sandboxes)])
 
     print("$ " + shlex.join(command))
+    environment = fresh_eval_environment()
+    # The task solver receives the same fully-qualified route that Inspect uses
+    # for pricing and model generation. OpenCode's provider name selects its
+    # request format; the Inspect bridge still owns the actual OpenRouter call.
+    environment["STREAMSTATS_OPENCODE_MODEL"] = model
     try:
         return subprocess.run(
             command,
             check=False,
-            env=fresh_eval_environment(),
+            env=environment,
         ).returncode
     finally:
         if temporary_cost_dir is not None:

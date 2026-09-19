@@ -4,13 +4,46 @@ services:
       context: ..
       dockerfile: sandbox/Dockerfile.synthetic-blocker
     working_dir: /workspace
-    command: ["sleep", "infinity"]
-    user: "1000:1000"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /home/dev/.cache /home/dev/.local/share /home/dev/.local/state
+        mkdir -p /home/dev/.config/opencode
+        printf '%s\n' '{"provider":{"openrouter":{"models":{"z-ai/glm-5.3-flash":{"name":"GLM 5.3 Flash"}}}}}' > /home/dev/.config/opencode/config.json
+        chown 1000:1000 /home/dev/.config/opencode/config.json
+        chmod 0644 /home/dev/.config/opencode/config.json
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        if [ "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version 2>/dev/null || true)" != "1.14.41" ]; then
+          find /var/tmp/.5c95f967ca830048 -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /var/tmp/.5c95f967ca830048/
+          chown -R root:root /var/tmp/.5c95f967ca830048
+          chmod -R a-w /var/tmp/.5c95f967ca830048
+        fi
+        test "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version)" = "1.14.41"
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        exec sleep infinity
+    environment:
+      TMPDIR: /var/tmp/agent-tmp
+    # Keep the framework's default exec/write path root-capable for Inspect's
+    # framework-bundle injection. OpenCode runs as dev explicitly.
+    user: "0:0"
+    depends_on:
+      opencode-runtime-init:
+        condition: service_completed_successfully
     read_only: true
+    volumes:
+      - opencode-runtime:/var/tmp/.5c95f967ca830048
     tmpfs:
       - /workspace:size=512m,uid=1000,gid=1000,mode=1777
       - /tmp:size=16m,uid=1000,gid=1000,mode=1777,exec
-      - /var/tmp:size=64m,uid=0,gid=0,mode=1777,exec
+      # Match the real blocker stack: the root-only framework mount must hold
+      # the pinned OpenCode bundle while remaining unavailable to dev.
+      - /var/tmp:size=512m,uid=0,gid=0,mode=755,exec
+      - /var/tmp/agent-tmp:size=16m,uid=1000,gid=1000,mode=1777,exec
       - /home/dev:size=16m,uid=1000,gid=1000,mode=700
       - /dev/shm:size=1m,uid=1000,gid=1000,mode=1777
       - /run:size=4m,uid=0,gid=0,mode=755
@@ -33,6 +66,33 @@ services:
       - benchmark-internal
     init: true
 
+  opencode-runtime-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile.synthetic-blocker
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -x /target/opencode/node_modules/.bin/opencode ]; then
+          find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /target/
+          chown -R root:root /target
+          chmod -R a-w /target
+        fi
+    user: "0:0"
+    read_only: true
+    volumes:
+      - opencode-runtime:/target
+    networks:
+      - benchmark-internal
+    init: true
+
 networks:
   benchmark-internal:
     internal: true
+
+volumes:
+  opencode-runtime:
+    driver: local

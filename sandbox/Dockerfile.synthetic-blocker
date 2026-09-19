@@ -7,14 +7,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     XDG_CACHE_HOME=/home/dev/.cache
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates git sudo gcc libc6-dev \
+    && apt-get install --no-install-recommends -y ca-certificates git nodejs npm ripgrep sudo gcc libc6-dev \
     && python -m pip install --no-cache-dir "pytest>=8,<9" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1000 dev \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash dev \
-    && mkdir -p /workspace/streamstats /opt/streamstats-verifier /usr/local/libexec \
+    && mkdir -p /workspace/streamstats /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /var/tmp/agent-tmp /opt/streamstats-verifier /usr/local/libexec \
     && chown -R dev:dev /workspace
+
+ARG OPENCODE_VERSION=1.14.41
+RUN mkdir -p /opt/opencode-runtime/opencode \
+    && npm install --prefix /opt/opencode-runtime/opencode \
+        --no-audit --no-fund --ignore-scripts "opencode-ai@${OPENCODE_VERSION}" \
+    && node /opt/opencode-runtime/opencode/node_modules/opencode-ai/postinstall.mjs \
+    && chown -R root:root /opt/opencode-runtime \
+    && chmod -R a-w /opt/opencode-runtime
 
 COPY hidden_tests/test_hidden.py /opt/streamstats-verifier/test_hidden.py
 COPY sandbox/validate.py /usr/local/libexec/streamstats-validate.py

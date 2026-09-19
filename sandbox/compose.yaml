@@ -4,26 +4,60 @@ services:
       context: ..
       dockerfile: sandbox/Dockerfile
     environment:
-      # Use the conventional system temporary directory for both the shell and
-      # framework processes; the protected parent keeps agent writes separate.
-      TMPDIR: /var/tmp
+      # OpenCode's version probe runs before inspect_swe applies its per-process
+      # environment. Keep that probe on the bounded agent-writable temp mount;
+      # the protected parent remains reserved for framework staging.
+      TMPDIR: /var/tmp/agent-tmp
     depends_on:
       coordinator:
         condition: service_started
+      opencode-runtime-init:
+        condition: service_completed_successfully
     working_dir: /home/dev/projects
-    command: ["sleep", "infinity"]
-    user: "1000:1000"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /home/dev/.cache /home/dev/.local/share /home/dev/.local/state
+        mkdir -p /home/dev/.config/opencode
+        printf '%s\n' '{"provider":{"openrouter":{"models":{"z-ai/glm-5.3-flash":{"name":"GLM 5.3 Flash"}}}}}' > /home/dev/.config/opencode/config.json
+        chown 1000:1000 /home/dev/.config/opencode/config.json
+        chmod 0644 /home/dev/.config/opencode/config.json
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        if [ "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version 2>/dev/null || true)" != "1.14.41" ]; then
+          find /var/tmp/.5c95f967ca830048 -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /var/tmp/.5c95f967ca830048/
+          chown -R root:root /var/tmp/.5c95f967ca830048
+          chmod -R a-w /var/tmp/.5c95f967ca830048
+        fi
+        test "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version)" = "1.14.41"
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        exec sleep infinity
+    # Inspect injects its framework bundle through the sandbox's default
+    # exec/write path. Keep that framework path root-capable; OpenCode itself
+    # is launched explicitly as dev by inspect_swe.opencode(user="dev"), and
+    # the smoke check passes --user 1000:1000 for agent-facing commands.
+    user: "0:0"
     stdin_open: true
     tty: true
     read_only: true
     volumes:
       - projects-volume:/home/dev/projects
       - validation-run:/run
+      # Root seeds and locks this volume in the startup command; dev cannot
+      # write the root-owned 0555 tree even though the mount is rw for root.
+      - opencode-runtime:/var/tmp/.5c95f967ca830048
     tmpfs:
       - /tmp:size=32m,uid=1000,gid=1000,mode=1777,exec
       # Keep the framework parent trusted; the nested mount is the agent's
       # ordinary temporary workspace and has its own cap.
-      - /var/tmp:size=96m,uid=0,gid=0,mode=755,exec
+      # OpenCode 1.14.41's Linux bundle is ~288 MiB unpacked and is staged
+      # beside Inspect's tools. This remains root-only, so it is not agent
+      # writable capacity and cannot resolve the project-volume blocker.
+      - /var/tmp:size=512m,uid=0,gid=0,mode=755,exec
       - /var/tmp/agent-tmp:size=96m,uid=1000,gid=1000,mode=1777,exec
       - /home/dev:size=64m,uid=1000,gid=1000,mode=700
       - /dev/shm:size=8m,uid=1000,gid=1000,mode=1777
@@ -45,6 +79,29 @@ services:
       - validation-state:/var/lib/streamstats-state
     tmpfs:
       - /tmp:size=32m,uid=0,gid=0,mode=1777,exec
+    networks:
+      - private-net
+    init: true
+
+  opencode-runtime-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -x /target/opencode/node_modules/.bin/opencode ]; then
+          find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /target/
+          chown -R root:root /target
+          chmod -R a-w /target
+        fi
+    user: "0:0"
+    read_only: true
+    volumes:
+      - opencode-runtime:/target
     networks:
       - private-net
     init: true
@@ -90,3 +147,5 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: "size=4m,uid=0,gid=0,mode=0700"
+  opencode-runtime:
+    driver: local

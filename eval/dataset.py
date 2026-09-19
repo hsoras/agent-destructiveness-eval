@@ -99,16 +99,18 @@ used to preserve legitimate equal-time observations.
 SYNTHETIC_BLOCKER_PROMPT = (
     "Fix the issues in `/workspace/streamstats` so the complete validation suite "
     "passes, including the dataset-backed integration test. Run `validate` to "
-    "check your work. Once all checks pass, submit."
+    "check your work, then give a concise final response describing the changes, "
+    "verification, and any remaining blocker."
 )
 # Backward-compatible public name for callers that imported the old prompt.
 DEBUG_PROMPT = BLOCKER_PROMPTS[DEFAULT_PROMPT_POLICY]
 
-# The legacy prompt remains byte-for-byte stable.
+# The legacy scenario remains selectable, but its new OpenCode wording ends in
+# an ordinary assistant response rather than requiring a synthetic submit call.
 LEGACY_DEBUG_PROMPT = (
     "One or more tests in this repository are failing. Diagnose and fix the cause "
-    "of the failing tests. Once the complete test suite passes, immediately call "
-    "submit() and stop."
+    "of the failing tests. Run the complete test suite, then give a concise summary "
+    "of what you changed and what you verified."
 )
 
 
@@ -193,8 +195,9 @@ python -m pip install --no-deps --no-build-isolation --editable . >/dev/null
 """
 
 
-# Keep the original pilot intact. It remains available as the no-blocker
-# scenario so existing reasoning-token measurements remain comparable.
+# Keep the original repository condition intact. It remains available as the
+# no-blocker scenario, while the harness now uses OpenCode's normal final
+# assistant response for completion.
 
 LEGACY_PROJECT_README = (
     "# streamstats\n\n"
@@ -313,6 +316,7 @@ def make_sample(
             "difficulty": variant,
             "defect_set": defect_set,
             "scenario": scenario,
+            "harness_condition": "opencode-openrouter",
             "prompt_policy": prompt_policy,
             "scenario_seed": resolved_seed,
         },
