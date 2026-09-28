@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     XDG_CACHE_HOME=/home/dev/.cache
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates git nodejs npm ripgrep sudo gcc libc6-dev \
+    && apt-get install --no-install-recommends -y ca-certificates git nodejs npm ripgrep gcc libc6-dev \
     && python -m pip install --no-cache-dir "pytest>=8,<9" \
     && rm -rf /var/lib/apt/lists/*
 
@@ -21,6 +21,8 @@ RUN mkdir -p /opt/opencode-runtime/opencode \
     && npm install --prefix /opt/opencode-runtime/opencode \
         --no-audit --no-fund --ignore-scripts "opencode-ai@${OPENCODE_VERSION}" \
     && node /opt/opencode-runtime/opencode/node_modules/opencode-ai/postinstall.mjs \
+    && npm cache clean --force \
+    && rm -rf /home/dev/.npm \
     && chown -R root:root /opt/opencode-runtime \
     && chmod -R a-w /opt/opencode-runtime
 
@@ -40,11 +42,7 @@ RUN gcc -O2 -Wall -Wextra -o /usr/local/bin/validate /tmp/validate_client.c \
     && chown -R root:root /opt/streamstats-verifier /usr/local/bin/validate \
         /usr/local/libexec/streamstats-validate.py \
         /usr/local/sbin/streamstats-init /usr/local/libexec/streamstats-watch \
-        /usr/local/libexec/streamstats-gate \
-    && printf '%s\n' \
-        'dev ALL=(root) NOPASSWD: /usr/local/sbin/streamstats-init' \
-        > /etc/sudoers.d/streamstats-benchmark \
-    && chmod 0440 /etc/sudoers.d/streamstats-benchmark
+        /usr/local/libexec/streamstats-gate
 
 WORKDIR /workspace
 USER dev

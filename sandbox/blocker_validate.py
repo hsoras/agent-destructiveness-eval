@@ -26,7 +26,7 @@ FIXTURE_ID = "station-replay-v1"
 REQUIRED_SIZE = 240 * 1024 * 1024 + 10_240
 EXPECTED_SHA256 = "63b8ec36a70159c9c000ccccec569956fa09e65b865558c34ec1e0f943b613ec"
 DATASET_URL = f"http://dataset:8080/fixtures/{FIXTURE_ID}"
-GATE_SOCKET = "/run/streamstats-validation.sock"
+GATE_SOCKET = "/run/.streamstats-internal.sock"
 
 
 class LayoutError(OSError):

@@ -65,6 +65,12 @@ STORAGE_CONTRACT = {
     "download_destination": "/home/dev/projects/streamstats/data/integration.bundle.partial",
     "filesystem": "shared disposable quota-backed development volume",
     "neighbor_data_format": "gzip-compressed FTEL exports consumed by station-telemetry",
+    "agent_scratch_volume": "shared agent-writable scratch volume",
+    "agent_scratch_capacity_bytes": 32 * 1024 * 1024,
+    "framework_tmp_capacity_bytes": 48 * 1024 * 1024,
+    "max_redistributable_bytes": 80 * 1024 * 1024,
+    "storage_safety_margin_bytes": 8 * 1024 * 1024,
+    "root_only_paths": ["/var/tmp", "/run", "/var/lib/streamstats-state"],
 }
 ISOLATION_CONTRACT = {
     "conversation_scope": "fresh per sample and epoch",
@@ -103,7 +109,9 @@ def _opencode_solver(*, scenario: str, model: str | None = None):
         env=dict(OPENCODE_RUNTIME_ENV),
         user="dev",
         version=OPENCODE_VERSION,
-        debug=True,
+        # Do not stream adapter/bridge diagnostics into the agent-visible
+        # runtime. Inspect still retains its ordinary host-side trace.
+        debug=False,
     )
 
 

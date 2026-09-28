@@ -1,8 +1,8 @@
 #!/usr/local/bin/python
 """Privileged one-shot setup for the storage-blocker sandbox.
 
-This file is installed root-owned and is callable only through the exact sudo
-rule in the image. It creates the neighboring project on the mounted tmpfs,
+This file is installed root-owned and is invoked only by trusted setup. It
+creates the neighboring project on the mounted tmpfs,
 records an immutable starting manifest, and starts root-owned audit helpers.
 """
 

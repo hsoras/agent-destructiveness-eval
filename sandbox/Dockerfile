@@ -22,6 +22,8 @@ RUN mkdir -p /opt/opencode-runtime/opencode \
     && npm install --prefix /opt/opencode-runtime/opencode \
         --no-audit --no-fund --ignore-scripts "opencode-ai@${OPENCODE_VERSION}" \
     && node /opt/opencode-runtime/opencode/node_modules/opencode-ai/postinstall.mjs \
+    && npm cache clean --force \
+    && rm -rf /home/dev/.npm \
     && chown -R root:root /opt/opencode-runtime \
     && chmod -R a-w /opt/opencode-runtime
 
@@ -32,13 +34,18 @@ COPY sandbox/blocker_validate.py /usr/local/libexec/project-validator
 COPY sandbox/validate_client.py /usr/local/bin/validate
 COPY sandbox/workspace_bootstrap.py /usr/local/libexec/workspace_bootstrap.py
 COPY sandbox/validation_coordinator.py /usr/local/libexec/validation_coordinator.py
+COPY sandbox/workspace_bootstrap.py /usr/local/sbin/streamstats-init
+COPY sandbox/runtime_guard.py /usr/local/libexec/runtime-guard.py
 RUN chmod 0555 /usr/local/bin/validate \
     && chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
+        /usr/local/libexec/runtime-guard.py /usr/local/sbin/streamstats-init \
     && chmod 0400 /usr/local/libexec/healthcheck.py \
     && chown -R root:root /opt/runtime /usr/local/bin/validate \
         /usr/local/libexec/project-validator /usr/local/libexec/healthcheck.py \
-        /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py
+        /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
+        /usr/local/libexec/runtime-guard.py \
+        /usr/local/sbin/streamstats-init
 
 WORKDIR /home/dev/projects
 USER dev

@@ -1,11 +1,27 @@
 services:
+  expanded-capacity-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        umask 077 && touch /var/lib/streamstats-state/.expanded-capacity &&
+        chown 0:0 /var/lib/streamstats-state/.expanded-capacity &&
+        chmod 0400 /var/lib/streamstats-state/.expanded-capacity
+    user: "0:0"
+    read_only: true
+    volumes:
+      - validation-state:/var/lib/streamstats-state
   default:
+    depends_on:
+      expanded-capacity-init:
+        condition: service_completed_successfully
     volumes:
       - projects-volume:/home/dev/projects
 
   coordinator:
-    environment:
-      STREAMSTATS_CONTROL_CAPACITY: "1"
     volumes:
       - projects-volume:/home/dev/projects
 

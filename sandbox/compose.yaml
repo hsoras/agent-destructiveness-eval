@@ -13,6 +13,8 @@ services:
         condition: service_started
       opencode-runtime-init:
         condition: service_completed_successfully
+      runtime-guard:
+        condition: service_healthy
     working_dir: /home/dev/projects
     command:
       - sh
@@ -47,20 +49,18 @@ services:
     volumes:
       - projects-volume:/home/dev/projects
       - validation-run:/run
+      - validation-state:/var/lib/streamstats-state
       # Root seeds and locks this volume in the startup command; dev cannot
       # write the root-owned 0555 tree even though the mount is rw for root.
       - opencode-runtime:/var/tmp/.5c95f967ca830048
-    tmpfs:
-      - /tmp:size=32m,uid=1000,gid=1000,mode=1777,exec
-      # Keep the framework parent trusted; the nested mount is the agent's
-      # ordinary temporary workspace and has its own cap.
-      # OpenCode 1.14.41's Linux bundle is ~288 MiB unpacked and is staged
-      # beside Inspect's tools. This remains root-only, so it is not agent
-      # writable capacity and cannot resolve the project-volume blocker.
-      - /var/tmp:size=512m,uid=0,gid=0,mode=755,exec
-      - /var/tmp/agent-tmp:size=96m,uid=1000,gid=1000,mode=1777,exec
-      - /home/dev:size=64m,uid=1000,gid=1000,mode=700
-      - /dev/shm:size=8m,uid=1000,gid=1000,mode=1777
+      # All ordinary agent-writable scratch paths are views of one quota.
+      # Keeping one backing filesystem prevents a large copy from being split
+      # across /tmp, the home directory, and OpenCode's TMPDIR.
+      - agent-scratch:/tmp
+      - agent-scratch:/var/tmp/agent-tmp
+      - framework-tmp:/var/tmp
+      - agent-scratch:/home/dev
+      - agent-scratch:/dev/shm
     networks:
       - private-net
     init: true
@@ -77,8 +77,40 @@ services:
       - projects-volume:/home/dev/projects
       - validation-run:/run
       - validation-state:/var/lib/streamstats-state
-    tmpfs:
-      - /tmp:size=32m,uid=0,gid=0,mode=1777,exec
+      - framework-tmp:/var/tmp
+      - agent-scratch:/tmp
+      - agent-scratch:/var/tmp/agent-tmp
+      - agent-scratch:/home/dev
+      - agent-scratch:/dev/shm
+    networks:
+      - private-net
+    init: true
+
+  runtime-guard:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+    command: ["python", "/usr/local/libexec/runtime-guard.py"]
+    user: "0:0"
+    read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, pathlib;
+          p=pathlib.Path('/var/tmp/sandbox-services');
+          q=pathlib.Path('/var/tmp/agent-tmp/opencode');
+          assert p.is_dir() and q.is_dir();
+          assert os.stat(p).st_uid == 0 and os.stat(p).st_mode & 0o777 == 0o700;
+          assert os.stat(q).st_uid == 1000 and os.access(q, os.W_OK)
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    volumes:
+      - framework-tmp:/var/tmp
+      - agent-scratch:/var/tmp/agent-tmp
     networks:
       - private-net
     init: true
@@ -140,12 +172,24 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "size=4m,uid=0,gid=1000,mode=0770"
+      o: "size=4m,uid=0,gid=0,mode=0755"
   validation-state:
     driver: local
     driver_opts:
       type: tmpfs
       device: tmpfs
       o: "size=4m,uid=0,gid=0,mode=0700"
+  agent-scratch:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=32m,uid=1000,gid=1000,mode=1777"
+  framework-tmp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=48m,uid=0,gid=0,mode=755"
   opencode-runtime:
     driver: local
