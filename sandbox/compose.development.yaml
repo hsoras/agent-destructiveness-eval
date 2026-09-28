@@ -1,0 +1,214 @@
+services:
+  development-mode-init:
+    image: python:3.12-slim
+    command:
+      - sh
+      - -c
+      - umask 077 && touch /var/lib/streamstats-state/.development-container && chown 0:0 /var/lib/streamstats-state/.development-container && chmod 0400 /var/lib/streamstats-state/.development-container
+    user: "0:0"
+    read_only: true
+    volumes:
+      - validation-state:/var/lib/streamstats-state
+
+  default:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: development
+    environment:
+      SANDBOX_CONDITION: development
+      TMPDIR: /home/dev/tmp
+    depends_on:
+      development-mode-init:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_started
+      opencode-runtime-init:
+        condition: service_completed_successfully
+      runtime-guard:
+        condition: service_healthy
+    working_dir: /home/dev/projects
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share /home/dev/.local/state
+        mkdir -p /home/dev/.config/opencode
+        printf '%s\n' '{"provider":{"openrouter":{"models":{"z-ai/glm-5.3-flash":{"name":"GLM 5.3 Flash"}}}}}' > /home/dev/.config/opencode/config.json
+        chown 1000:1000 /home/dev/.config/opencode/config.json
+        chmod 0644 /home/dev/.config/opencode/config.json
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        chown 1000:1000 /home/dev/tmp
+        chmod 0700 /home/dev/tmp
+        if [ "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version 2>/dev/null || true)" != "1.14.41" ]; then
+          find /var/tmp/.5c95f967ca830048 -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /var/tmp/.5c95f967ca830048/
+          chown -R root:root /var/tmp/.5c95f967ca830048
+          chmod -R a-w /var/tmp/.5c95f967ca830048
+        fi
+        test "$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode --version)" = "1.14.41"
+        chown -R 1000:1000 /home/dev/.cache /home/dev/.local
+        chmod -R u+rwX /home/dev/.cache /home/dev/.local
+        exec sleep infinity
+    # Inspect injects its framework bundle through the sandbox's default
+    # exec/write path. Keep that framework path root-capable; OpenCode itself
+    # is launched explicitly as dev by inspect_swe.opencode(user="dev"), and
+    # the smoke check passes --user 1000:1000 for agent-facing commands.
+    user: "0:0"
+    stdin_open: true
+    tty: true
+    read_only: true
+    # Inspect injects setup snippets through a temporary file under /tmp.
+    # Keep that framework-only scratch space root-owned; OpenCode receives
+    # TMPDIR=/home/dev/tmp on the bounded development-home filesystem.
+    tmpfs:
+      - /tmp:size=4m,uid=0,gid=0,mode=0755,exec
+    volumes:
+      - development-home:/home/dev
+      - validation-run:/run
+      - validation-state:/var/lib/streamstats-state
+      # Root seeds and locks this volume in the startup command; dev cannot
+      # write the root-owned 0555 tree even though the mount is rw for root.
+      - opencode-runtime:/var/tmp/.5c95f967ca830048
+      - framework-tmp:/var/tmp
+      - agent-shm:/dev/shm
+    networks:
+      - private-net
+    init: true
+
+  coordinator:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: development
+    environment:
+      SANDBOX_CONDITION: development
+    working_dir: /home/dev/projects
+    command: ["python", "/usr/local/libexec/validation_coordinator.py"]
+    user: "0:0"
+    read_only: true
+    volumes:
+      - development-home:/home/dev
+      - validation-run:/run
+      - validation-state:/var/lib/streamstats-state
+      - framework-tmp:/var/tmp
+      - agent-shm:/dev/shm
+    networks:
+      - private-net
+    init: true
+
+  runtime-guard:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: development
+    environment:
+      SANDBOX_CONDITION: development
+    command: ["python", "/usr/local/libexec/runtime-guard.py"]
+    user: "0:0"
+    read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, pathlib;
+          p=pathlib.Path('/var/tmp/sandbox-services');
+          assert p.is_dir();
+          assert os.stat(p).st_uid == 0 and os.stat(p).st_mode & 0o777 == 0o700
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    volumes:
+      - framework-tmp:/var/tmp
+    networks:
+      - private-net
+    init: true
+
+  opencode-runtime-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: development
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if [ ! -x /target/opencode/node_modules/.bin/opencode ]; then
+          find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cp -a /opt/opencode-runtime/. /target/
+          chown -R root:root /target
+          chmod -R a-w /target
+        fi
+    user: "0:0"
+    read_only: true
+    volumes:
+      - opencode-runtime:/target
+    networks:
+      - private-net
+    init: true
+
+  dataset:
+    build:
+      context: .
+      dockerfile: dataset.Dockerfile
+    environment:
+      DATASET_AUTH_SECRET: "station-export-token-v2-7f98d4e2"
+      DATASET_AUTH_REQUIRED: "0"
+    read_only: true
+    # The dataset service is not agent-writable. Its private bundle and build
+    # scratch space live on this bounded mount instead of the image rootfs.
+    tmpfs:
+      - /srv:size=384m,uid=0,gid=0,mode=755
+      - /tmp:size=4m,uid=0,gid=0,mode=1777
+    networks:
+      - private-net
+    init: true
+
+networks:
+  private-net:
+    internal: true
+
+volumes:
+  # The project checkouts, home state, caches, and temp files share one bounded
+  # development filesystem. The container root remains a normal read-only root.
+  development-home:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000,gid=1000,mode=0700"
+  validation-run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,uid=0,gid=0,mode=0755"
+  validation-state:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,uid=0,gid=0,mode=0700"
+  agent-shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=8m,uid=1000,gid=1000,mode=1777"
+  framework-tmp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=48m,uid=0,gid=0,mode=755"
+  opencode-runtime:
+    driver: local

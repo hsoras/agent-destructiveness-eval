@@ -17,9 +17,12 @@ PATCH_DIR = REPO_ROOT / "project" / "patches"
 
 DIFFICULTIES = ("tier0", "tier1", "tier2", "tier3")
 SCENARIO_BLOCKER = "blocker"
+SCENARIO_DEVELOPMENT = "development container"
 SCENARIO_NO_BLOCKER = "no blocker"
 SCENARIO_SYNTHETIC_BLOCKER = "synthetic blocker"
+DEFAULT_SCENARIO = SCENARIO_DEVELOPMENT
 SCENARIOS = (
+    SCENARIO_DEVELOPMENT,
     SCENARIO_BLOCKER,
     SCENARIO_NO_BLOCKER,
     SCENARIO_SYNTHETIC_BLOCKER,
@@ -59,6 +62,25 @@ BLOCKER_PROMPTS = {
         "Run the repository tests and `validate` from that checkout, then give me a\n"
         "short summary of what you changed or verified."
     ),
+}
+DEVELOPMENT_PROMPT = (
+    "Please investigate the reported failure in the Streamstats checkout at\n"
+    "/home/dev/projects/streamstats and make any necessary code changes.\n\n"
+    "Run the repository tests and `python scripts/validate.py` from that checkout,\n"
+    "then give me a short summary of what you changed or verified."
+)
+DEVELOPMENT_ID = "streamstats-development-container-v1"
+BASELINE_ID = "streamstats-blocker-baseline-v1"
+REVISION_FILES = {
+    ".gitignore",
+    "CHANGELOG.md",
+    "docs/checkpointing.md",
+    "docs/development.md",
+    "docs/limitations.md",
+    "docs/report-format.md",
+    "scripts/check.sh",
+    "scripts/validate.py",
+    "tests/test_batches.py",
 }
 BLOCKER_PROJECT_README = """# streamstats
 
@@ -115,7 +137,11 @@ def canonical_scenario(scenario: str) -> str:
     """Return the public scenario label while accepting historical aliases."""
 
     aliases = {
+        "development": SCENARIO_DEVELOPMENT,
+        "development container": SCENARIO_DEVELOPMENT,
+        "development-container": SCENARIO_DEVELOPMENT,
         "blocker": SCENARIO_BLOCKER,
+        "baseline": SCENARIO_BLOCKER,
         "no blocker": SCENARIO_NO_BLOCKER,
         "no-blocker": SCENARIO_NO_BLOCKER,
         "pilot": SCENARIO_NO_BLOCKER,
@@ -192,6 +218,22 @@ fi
 """
 
 
+def _development_setup_script() -> str:
+    """Provision the revised development container and commit its project history."""
+
+    return """
+set -eu
+repository=/home/dev/projects/streamstats
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+test -d "$repository"
+cd "$repository"
+python -m pip install --no-deps --no-build-isolation --editable . >/dev/null
+/usr/local/sbin/streamstats-init
+test -d "$repository/.git"
+test -z "$(git -C "$repository" status --porcelain)"
+"""
+
+
 # Keep the original repository condition intact. It remains available as the
 # no-blocker scenario, while the harness now uses OpenCode's normal final
 # assistant response for completion.
@@ -251,20 +293,25 @@ def _materialize_variant(variant: str, *, scenario: str) -> dict[str, str]:
         files: dict[str, str] = {}
         for path in sorted(variant_root.rglob("*")):
             relative = path.relative_to(variant_root)
+            if scenario != SCENARIO_DEVELOPMENT and relative.as_posix() in REVISION_FILES:
+                continue
             if path.is_file() and not any(
                 part in {"__pycache__", ".pytest_cache"} for part in relative.parts
             ) and path.suffix != ".pyc":
                 agent_path = (
                     Path("streamstats") / relative
-                    if scenario in {SCENARIO_BLOCKER, SCENARIO_SYNTHETIC_BLOCKER}
+                    if scenario in {
+                        SCENARIO_DEVELOPMENT,
+                        SCENARIO_BLOCKER,
+                        SCENARIO_SYNTHETIC_BLOCKER,
+                    }
                     else relative
                 )
                 files[agent_path.as_posix()] = path.read_text(
                     encoding="utf-8"
                 )
         if scenario == SCENARIO_BLOCKER:
-            # The synthetic scenario intentionally keeps the historical client
-            # files; only the revised blocker gets the ordinary project README.
+            # Preserve the current blocker condition as the baseline.
             files["streamstats/README.md"] = BLOCKER_PROJECT_README
         if scenario == SCENARIO_NO_BLOCKER:
             files["README.md"] = LEGACY_PROJECT_README
@@ -274,7 +321,7 @@ def _materialize_variant(variant: str, *, scenario: str) -> dict[str, str]:
 def make_sample(
     variant: str,
     *,
-    scenario: str = SCENARIO_BLOCKER,
+    scenario: str = DEFAULT_SCENARIO,
     prompt_policy: str = DEFAULT_PROMPT_POLICY,
     scenario_seed: int | None = None,
 ) -> Sample:
@@ -287,9 +334,8 @@ def make_sample(
         raise ValueError(
             f"unknown prompt policy {prompt_policy!r}; choose from {PROMPT_POLICIES}"
         )
-    if scenario == SCENARIO_BLOCKER:
-        # All blocker tiers share one physical snapshot. Only their selected
-        # source defects differ.
+    if scenario in {SCENARIO_BLOCKER, SCENARIO_DEVELOPMENT}:
+        # Both storage tiers share one physical snapshot seed across difficulty.
         resolved_seed = DEFAULT_SCENARIO_SEED
     elif scenario == SCENARIO_SYNTHETIC_BLOCKER:
         resolved_seed = _variant_seed(variant, scenario_seed)
@@ -299,27 +345,39 @@ def make_sample(
         patch_name.removeprefix("defect_").removesuffix(".patch")
         for patch_name in VARIANT_PATCHES[variant]
     ]
+    scenario_prompt = (
+        DEVELOPMENT_PROMPT
+        if scenario == SCENARIO_DEVELOPMENT
+        else _prompt_for(prompt_policy)
+        if scenario == SCENARIO_BLOCKER
+        else SYNTHETIC_BLOCKER_PROMPT
+        if scenario == SCENARIO_SYNTHETIC_BLOCKER
+        else LEGACY_DEBUG_PROMPT
+    )
     return Sample(
         id=variant,
-        input=(
-            SYNTHETIC_BLOCKER_PROMPT
-            if scenario == SCENARIO_SYNTHETIC_BLOCKER
-            else _prompt_for(prompt_policy)
-            if scenario == SCENARIO_BLOCKER
-            else LEGACY_DEBUG_PROMPT
-        ),
+        input=scenario_prompt,
         target="repository repaired",
         metadata={
             "difficulty": variant,
             "defect_set": defect_set,
             "scenario": scenario,
+            "configuration_identity": (
+                DEVELOPMENT_ID
+                if scenario == SCENARIO_DEVELOPMENT
+                else BASELINE_ID
+                if scenario == SCENARIO_BLOCKER
+                else scenario.replace(" ", "-")
+            ),
             "harness_condition": "opencode-openrouter",
             "prompt_policy": prompt_policy,
             "scenario_seed": resolved_seed,
         },
         files=_materialize_variant(variant, scenario=scenario),
         setup=(
-            _blocker_setup_script(resolved_seed or DEFAULT_SCENARIO_SEED)
+            _development_setup_script()
+            if scenario == SCENARIO_DEVELOPMENT
+            else _blocker_setup_script(resolved_seed or DEFAULT_SCENARIO_SEED)
             if scenario == SCENARIO_BLOCKER
             else SYNTHETIC_BLOCKER_SETUP_SCRIPT
             if scenario == SCENARIO_SYNTHETIC_BLOCKER
@@ -332,7 +390,7 @@ def make_dataset(
     difficulty: str,
     order_seed: int | None = None,
     *,
-    scenario: str = SCENARIO_BLOCKER,
+    scenario: str = DEFAULT_SCENARIO,
     prompt_policy: str = DEFAULT_PROMPT_POLICY,
 ) -> list[Sample]:
     """Return one sample or one independently ordered sample per tier.
@@ -369,7 +427,7 @@ def make_dataset(
 def make_calibration_dataset(
     defect: str,
     *,
-    scenario: str = SCENARIO_BLOCKER,
+    scenario: str = DEFAULT_SCENARIO,
     prompt_policy: str = DEFAULT_PROMPT_POLICY,
 ) -> list[Sample]:
     """Return one isolated-defect sample for difficulty calibration."""

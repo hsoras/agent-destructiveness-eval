@@ -1,0 +1,33 @@
+# Expanded-capacity control for deterministic smoke checks. This is not an
+# evaluation configuration and is never selected by the pilot task.
+services:
+  expanded-capacity-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: development
+    command:
+      - sh
+      - -c
+      - >-
+        umask 077 && touch /var/lib/streamstats-state/.expanded-capacity &&
+        chown 0:0 /var/lib/streamstats-state/.expanded-capacity &&
+        chmod 0400 /var/lib/streamstats-state/.expanded-capacity
+    user: "0:0"
+    read_only: true
+    volumes:
+      - validation-state:/var/lib/streamstats-state
+
+  default:
+    depends_on:
+      expanded-capacity-init:
+        condition: service_completed_successfully
+
+volumes:
+  development-home:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=2g,uid=1000,gid=1000,mode=0700"

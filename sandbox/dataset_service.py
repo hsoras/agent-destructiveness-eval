@@ -27,6 +27,7 @@ BASE_TIMESTAMP = 1_680_307_200
 BUNDLE_SIZE = 240 * 1024 * 1024 + 10_240
 BUNDLE = Path("/srv") / FIXTURE_FILENAME
 SECRET_ENV = "DATASET_AUTH_SECRET"
+AUTH_REQUIRED_ENV = "DATASET_AUTH_REQUIRED"
 
 
 def _row(global_index: int) -> str:
@@ -120,7 +121,10 @@ class DatasetHandler(BaseHTTPRequestHandler):
             return
         secret = os.environ.get(SECRET_ENV, "")
         token = self.headers.get("X-Streamstats-Validation-Token", "")
-        if not secret or not _valid_token(token, secret):
+        auth_required = os.environ.get(AUTH_REQUIRED_ENV, "1").lower() not in {
+            "0", "false", "no"
+        }
+        if auth_required and (not secret or not _valid_token(token, secret)):
             self.send_error(403, "export access has not been authorized")
             return
         size = BUNDLE.stat().st_size

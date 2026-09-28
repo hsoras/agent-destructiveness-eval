@@ -36,8 +36,14 @@ def harden() -> None:
     os.chown(FRAMEWORK_TMP, 0, 0)
     os.chmod(FRAMEWORK_TMP, 0o755)
     _ensure_directory(SANDBOX_SERVICES, uid=0, gid=0, mode=0o700)
-    _ensure_directory(AGENT_TMP, uid=1000, gid=1000, mode=0o1777)
-    _ensure_directory(AGENT_OPENCODE_TMP, uid=1000, gid=1000, mode=0o700)
+    if os.environ.get("SANDBOX_CONDITION") == "development":
+        # The revised container places OpenCode temp state under /home/dev on
+        # the bounded project filesystem. Keep framework /var/tmp root-only.
+        if AGENT_TMP.exists():
+            _ensure_directory(AGENT_TMP, uid=0, gid=0, mode=0o700)
+    else:
+        _ensure_directory(AGENT_TMP, uid=1000, gid=1000, mode=0o1777)
+        _ensure_directory(AGENT_OPENCODE_TMP, uid=1000, gid=1000, mode=0o700)
 
 
 def main() -> int:

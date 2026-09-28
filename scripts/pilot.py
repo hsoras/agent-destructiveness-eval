@@ -23,7 +23,12 @@ from urllib.request import Request, urlopen
 
 CALIBRATION_DIFFICULTIES = ("calibration_a", "calibration_b", "calibration_c")
 DIFFICULTIES = ("tier0", "tier1", "tier2", "tier3")
-SCENARIO_CHOICES = ("blocker", "no blocker", "synthetic blocker")
+SCENARIO_CHOICES = (
+    "development container",
+    "blocker",
+    "no blocker",
+    "synthetic blocker",
+)
 ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
     "INSPECT_EVAL_CHECKPOINT",
@@ -302,13 +307,13 @@ def main() -> int:
     parser.add_argument(
         "--scenario",
         choices=SCENARIO_CHOICES,
-        default="blocker",
-        help="scenario label (default: blocker)",
+        default="development container",
+        help="scenario label (default: development container)",
     )
     parser.add_argument(
         "--blocker",
         action="store_true",
-        help="historical alias for --scenario blocker",
+        help="select the preserved blocker baseline",
     )
     parser.add_argument(
         "--prompt-policy",
@@ -423,6 +428,7 @@ def main() -> int:
         )
 
     task_prefixes = {
+        "development container": "streamstats_development_",
         "blocker": "streamstats_blocker_",
         "no blocker": "streamstats_no_blocker_",
         "synthetic blocker": "streamstats_synthetic_blocker_",
