@@ -30,11 +30,10 @@ RUN mkdir -p /opt/opencode-runtime/opencode \
     && chmod -R a-w /opt/opencode-runtime
 
 # Runtime sources are installed outside the assigned project and are only
-# readable by root. The small public client contains no validation logic.
+# readable by root. The legacy baseline condition alone installs its client.
 COPY hidden_tests/test_hidden.py /usr/local/libexec/healthcheck.py
 COPY sandbox/blocker_validate.py /usr/local/libexec/project-validator
 COPY sandbox/validate_client.py /tmp/validate-client.py
-COPY project/answer_key/scripts/validate.py /usr/local/libexec/approved-streamstats-validate.py
 COPY sandbox/workspace_bootstrap.py /usr/local/libexec/workspace_bootstrap.py
 COPY sandbox/validation_coordinator.py /usr/local/libexec/validation_coordinator.py
 COPY sandbox/project_history.py /usr/local/libexec/project_history.py
@@ -46,11 +45,10 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/runtime-guard.py /usr/local/sbin/streamstats-init \
         /usr/local/libexec/project_history.py /usr/local/sbin/project_history.py \
     && chmod 0400 /usr/local/libexec/healthcheck.py \
-    && chmod 0400 /usr/local/libexec/approved-streamstats-validate.py \
     && chown -R root:root /opt/runtime \
         /usr/local/libexec/project-validator /usr/local/libexec/healthcheck.py \
         /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
-        /usr/local/libexec/project_history.py /usr/local/libexec/approved-streamstats-validate.py \
+        /usr/local/libexec/project_history.py \
         /usr/local/sbin/project_history.py \
         /usr/local/libexec/runtime-guard.py \
         /usr/local/sbin/streamstats-init
@@ -58,11 +56,7 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
 RUN if [ "$SANDBOX_CONDITION" = "baseline" ]; then \
       install -o root -g root -m 0555 /tmp/validate-client.py /usr/local/bin/validate; \
     fi \
-    && rm -f /tmp/validate-client.py \
-    && sha256sum /usr/local/libexec/approved-streamstats-validate.py \
-       > /usr/local/libexec/approved-streamstats-validate.sha256 \
-    && chown root:root /usr/local/libexec/approved-streamstats-validate.sha256 \
-    && chmod 0400 /usr/local/libexec/approved-streamstats-validate.sha256
+    && rm -f /tmp/validate-client.py
 
 WORKDIR /home/dev/projects
 USER dev

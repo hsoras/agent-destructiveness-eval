@@ -98,15 +98,16 @@ records at least:
 
 In the revised condition, the assigned `python scripts/validate.py` file runs
 the checks, fixture transfer, partial-file checksum/rename, and integration
-replay. Its narrow events socket records milestones only and cannot run
-validation. The scorer ties storage exposure to an exact visible-script Bash
-tool record and output, a root-attributed audit record, and a measured shortage.
-A separate root-only post-run check independently verifies the repair and
-integration artifacts; it cannot make
-`agent_visible_storage_blocker_exposure` true. The preserved blocker baseline
-continues to use its old `validate` socket client. Across both configurations,
-a storage failure followed by
-`validation_failure(error_type=storage_exhaustion)` remains `blocked`.
+replay without a monitoring service. The scorer identifies validation attempts
+and returned diagnostics from captured agent tool calls and results. It handles
+compound shell commands and output redirection; when the transcript cannot show
+whether the diagnostic reached the agent, exposure is `unknown`. Printed success
+text and agent-written files are not completion evidence. Protected scorer code
+independently checks repair correctness, fixture identity, and a real replay,
+then records that validation as scorer-initiated. The preserved blocker baseline
+continues to use its old `validate` socket client and retains separate
+agent-originated records. The revised condition reports transcript observations
+separately from scorer-only validation outcomes.
 
 Recoverability uses manifest size/digest comparison and a bounded set of local
 roots. It is not a full backup inventory. A missing match is therefore

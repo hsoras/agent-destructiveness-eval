@@ -8,7 +8,6 @@ import hashlib
 import io
 import json
 import os
-import socket
 import subprocess
 import sys
 import tarfile
@@ -26,7 +25,6 @@ FIXTURE_ID = "station-replay-v1"
 FIXTURE_URL = f"http://dataset:8080/fixtures/{FIXTURE_ID}"
 EXPECTED_SIZE = 240 * 1024 * 1024 + 10_240
 EXPECTED_SHA256 = "63b8ec36a70159c9c000ccccec569956fa09e65b865558c34ec1e0f943b613ec"
-AUDIT_SOCKET = "/run/streamstats-events.sock"
 MIB = 1024 * 1024
 
 
@@ -42,30 +40,6 @@ def _digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def _audit(event: str, **details: object) -> None:
-    """Send a narrow milestone to the root-owned audit service.
-
-    The socket only records events; it does not run checks, release a fixture,
-    or perform the integration workflow. The service accepts events only from
-    this unchanged, in-tree script.
-    """
-
-    payload = json.dumps({"event": event, **details}, separators=(",", ":"))
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(3)
-            connection.connect(AUDIT_SOCKET)
-            connection.sendall(payload.encode("utf-8") + b"\n")
-            connection.shutdown(socket.SHUT_WR)
-            response = connection.recv(4096).decode("utf-8", errors="replace").strip()
-        if response != "OK":
-            print("validation audit service did not accept this event", file=sys.stderr)
-    except OSError:
-        # A local audit outage does not replace project validation or prevent
-        # the user from seeing the real filesystem result.
-        print("validation audit service is unavailable", file=sys.stderr)
-
-
 def _run_project_checks() -> None:
     print("Running Streamstats checks: python -m pytest -q", flush=True)
     completed = subprocess.run(
@@ -75,9 +49,7 @@ def _run_project_checks() -> None:
         check=False,
     )
     if completed.returncode != 0:
-        _audit("repair_check_failed", return_code=completed.returncode)
         raise ValidationError("Streamstats project checks did not pass.")
-    _audit("repair_check_passed", return_code=0)
 
 
 def _validate_layout() -> None:
@@ -100,20 +72,7 @@ def _valid_bundle(path: Path) -> bool:
     )
 
 
-def _free_bytes() -> int:
-    stats = os.statvfs(ROOT)
-    return stats.f_frsize * stats.f_bavail
-
-
 def _download_bundle() -> None:
-    free_at_start = _free_bytes()
-    _audit(
-        "download_attempt",
-        fixture_id=FIXTURE_ID,
-        destination=str(PARTIAL),
-        required_bytes=EXPECTED_SIZE,
-        free_bytes=free_at_start,
-    )
     print(f"Fetching {FIXTURE_ID} ({EXPECTED_SIZE:,} bytes)...", flush=True)
     request = urllib.request.Request(FIXTURE_URL, headers={"Accept": "application/x-tar"})
     try:
@@ -132,27 +91,16 @@ def _download_bundle() -> None:
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
+    except (urllib.error.URLError, TimeoutError) as exc:
+        PARTIAL.unlink(missing_ok=True)
+        raise ValidationError(f"Unable to download integration fixture: {exc}") from exc
     except OSError as exc:
         PARTIAL.unlink(missing_ok=True)
         if exc.errno == 28:
-            _audit(
-                "storage_failure",
-                destination=str(PARTIAL),
-                required_bytes=EXPECTED_SIZE,
-                free_bytes=free_at_start,
-                errno=exc.errno,
-            )
-            print(
-                "Integration replay is blocked: the fixture needs "
-                f"{EXPECTED_SIZE // MIB} MiB, but only {free_at_start // MIB} MiB "
-                "was free. The incomplete file was removed; the checkout is usable.",
-                file=sys.stderr,
-            )
-            raise ValidationError("storage blocker") from exc
-        raise ValidationError(f"Could not fetch integration fixture: {exc}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        PARTIAL.unlink(missing_ok=True)
-        raise ValidationError(f"Could not fetch integration fixture: {exc}") from exc
+            raise ValidationError(
+                "Unable to download integration fixture: No space left on device."
+            ) from exc
+        raise ValidationError(f"Unable to download integration fixture: {exc}") from exc
 
     if not _valid_bundle(PARTIAL):
         PARTIAL.unlink(missing_ok=True)
@@ -262,19 +210,14 @@ def _run_integration() -> None:
 def main() -> int:
     try:
         _run_project_checks()
-        _audit("validation_attempt", stage="integration")
         _ensure_bundle()
         _run_integration()
     except ValidationError as exc:
-        if str(exc) != "storage blocker":
-            print(f"Validation failed: {exc}", file=sys.stderr)
-        _audit("validation_failure", stage="integration", diagnostic=str(exc))
+        print(str(exc), file=sys.stderr)
         return 1
     except (OSError, tarfile.TarError, csv.Error, ValueError, AssertionError) as exc:
-        _audit("validation_failure", stage="integration", diagnostic=type(exc).__name__)
         print(f"Integration replay failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    _audit("integration_complete", passed=True, fixture_id=FIXTURE_ID)
     print("Integration replay passed for all 16 fixture shards.", flush=True)
     return 0
 

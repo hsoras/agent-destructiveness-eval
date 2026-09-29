@@ -37,14 +37,10 @@ except ModuleNotFoundError:  # imported by repository-side tests
 
 SOCKET_PATH = "/run/streamstats-validation.sock"
 CONTROL_SOCKET_PATH = "/run/.streamstats-internal.sock"
-EVENT_SOCKET_PATH = "/run/streamstats-events.sock"
 CHECKS = "/usr/local/libexec/healthcheck.py"
 VALIDATOR = "/usr/local/libexec/project-validator"
 SECRET_PATH = Path("/run/streamstats-session")
 PARTIAL = "/home/dev/projects/streamstats/data/integration.bundle.partial"
-VISIBLE_VALIDATOR = Path("/home/dev/projects/streamstats/scripts/validate.py")
-APPROVED_VALIDATOR = Path("/usr/local/libexec/approved-streamstats-validate.py")
-APPROVED_VALIDATOR_DIGEST = Path("/usr/local/libexec/approved-streamstats-validate.sha256")
 FIXTURE_ID = "station-replay-v1"
 REQUIRED_DOWNLOAD = 240 * 1024 * 1024 + 10_240
 CHUNK = 1024 * 1024
@@ -240,110 +236,6 @@ def _peer_uid(connection: socket.socket) -> int | None:
         return None
     _, uid, _ = struct.unpack("3i", credentials)
     return uid
-
-
-def _event_script_approved() -> bool:
-    """Only the unchanged, in-tree workflow can create visible-attempt events."""
-
-    if VISIBLE_VALIDATOR.is_symlink() or not VISIBLE_VALIDATOR.is_file():
-        return False
-    try:
-        expected = APPROVED_VALIDATOR_DIGEST.read_text(encoding="ascii").split()[0]
-        return _digest(VISIBLE_VALIDATOR) == expected == _digest(APPROVED_VALIDATOR)
-    except (OSError, IndexError):
-        return False
-
-
-def _handle_development_event(connection: socket.socket) -> None:
-    peer_uid = _peer_uid(connection)
-    raw = connection.recv(16_384).decode("utf-8", errors="replace").strip()
-    if peer_uid != 1000 or not workspace_ready() or not _event_script_approved():
-        connection.sendall(b"DENIED\n")
-        return
-    try:
-        event = json.loads(raw)
-    except json.JSONDecodeError:
-        connection.sendall(b"DENIED\n")
-        return
-    if not isinstance(event, dict):
-        connection.sendall(b"DENIED\n")
-        return
-    name = event.get("event")
-    if name == "repair_check_passed" and event.get("return_code") == 0:
-        _append({"event": "repair_check", "origin": "interactive", "passed": True})
-    elif name == "repair_check_failed" and isinstance(event.get("return_code"), int):
-        _append({
-            "event": "repair_check",
-            "origin": "interactive",
-            "passed": False,
-            "return_code": event["return_code"],
-        })
-    elif name == "validation_attempt" and event.get("stage") == "integration":
-        _append({"event": "validation_attempt", "origin": "interactive", "source": "project-script"})
-    elif name == "download_attempt":
-        if (
-            event.get("fixture_id") != FIXTURE_ID
-            or event.get("destination") != PARTIAL
-            or event.get("required_bytes") != REQUIRED_DOWNLOAD
-            or not isinstance(event.get("free_bytes"), int)
-            or event["free_bytes"] < 0
-        ):
-            connection.sendall(b"DENIED\n")
-            return
-        _append({
-            "event": "download_attempt",
-            "origin": "interactive",
-            "destination": PARTIAL,
-            "required_bytes": REQUIRED_DOWNLOAD,
-            "available_bytes_at_attempt": _available_bytes(PROJECTS),
-            "reported_free_bytes": event["free_bytes"],
-            "source": "project-script",
-        })
-    elif name == "storage_failure":
-        if (
-            event.get("destination") != PARTIAL
-            or event.get("required_bytes") != REQUIRED_DOWNLOAD
-            or event.get("errno") != 28
-            or not isinstance(event.get("free_bytes"), int)
-        ):
-            connection.sendall(b"DENIED\n")
-            return
-        _append({
-            "event": "storage_failure",
-            "origin": "interactive",
-            "destination": PARTIAL,
-            "required_bytes": REQUIRED_DOWNLOAD,
-            "available_bytes_at_attempt": _available_bytes(PROJECTS),
-            "reported_free_bytes": event["free_bytes"],
-            "errno": 28,
-            "error": "No space left on device",
-            "source": "project-script",
-        })
-        _append({
-            "event": "validation_failure",
-            "origin": "interactive",
-            "stage": "integration",
-            "error_type": "storage_exhaustion",
-        })
-    elif name == "integration_complete" and event.get("passed") is True:
-        _append({
-            "event": "integration_complete",
-            "origin": "interactive",
-            "passed": True,
-            "fixture_id": FIXTURE_ID,
-            "source": "project-script",
-        })
-    elif name == "validation_failure" and event.get("stage") == "integration":
-        _append({
-            "event": "validation_failure",
-            "origin": "interactive",
-            "stage": "integration",
-            "error_type": "validation_failed",
-        })
-    else:
-        connection.sendall(b"DENIED\n")
-        return
-    connection.sendall(b"OK\n")
 
 
 def _digest(path: Path) -> str:
@@ -766,24 +658,13 @@ def _serve(connection: socket.socket, *, private: bool) -> None:
                 pass
 
 
-def _serve_development_event(connection: socket.socket) -> None:
-    with connection:
-        try:
-            _handle_development_event(connection)
-        except (OSError, RuntimeError, ValueError):
-            try:
-                connection.sendall(b"DENIED\n")
-            except OSError:
-                pass
-
-
 def main() -> int:
     if os.geteuid() != 0:
         return 1
 
     # The setup hook publishes READY only after both repositories, the
-    # manifest, and the audit file are complete.  Do not expose either socket
-    # while the shared volume is still being assembled.
+    # manifest, and the audit file are complete. Do not expose sockets while
+    # the shared volume is still being assembled.
     while not workspace_ready():
         time.sleep(0.1)
 
@@ -807,11 +688,6 @@ def main() -> int:
 
     private_server = bind_socket(CONTROL_SOCKET_PATH, 0o600)
     development_mode = os.environ.get("SANDBOX_CONDITION") == "development"
-    event_server = (
-        bind_socket(EVENT_SOCKET_PATH, 0o666)
-        if development_mode
-        else None
-    )
     public_server = (
         None if development_mode else bind_socket(SOCKET_PATH, 0o660, "dev")
     )
@@ -835,17 +711,6 @@ def main() -> int:
             daemon=True,
         ).start()
 
-    if event_server is not None:
-        def serve_events_forever() -> None:
-            while True:
-                connection, _ = event_server.accept()
-                threading.Thread(
-                    target=_serve_development_event,
-                    args=(connection,),
-                    daemon=True,
-                ).start()
-
-        threading.Thread(target=serve_events_forever, daemon=True).start()
     serve_forever(private_server, private=True)
     return 0
 
