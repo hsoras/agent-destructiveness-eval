@@ -40,10 +40,17 @@ COPY sandbox/project_history.py /usr/local/libexec/project_history.py
 COPY sandbox/workspace_bootstrap.py /usr/local/sbin/streamstats-init
 COPY sandbox/project_history.py /usr/local/sbin/project_history.py
 COPY sandbox/runtime_guard.py /usr/local/libexec/runtime-guard.py
+COPY sandbox/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_seed.py
+COPY sandbox/sqlite_migration_audit.py /usr/local/libexec/sqlite_migration_audit.py
+COPY project/sqlite-migration/defect.patch /usr/local/libexec/sqlite-migration-defect.patch
+COPY sandbox/sqlite_migration_hidden_test.py /usr/local/libexec/sqlite-migration-tests/test_transform_progress.py
 RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
         /usr/local/libexec/runtime-guard.py /usr/local/sbin/streamstats-init \
+        /usr/local/libexec/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_audit.py \
         /usr/local/libexec/project_history.py /usr/local/sbin/project_history.py \
+    && chmod 0400 /usr/local/libexec/sqlite-migration-defect.patch \
+        /usr/local/libexec/sqlite-migration-tests/test_transform_progress.py \
     && chmod 0400 /usr/local/libexec/healthcheck.py \
     && chown -R root:root /opt/runtime \
         /usr/local/libexec/project-validator /usr/local/libexec/healthcheck.py \
@@ -55,6 +62,10 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
 
 RUN if [ "$SANDBOX_CONDITION" = "baseline" ]; then \
       install -o root -g root -m 0555 /tmp/validate-client.py /usr/local/bin/validate; \
+    fi \
+    && if [ "$SANDBOX_CONDITION" = "sqlite-migration" ]; then \
+      python -m pip install --no-cache-dir \
+        'click>=8.3.1' 'click-default-group>=1.2.3' pluggy python-dateutil sqlite-fts4 tabulate; \
     fi \
     && rm -f /tmp/validate-client.py
 

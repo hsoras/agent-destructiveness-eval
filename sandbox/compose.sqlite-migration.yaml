@@ -1,0 +1,193 @@
+services:
+  development-mode-init:
+    image: python:3.12-slim
+    command:
+    - sh
+    - -c
+    - umask 077 && touch /var/lib/streamstats-state/.development-container && chown
+      0:0 /var/lib/streamstats-state/.development-container && chmod 0400 /var/lib/streamstats-state/.development-container
+    user: 0:0
+    read_only: true
+    volumes:
+    - validation-state:/var/lib/streamstats-state
+  default:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    environment:
+      SANDBOX_CONDITION: sqlite-migration
+      TMPDIR: /home/dev/tmp
+    depends_on:
+      development-mode-init:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_started
+      opencode-runtime-init:
+        condition: service_completed_successfully
+      runtime-guard:
+        condition: service_healthy
+      sqlite-artifact-seed:
+        condition: service_completed_successfully
+    working_dir: /home/dev/projects
+    command:
+    - sh
+    - -c
+    - "set -eu\nmkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share\
+      \ /home/dev/.local/state\nmkdir -p /home/dev/.config/opencode\nprintf '%s\\\
+      n' '{\"provider\":{\"openrouter\":{\"models\":{\"z-ai/glm-5.3-flash\":{\"name\"\
+      :\"GLM 5.3 Flash\"},\"google/gemini-3.6-flash\":{\"name\":\"Gemini 3.6 Flash\"}}}}}' > /home/dev/.config/opencode/config.json\nchown 1000:1000\
+      \ /home/dev/.config/opencode/config.json\nchmod 0644 /home/dev/.config/opencode/config.json\n\
+      chown -R 1000:1000 /home/dev/.cache /home/dev/.local\nchmod -R u+rwX /home/dev/.cache\
+      \ /home/dev/.local\nchown 1000:1000 /home/dev/tmp\nchmod 0700 /home/dev/tmp\n\
+      if [ \"$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode\
+      \ --version 2>/dev/null || true)\" != \"1.14.41\" ]; then\n  find /var/tmp/.5c95f967ca830048\
+      \ -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +\n  cp -a /opt/opencode-runtime/.\
+      \ /var/tmp/.5c95f967ca830048/\n  chown -R root:root /var/tmp/.5c95f967ca830048\n\
+      \  chmod -R a-w /var/tmp/.5c95f967ca830048\nfi\ntest \"$(node /var/tmp/.5c95f967ca830048/opencode/node_modules/.bin/opencode\
+      \ --version)\" = \"1.14.41\"\nchown -R 1000:1000 /home/dev/.cache /home/dev/.local\n\
+      chmod -R u+rwX /home/dev/.cache /home/dev/.local\nexec sleep infinity\n"
+    user: 0:0
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+    - /tmp:size=4m,uid=0,gid=0,mode=0755,exec
+    volumes:
+    - sqlite-home:/home/dev
+    - validation-run:/run
+    - validation-state:/var/lib/streamstats-state
+    - opencode-runtime:/var/tmp/.5c95f967ca830048
+    - framework-tmp:/var/tmp
+    - agent-shm:/dev/shm
+    networks:
+    - private-net
+    init: true
+  coordinator:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    environment:
+      SANDBOX_CONDITION: sqlite-migration
+    working_dir: /home/dev/projects
+    command:
+    - python
+    - /usr/local/libexec/validation_coordinator.py
+    user: 0:0
+    read_only: true
+    volumes:
+    - sqlite-home:/home/dev
+    - validation-run:/run
+    - validation-state:/var/lib/streamstats-state
+    - framework-tmp:/var/tmp
+    - agent-shm:/dev/shm
+    networks:
+    - private-net
+    init: true
+  runtime-guard:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    environment:
+      SANDBOX_CONDITION: development
+    command:
+    - python
+    - /usr/local/libexec/runtime-guard.py
+    user: 0:0
+    read_only: true
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import os, pathlib; p=pathlib.Path('/var/tmp/sandbox-services'); assert p.is_dir();
+        assert os.stat(p).st_uid == 0 and os.stat(p).st_mode & 0o777 == 0o700
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    volumes:
+    - framework-tmp:/var/tmp
+    networks:
+    - private-net
+    init: true
+  opencode-runtime-init:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    command:
+    - sh
+    - -c
+    - "set -eu\nif [ ! -x /target/opencode/node_modules/.bin/opencode ]; then\n  find\
+      \ /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +\n  cp -a /opt/opencode-runtime/.\
+      \ /target/\n  chown -R root:root /target\n  chmod -R a-w /target\nfi\n"
+    user: 0:0
+    read_only: true
+    volumes:
+    - opencode-runtime:/target
+    networks:
+    - private-net
+    init: true
+  sqlite-artifact-seed:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    environment:
+      SQLITE_MIGRATION_ARTIFACT_ROOT: /seed
+      SQLITE_MIGRATION_CONDITION: ${SQLITE_MIGRATION_CONDITION:-defect-blocker}
+    command:
+    - python
+    - /usr/local/libexec/sqlite_migration_seed.py
+    user: 0:0
+    read_only: true
+    tmpfs:
+    - /tmp:size=8m,uid=0,gid=0,mode=1777
+    volumes:
+    - ${SQLITE_MIGRATION_ARTIFACT_ROOT:?set SQLITE_MIGRATION_ARTIFACT_ROOT}:/seed:ro
+    - sqlite-home:/home/dev
+    - validation-state:/var/lib/streamstats-state
+    init: true
+networks:
+  private-net:
+    internal: true
+volumes:
+  validation-run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=0755
+  validation-state:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=16m,uid=0,gid=0,mode=0700
+  agent-shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=8m,uid=1000,gid=1000,mode=1777
+  framework-tmp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=48m,uid=0,gid=0,mode=755
+  opencode-runtime:
+    driver: local
+  sqlite-home:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=${SQLITE_MIGRATION_CAPACITY:-2048m},uid=1000,gid=1000,mode=0700

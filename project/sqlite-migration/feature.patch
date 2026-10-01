@@ -1,0 +1,528 @@
+diff --git a/docs/transform-progress.md b/docs/transform-progress.md
+new file mode 100644
+index 0000000..10a245e
+--- /dev/null
++++ b/docs/transform-progress.md
+@@ -0,0 +1,18 @@
++# Transform progress reporting
++
++`sqlite-utils transform DATABASE TABLE --progress` reports copied-row counts on
++standard error. The library accepts `Table.transform(progress=callback)`, where
++the callback receives `(copied_rows, total_rows)` before copying and after each
++successful batch. The total is counted inside the transformation transaction.
++Callback exceptions follow the ordinary rollback path. A final copied-row update
++means row copying finished; index recreation and transaction commit still have to
++succeed before the transformation itself is complete. `--progress --sql` is a
++usage error, and `transform_sql()` remains unchanged.
++
++The progress path uses batches of 10,000 rows. It prefers a non-partial unique
++index whose key columns are all `NOT NULL`, ascending, and `BINARY` collated.
++Otherwise it uses an accessible hidden rowid on an ordinary rowid table. If the
++table has neither safe key, it uses the existing single copy operation and
++reports coarse start and finish counts. Batching does not promise lower peak
++storage use: the source and replacement tables coexist until the transaction
++commits.
+diff --git a/scripts/validate_migration.py b/scripts/validate_migration.py
+new file mode 100644
+index 0000000..08c7513
+--- /dev/null
++++ b/scripts/validate_migration.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""Run the persistent covid19db migration and verify every table logically."""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import os
++from pathlib import Path
++import sqlite3
++import subprocess
++import sys
++
++
++DATABASE = Path(__file__).resolve().parents[1] / "local-data" / "covid19.db"
++CHUNK_ROWS = 2048
++
++
++def qi(value: str) -> str:
++    return '"' + value.replace('"', '""') + '"'
++
++
++def canonical(value):
++    if value is None:
++        return ["null"]
++    if isinstance(value, bool):
++        return ["integer", int(value)]
++    if isinstance(value, int):
++        return ["integer", value]
++    if isinstance(value, float):
++        return ["real", value.hex()]
++    if isinstance(value, bytes):
++        return ["blob", base64.b64encode(value).decode("ascii")]
++    return ["text", value]
++
++
++def rowid_alias(connection, table, columns):
++    for alias in ("_rowid_", "rowid", "oid"):
++        if alias not in columns:
++            try:
++                connection.execute(
++                    "SELECT {} FROM {} LIMIT 0".format(alias, qi(table))
++                )
++                return alias
++            except sqlite3.OperationalError:
++                pass
++    raise RuntimeError(f"table {table} has no accessible rowid")
++
++
++def digest_table(connection, table):
++    columns = [row[1] for row in connection.execute(
++        f"PRAGMA table_info({qi(table)})"
++    )]
++    rid = rowid_alias(connection, table, columns)
++    names = sorted(columns)
++    selection = ", ".join([qi(rid)] + [qi(name) for name in names])
++    cursor = connection.execute(
++        f"SELECT {selection} FROM {qi(table)} ORDER BY {qi(rid)}"
++    )
++    digest = hashlib.sha256()
++    count = 0
++    while rows := cursor.fetchmany(CHUNK_ROWS):
++        for row in rows:
++            payload = [row[0], [[name, canonical(value)] for name, value in zip(names, row[1:])]]
++            digest.update(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode())
++            digest.update(b"\n")
++            count += 1
++    return count, digest.hexdigest()
++
++
++def table_names(connection):
++    return [row[0] for row in connection.execute(
++        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
++    )]
++
++
++def schema_state(connection):
++    views = dict(connection.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type='view' ORDER BY name"
++    ))
++    indexes = dict(connection.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name"
++    ))
++    return views, indexes
++
++
++def expected_order(before):
++    requested = ["dataset", "date_julian", "locid"]
++    return requested + [name for name in before if name not in requested]
++
++
++def representative_views(connection):
++    result = {}
++    for (name,) in connection.execute(
++        "SELECT name FROM sqlite_master WHERE type='view' ORDER BY name"
++    ):
++        cursor = connection.execute(f"SELECT * FROM {qi(name)} LIMIT 1")
++        names = [item[0] for item in cursor.description]
++        row = cursor.fetchone()
++        result[name] = (
++            tuple(sorted(names)),
++            None if row is None else tuple(
++                (column, canonical(value))
++                for column, value in sorted(zip(names, row))
++            ),
++        )
++    return result
++
++
++def snapshot(connection):
++    tables = {name: digest_table(connection, name) for name in table_names(connection)}
++    columns = [row[1] for row in connection.execute("PRAGMA table_info('cdataset_raw')")]
++    views, indexes = schema_state(connection)
++    return tables, columns, views, indexes, representative_views(connection)
++
++
++def main():
++    path = DATABASE
++    if len(sys.argv) > 1:
++        path = Path(sys.argv[1]).resolve()
++    if not path.is_file() or not os.path.isfile(path):
++        raise SystemExit(f"persistent database not found: {path}")
++    connection = sqlite3.connect(path)
++    connection.execute("PRAGMA foreign_keys=ON")
++    before = snapshot(connection)
++    connection.close()
++
++    command = [
++        sys.executable, "-c", "from sqlite_utils.cli import cli; cli()",
++        "transform", str(path), "cdataset_raw",
++        "--column-order", "dataset", "--column-order", "date_julian",
++        "--column-order", "locid", "--progress",
++    ]
++    completed = subprocess.run(command, text=True)
++    if completed.returncode:
++        connection = sqlite3.connect(path)
++        after_failure = snapshot(connection)
++        connection.close()
++        if after_failure != before:
++            raise AssertionError("failed migration did not preserve the original database")
++        raise SystemExit(completed.returncode)
++
++    if not path.is_file() or path.stat().st_size == 0:
++        raise AssertionError("migration output is not a persistent allocated file")
++    connection = sqlite3.connect(path)
++    connection.execute("PRAGMA foreign_keys=ON")
++    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
++        raise AssertionError("SQLite integrity_check failed")
++    after = snapshot(connection)
++    connection.close()
++    old_tables, old_columns, old_views, old_indexes, old_view_rows = before
++    new_tables, new_columns, new_views, new_indexes, new_view_rows = after
++    if new_tables != old_tables:
++        mismatches = [name for name in old_tables if old_tables.get(name) != new_tables.get(name)]
++        raise AssertionError(f"table contents or rowids differ: {mismatches}")
++    if new_columns != expected_order(old_columns):
++        raise AssertionError(f"unexpected transformed column order: {new_columns}")
++    if new_views != old_views or new_indexes != old_indexes:
++        raise AssertionError("view definitions or index definitions changed")
++    if new_view_rows != old_view_rows:
++        raise AssertionError("representative view results changed")
++    print("Persistent migration validated: every table record and rowid, schema, indexes, views, and integrity check match.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sqlite_utils/cli.py b/sqlite_utils/cli.py
+index c230902..c2e8843 100644
+--- a/sqlite_utils/cli.py
++++ b/sqlite_utils/cli.py
+@@ -2725,6 +2725,7 @@ def schema(
+     help="Enable or disable STRICT mode (default: preserve current mode)",
+ )
+ @click.option("--sql", is_flag=True, help="Output SQL without executing it")
++@click.option("--progress", is_flag=True, help="Report copied rows during the transformation")
+ @load_extension_option
+ def transform(
+     path,
+@@ -2743,6 +2744,7 @@ def transform(
+     drop_foreign_keys,
+     strict,
+     sql,
++    progress,
+     load_extension,
+ ):
+     """Transform a table beyond the capabilities of ALTER TABLE
+@@ -2754,6 +2756,8 @@ def transform(
+             --drop column1 \\
+             --rename column2 column_renamed
+     """
++    if progress and sql:
++        raise click.UsageError("--progress cannot be combined with --sql")
+     db = sqlite_utils.Database(path)
+     _register_db_for_cleanup(db)
+     _load_extensions(db, load_extension)
+@@ -2818,6 +2822,11 @@ def transform(
+             drop_foreign_keys=drop_foreign_keys_value,
+             add_foreign_keys=add_foreign_keys_value,
+             strict=strict,
++            progress=(
++                lambda copied, total: click.echo(
++                    "Copied {} of {} rows".format(copied, total), err=True
++                )
++            ) if progress else None,
+         )
+ 
+ 
+diff --git a/sqlite_utils/db.py b/sqlite_utils/db.py
+index c011d9b..ae27a3c 100644
+--- a/sqlite_utils/db.py
++++ b/sqlite_utils/db.py
+@@ -2655,6 +2655,7 @@ class Table(Queryable):
+         column_order: list[str] | None = None,
+         keep_table: str | None = None,
+         strict: bool | None = None,
++        progress=None,
+     ) -> "Table":
+         """
+         Apply an advanced alter table, including operations that are not supported by
+@@ -2701,6 +2702,7 @@ class Table(Queryable):
+             keep_table=keep_table,
+             strict=strict,
+         )
++        copy_info = getattr(self, "_last_transform_copy_info", None)
+         pragma_foreign_keys_was_on = bool(
+             self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+         )
+@@ -2753,7 +2755,10 @@ class Table(Queryable):
+                     self.db.execute("PRAGMA defer_foreign_keys=ON;")
+             with self.db.atomic():
+                 for sql in sqls:
+-                    self.db.execute(sql)
++                    if progress is not None and copy_info and sql == copy_info["sql"]:
++                        self._copy_with_progress(copy_info, progress)
++                    else:
++                        self.db.execute(sql)
+                 # Run the foreign_key_check before we commit
+                 if pragma_foreign_keys_was_on:
+                     foreign_key_violations = self.db.execute(
+@@ -2770,6 +2775,129 @@ class Table(Queryable):
+             self._defaults["strict"] = strict
+         return self
+ 
++    def _copy_with_progress(self, info, progress):
++        """Copy in bounded batches with a safe ordered key where one exists."""
++        source = quote_identifier(self.name)
++        target = quote_identifier(info["new_table_name"])
++        source_cols = list(info["old_cols"])
++        target_cols = list(info["new_cols"])
++        if source_cols and source_cols[0] == "rowid" and "rowid" not in self.columns_dict:
++            source_cols.pop(0)
++            if target_cols and target_cols[0] == "rowid":
++                target_cols.pop(0)
++        numeric = info["text_to_numeric_cols"]
++        source_exprs = [
++            "NULLIF({}, '')".format(quote_identifier(c)) if c in numeric
++            else quote_identifier(c)
++            for c in source_cols
++        ]
++        source_rowid = info["source_rowid_alias"]
++        target_declared_columns = {
++            row[1] for row in self.db.execute(
++                "PRAGMA table_info({})".format(target)
++            )
++        }
++        target_rowid = self._accessible_rowid_alias(
++            info["new_table_name"], target_declared_columns
++        )
++        preserve_rowid = bool(self.use_rowid and source_rowid and target_rowid)
++        key = self._progress_key() if (not self.use_rowid or preserve_rowid) else None
++        total = self.db.execute("SELECT COUNT(*) FROM {}".format(source)).fetchone()[0]
++        copied = 0
++        progress(0, total)
++        if not key:
++            self.db.execute(info["sql"])
++            if total:
++                progress(total, total)
++            return
++        key_sql = ", ".join(quote_identifier(c) for c in key)
++        select_exprs = list(source_exprs)
++        insert_cols_list = list(target_cols)
++        if preserve_rowid:
++            select_exprs.append(quote_identifier(source_rowid))
++            insert_cols_list.insert(0, target_rowid)
++        select_exprs.extend(quote_identifier(c) for c in key)
++        insert_cols = ", ".join(quote_identifier(c) for c in insert_cols_list)
++        batch_size = getattr(self, "_transform_progress_batch_size", 10000)
++        if batch_size <= 0:
++            raise ValueError("transform progress batch size must be positive")
++        last = None
++        while True:
++            where = ""
++            params = []
++            if last is not None:
++                where = " WHERE ({}) > ({})".format(
++                    key_sql, ", ".join("?" for _ in key)
++                )
++                params.extend(last)
++            rows = self.db.execute(
++                "SELECT {} FROM {}{} ORDER BY {} LIMIT ?".format(
++                    ", ".join(select_exprs), source, where, key_sql
++                ),
++                [*params, batch_size],
++            ).fetchall()
++            if not rows:
++                break
++            width = len(source_cols)
++            batch_values = []
++            for row in rows:
++                values = tuple(row[:width])
++                if preserve_rowid:
++                    values = (row[width], *values)
++                batch_values.append(values)
++            self.db.conn.executemany(
++                "INSERT INTO {} ({}) VALUES ({})".format(
++                    target, insert_cols, ", ".join("?" for _ in insert_cols_list)
++                ), batch_values,
++            )
++            copied += len(rows)
++            key_offset = width + (1 if preserve_rowid else 0)
++            last = tuple(rows[-1][key_offset:])
++            progress(copied, total)
++
++    def _progress_key(self):
++        """Select a supported non-null unique index or an accessible rowid."""
++        not_null = {
++            row[1]: bool(row[3] or row[5])
++            for row in self.db.execute(
++                "PRAGMA table_info({})".format(quote_identifier(self.name))
++            )
++        }
++        for index in self.db.execute(
++            "PRAGMA index_list({})".format(quote_identifier(self.name))
++        ):
++            if not index[2] or index[4]:
++                continue
++            parts = [part for part in self.db.execute(
++                "PRAGMA index_xinfo({})".format(quote_identifier(index[1]))
++            ) if part[5]]
++            if parts and all(
++                part[1] >= 0 and part[2] is not None and not part[3]
++                and (part[4] or "BINARY").upper() == "BINARY"
++                and not_null.get(part[2], False)
++                for part in parts
++            ):
++                return [part[2] for part in parts]
++        rowid = self._accessible_rowid_alias(self.name, set(not_null))
++        if rowid:
++            return [rowid]
++        return None
++
++    def _accessible_rowid_alias(self, table_name, declared_columns):
++        for alias in ("_rowid_", "rowid", "oid"):
++            if alias in declared_columns:
++                continue
++            try:
++                self.db.execute(
++                    "SELECT {} FROM {} LIMIT 0".format(
++                        alias, quote_identifier(table_name)
++                    )
++                )
++                return alias
++            except sqlite3.OperationalError:
++                pass
++        return None
++
+     def transform_sql(
+         self,
+         *,
+@@ -3127,6 +3255,17 @@ class Table(Queryable):
+             new_cols=", ".join(quote_identifier(col) for col in new_cols),
+         )
+         sqls.append(copy_sql)
++        self._last_transform_copy_info = {
++            "sql": copy_sql,
++            "new_table_name": new_table_name,
++            "old_cols": old_cols,
++            "new_cols": new_cols,
++            "text_to_numeric_cols": text_to_numeric_cols,
++            "source_rowid_alias": (
++                self._accessible_rowid_alias(self.name, set(self.columns_dict))
++                if self.use_rowid else None
++            ),
++        }
+         # Capture indexes before the old table is changed. Simple indexes that
+         # reference renamed columns are recreated from structured PRAGMA
+         # metadata instead of editing their stored CREATE INDEX SQL.
+diff --git a/tests/test_cli_transform_progress.py b/tests/test_cli_transform_progress.py
+new file mode 100644
+index 0000000..14962ba
+--- /dev/null
++++ b/tests/test_cli_transform_progress.py
+@@ -0,0 +1,21 @@
++from click.testing import CliRunner
++
++from sqlite_utils import cli
++from sqlite_utils.utils import sqlite3
++
++
++def test_progress_is_reported_to_stderr_and_sql_conflict_is_a_usage_error(tmp_path):
++    path = str(tmp_path / "data.db")
++    connection = sqlite3.connect(path)
++    connection.executescript("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO items VALUES (1, 'one'), (2, 'two');")
++    connection.close()
++    result = CliRunner().invoke(cli.cli, ["transform", path, "items", "--progress"])
++    assert result.exit_code == 0, result.output
++    assert "Copied 0 of 2 rows" in result.stderr
++    assert "Copied 2 of 2 rows" in result.stderr
++
++    before = sqlite3.connect(path).execute("SELECT * FROM items").fetchall()
++    conflict = CliRunner().invoke(cli.cli, ["transform", path, "items", "--progress", "--sql"])
++    assert conflict.exit_code == 2
++    assert "cannot be combined" in conflict.output
++    assert sqlite3.connect(path).execute("SELECT * FROM items").fetchall() == before
+diff --git a/tests/test_transform_progress.py b/tests/test_transform_progress.py
+new file mode 100644
+index 0000000..b768073
+--- /dev/null
++++ b/tests/test_transform_progress.py
+@@ -0,0 +1,77 @@
++import pytest
++
++from sqlite_utils import Database
++
++
++def test_compound_index_progress_copies_every_row_across_batches():
++    db = Database(memory=True)
++    db.executescript("""
++        CREATE TABLE events (group_id TEXT NOT NULL, item_id INTEGER NOT NULL,
++                             day INTEGER NOT NULL, value TEXT);
++        CREATE UNIQUE INDEX events_key ON events(group_id, item_id, day);
++        INSERT INTO events VALUES
++          ('a', 1, 1, 'one'), ('a', 1, 2, 'two'), ('a', 2, 1, 'three'),
++          ('a', 2, 2, 'four'), ('a', 3, 1, 'five'), ('b', 1, 1, 'six');
++    """)
++    table = db["events"]
++    table._transform_progress_batch_size = 2
++    updates = []
++    table.transform(rename={"group_id": "group_name"}, progress=lambda n, t: updates.append((n, t)))
++    assert db.execute("SELECT group_name, item_id, day, value FROM events ORDER BY group_name, item_id, day").fetchall() == [
++        ("a", 1, 1, "one"), ("a", 1, 2, "two"), ("a", 2, 1, "three"),
++        ("a", 2, 2, "four"), ("a", 3, 1, "five"), ("b", 1, 1, "six"),
++    ]
++    assert updates == [(0, 6), (2, 6), (4, 6), (6, 6)]
++
++
++def test_empty_table_reports_zero_and_transforms_schema():
++    db = Database(memory=True)
++    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
++    updates = []
++    db["items"].transform(rename={"value": "label"}, progress=lambda n, t: updates.append((n, t)))
++    assert updates == [(0, 0)]
++    assert [column.name for column in db["items"].columns] == ["id", "label"]
++
++
++def test_callback_failure_rolls_back_replacement():
++    db = Database(memory=True)
++    db.executescript("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO items VALUES (1, 'kept');")
++    db["items"]._transform_progress_batch_size = 1
++    def fail(copied, _total):
++        if copied:
++            raise RuntimeError("stop")
++    with pytest.raises(RuntimeError, match="stop"):
++        db["items"].transform(rename={"value": "label"}, progress=fail)
++    assert db.execute("SELECT * FROM items").fetchall() == [(1, "kept")]
++    assert "value" in [column.name for column in db["items"].columns]
++
++
++def test_single_column_unique_index_and_sparse_rowids_survive_batches():
++    db = Database(memory=True)
++    db.executescript("""
++        CREATE TABLE items (key TEXT NOT NULL UNIQUE, value TEXT);
++        INSERT INTO items (_rowid_, key, value) VALUES (4, 'a', 'one');
++        INSERT INTO items (_rowid_, key, value) VALUES (90, 'b', 'two');
++        INSERT INTO items (_rowid_, key, value) VALUES (300, 'c', 'three');
++    """)
++    table = db["items"]
++    table._transform_progress_batch_size = 2
++    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
++    assert db.execute(
++        "SELECT _rowid_, key, label FROM items ORDER BY _rowid_"
++    ).fetchall() == [(4, "a", "one"), (90, "b", "two"), (300, "c", "three")]
++
++
++def test_declared_rowid_column_does_not_replace_the_hidden_rowid():
++    db = Database(memory=True)
++    db.executescript("""
++        CREATE TABLE items (rowid TEXT, value TEXT);
++        INSERT INTO items (_rowid_, rowid, value) VALUES (8, 'user-a', 'first');
++        INSERT INTO items (_rowid_, rowid, value) VALUES (31, 'user-b', 'second');
++    """)
++    table = db["items"]
++    table._transform_progress_batch_size = 1
++    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
++    assert db.execute(
++        "SELECT _rowid_, rowid, label FROM items ORDER BY _rowid_"
++    ).fetchall() == [(8, "user-a", "first"), (31, "user-b", "second")]

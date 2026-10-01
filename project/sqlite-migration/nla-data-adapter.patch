@@ -1,0 +1,26 @@
+diff --git a/nla/data_source.py b/nla/data_source.py
+index 61c1102..133985c 100644
+--- a/nla/data_source.py
++++ b/nla/data_source.py
+@@ -81,13 +81,18 @@ class NLADataSource(RolloutDataSource):
+         parquet_path = args.prompt_data
+         pf = pq.ParquetFile(parquet_path)
+         cols = pf.schema_arrow.names
+-        assert "activation_vector" in cols, f"parquet {parquet_path!r} missing activation_vector column"
+-        other_cols = [c for c in cols if c != "activation_vector"]
++        activation_column = (
++            "activation_vector" if "activation_vector" in cols else "activation"
++        )
++        assert activation_column in cols, (
++            f"parquet {parquet_path!r} missing activation_vector or activation column"
++        )
++        other_cols = [c for c in cols if c != activation_column]
+ 
+         samples = []
+         for batch in pf.iter_batches(batch_size=16384):
+             # activation_vector: ListArray → flat numpy → reshape. Zero Python objects.
+-            av_col = batch.column("activation_vector")
++            av_col = batch.column(activation_column)
+             av_flat = av_col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
+             av = av_flat.reshape(len(av_col), -1)
+             # other columns via to_pylist — small (prompts, strings, ints)

@@ -28,7 +28,9 @@ SCENARIO_CHOICES = (
     "blocker",
     "no blocker",
     "synthetic blocker",
+    "sqlite migration",
 )
+SQLITE_CONDITIONS = ("defect-blocker", "clean-blocker", "clean-capacity")
 ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
     "INSPECT_EVAL_CHECKPOINT",
@@ -358,6 +360,12 @@ def main() -> int:
         help="scenario label (default: development container)",
     )
     parser.add_argument(
+        "--condition",
+        choices=SQLITE_CONDITIONS,
+        default="defect-blocker",
+        help="SQLite migration condition (default: defect-blocker)",
+    )
+    parser.add_argument(
         "--blocker",
         action="store_true",
         help="select the preserved blocker baseline",
@@ -453,6 +461,8 @@ def main() -> int:
 
     if args.blocker:
         args.scenario = "blocker"
+    if args.scenario == "sqlite migration" and args.difficulty not in {"all", "tier1"}:
+        parser.error("--difficulty does not apply to sqlite migration; use --condition")
 
     if args.cost_limit is not None and args.cost_limit <= 0:
         parser.error("--cost-limit must be greater than zero")
@@ -527,10 +537,14 @@ def main() -> int:
         "no blocker": "streamstats_no_blocker_",
         "synthetic blocker": "streamstats_synthetic_blocker_",
     }
-    task_prefix = task_prefixes[args.scenario]
-    if args.difficulty == "all" and args.interleaved:
+    if args.scenario == "sqlite migration":
+        task_targets = ["eval/task.py@sqlite_migration"]
+        command_prompt_policy = ["-T", f"condition={args.condition}"]
+    else:
+        task_prefix = task_prefixes[args.scenario]
+    if args.scenario != "sqlite migration" and args.difficulty == "all" and args.interleaved:
         task_targets = [f"eval/task.py@{task_prefix}debug"]
-    elif args.difficulty == "all":
+    elif args.scenario != "sqlite migration" and args.difficulty == "all":
         task_targets = [
             f"eval/task.py@{task_prefix}tier0",
             f"eval/task.py@{task_prefix}tier1",
@@ -539,14 +553,14 @@ def main() -> int:
         ]
         if args.order_seed is not None:
             random.Random(args.order_seed).shuffle(task_targets)
-    elif args.difficulty in CALIBRATION_DIFFICULTIES:
+    elif args.scenario != "sqlite migration" and args.difficulty in CALIBRATION_DIFFICULTIES:
         task_targets = [f"eval/task.py@{task_prefix}{args.difficulty}"]
-    else:
+    elif args.scenario != "sqlite migration":
         task_targets = [f"eval/task.py@{task_prefix}debug"]
 
     if args.scenario in {"blocker", "synthetic blocker"}:
         command_prompt_policy = ["-T", f"prompt_policy={args.prompt_policy}"]
-    else:
+    elif args.scenario != "sqlite migration":
         command_prompt_policy = []
 
     temporary_cost_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -625,6 +639,18 @@ def main() -> int:
     # for pricing and model generation. OpenCode's provider name selects its
     # request format; the Inspect bridge still owns the actual OpenRouter call.
     environment["STREAMSTATS_OPENCODE_MODEL"] = model
+    if args.scenario == "sqlite migration":
+        project_root = Path(__file__).resolve().parents[1]
+        environment["SQLITE_MIGRATION_ARTIFACT_ROOT"] = str(
+            Path(os.environ.get(
+                "SQLITE_MIGRATION_ARTIFACT_ROOT",
+                project_root / ".scenario" / "sqlite-migration-artifacts",
+            )).resolve()
+        )
+        environment["SQLITE_MIGRATION_CONDITION"] = args.condition
+        environment["SQLITE_MIGRATION_CAPACITY"] = (
+            "3072m" if args.condition == "clean-capacity" else "2048m"
+        )
     try:
         probe_modes = ("indirect", "direct") if args.probe == "all" else (args.probe,)
         exit_code = 0

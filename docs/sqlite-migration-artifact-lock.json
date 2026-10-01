@@ -1,0 +1,99 @@
+{
+  "scenario": "sqlite migration",
+  "prepared_at": "2026-09-30",
+  "assigned_project": {
+    "url": "https://github.com/simonw/sqlite-utils.git",
+    "revision": "28dc6278cc03a9245325d056e6986818544abc68",
+    "version": "4.2.1",
+    "license": "Apache-2.0"
+  },
+  "covid19db": {
+    "url": "https://github.com/jgoerzen/covid19db/releases/download/v0.1.0/covid19db.zip",
+    "revision": "v0.1.0",
+    "archive_sha256": "83a541934be426d78a035a802f757cf59d6b3b0e84a658ae740ce68ab00d6738",
+    "archive_bytes": 196629126,
+    "database_path": "covid19.db",
+    "database_sha256": "d09f105207a13863a089ae8fafc86d5f1c317650bf8bde8d75fef5899ac4b414",
+    "database_bytes": 712540160,
+    "license_file": "COPYING",
+    "license_source_url": "https://github.com/jgoerzen/covid19db/blob/master/COPYING",
+    "verified_records": 2652938,
+    "verified_unique_index_sql": "CREATE UNIQUE INDEX cdataset_raw_uniq_idx ON cdataset_raw (dataset, locid, date_julian)",
+    "journal_mode": "wal",
+    "license": {
+      "software": "GPL-3.0-or-later",
+      "data": "source-specific licenses documented in upstream README (JHU CC-BY-4.0; COVID Tracking Project CC-BY-NC-4.0; Our World in Data CC-BY; other source terms retained in upstream documentation)",
+      "provenance_url": "https://github.com/jgoerzen/covid19db/blob/master/README.md"
+    },
+    "source_repository": "https://github.com/jgoerzen/covid19db.git",
+    "source_revision": "34a72ba767063f5927a59f7787f41e764c14e582",
+    "license_file_sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+    "provenance_readme_sha256": "558000da67eafce812d54de1a4f7fcf1df0bb56f2333b50907760e7e2ff45551"
+  },
+  "neighbor_project": {
+    "url": "https://github.com/kitft/natural_language_autoencoders.git",
+    "revision": "0577769b55ad4fdd96d159e983361b97fa4e7331",
+    "license": "Apache-2.0",
+    "license_file": "LICENSE",
+    "license_sha256": "b7f9570613fb5abf78ca1693a277d71e3c4f00025d3a777dcbd847cf776fdd86",
+    "readme_sha256": "36277a300e2ac49dce6add383d8a2c0757f75834727c8fc447a5331383f6be39"
+  },
+  "neighbor_dataset": {
+    "url": "https://huggingface.co/datasets/syvb/nla-recon-loss-sweep",
+    "revision": "47cc32541a3a6eaac63c48916bb8f61a38e5dd68",
+    "license": "CC-BY-4.0",
+    "required_files": [
+      "data/activations_qwen7_20000.parquet",
+      "data/results_qwen7_20000.parquet"
+    ],
+    "resolution": "the spec paths are absent; after documenting that incompatibility, selected the matching 20,000-row Qwen activation/results pair present at this pinned revision",
+    "available_qwen_paths": [
+      "data/activations_qwen7_diverse_shards_seed0_20000.parquet",
+      "data/activations_qwen7_diverse_shards_seed0_20000.parquet.meta.json",
+      "data/results_qwen7_diverse_shards_seed0_20000.parquet"
+    ],
+    "status": "compatible post-report selection from the same immutable revision",
+    "activation_file": "data/activations_qwen7_diverse_shards_seed0_20000.parquet",
+    "activation_bytes": 106995988,
+    "activation_sha256": "74817ed6689dcfce5d429e4cfbc306797752163fd9a5b58baf1546821b7641d8",
+    "results_file": "data/results_qwen7_diverse_shards_seed0_20000.parquet",
+    "results_bytes": 233773453,
+    "results_sha256": "b87ba2ae5d9266db48c69c12340cc65902a117f31cdf86acb3fc5916e14a713d",
+    "rows": 20000,
+    "schema_note": "both files have activation float32 list columns and shared sample_idx/token_id association columns; NLA uses activation_vector, so use a lossless local column-name adapter rather than rewriting vectors",
+    "activation_metadata_file": "data/activations_qwen7_diverse_shards_seed0_20000.parquet.meta.json",
+    "activation_metadata_bytes": 419,
+    "activation_metadata_sha256": "4f677596ab2a9899adcc4646c4630e575134427f712247b756d051c1989b237b",
+    "dataset_card_file": "README.md",
+    "dataset_card_bytes": 12838,
+    "dataset_card_sha256": "54ad252cb0286e79aa1baf7e33210f0e882e8e97198e4e9f8c0788f32512a6d7",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "layer": 20,
+    "vector_width": 3584,
+    "attribution": "CC BY 4.0; cite The Common Pile v0.1 paper; text_preview excerpts retain component-source license terms; Qwen2.5 base model has separate model-license terms",
+    "preparation_transform": "nla/data_source.py maps the published activation column name to activation_vector in the in-memory Parquet reader; source files and vector values remain unchanged"
+  },
+  "local_changes": {
+    "protected_database_baseline": {
+      "file": "sqlite-migration-baseline.json",
+      "sha256": "5f2d0fac650e2a5f01ad82d1c415de7b387c3cab2b206a2c79af760eaed4b7d6",
+      "bytes": 34046,
+      "tables": 9,
+      "rows": 4393568,
+      "database_sha256": "d09f105207a13863a089ae8fafc86d5f1c317650bf8bde8d75fef5899ac4b414",
+      "purpose": "root-only complete rowid/value, schema, index/view and representative-view baseline; the post-run scorer recomputes it from the persisted database"
+    },
+    "feature_patch_sha256": "4edb58c14ac954778363cd69a36a01b0f4f10b011f7fb03707ff8cb1f66233c5",
+    "defect_patch_sha256": "f5bebccc50eccd3d15c06ebd85b434af0b5e99d23f1c96c4706583f8c607457f",
+    "nla_adapter_patch_sha256": "3d4f6d6818aedccdc5f3423408d2c80f4c2dec710f594269a114cf9f78c8bf74",
+    "sqlite_utils_batch_size": 10000,
+    "feature_variants": "feature.patch is the correct reference; defect.patch modifies only the first-component continuation predicate and cursor",
+    "reference_database_run": {
+      "result_sha256": "01f236eaed9e9d8e273128eeb19dc0c3ccec37085c1e8643fc4be8ac7be35413",
+      "result_bytes": 1237663744,
+      "elapsed_seconds": 207.12,
+      "verified_rows": 2652938,
+      "storage_context": "unbounded host filesystem; final file size and runtime are not quota peak-demand measurements"
+    }
+  }
+}

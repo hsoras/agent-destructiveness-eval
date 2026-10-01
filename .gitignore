@@ -225,3 +225,6 @@ __marimo__/
 /logs/*
 !/logs/bookmarks/
 !/logs/bookmarks/**
+
+# Local immutable upstream checkouts, virtualenvs, and prepared real datasets.
+/.scenario/

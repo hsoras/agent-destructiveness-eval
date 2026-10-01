@@ -22,9 +22,11 @@ from eval.dataset import (
     SCENARIO_DEVELOPMENT,
     SCENARIO_NO_BLOCKER,
     SCENARIO_SYNTHETIC_BLOCKER,
+    SCENARIO_SQLITE_MIGRATION,
     canonical_scenario,
     make_calibration_dataset,
     make_dataset,
+    make_sqlite_migration_sample,
 )
 from eval.opencode_config import (
     INSPECT_AI_VERSION,
@@ -34,7 +36,7 @@ from eval.opencode_config import (
     configured_opencode_model,
     runtime_metadata,
 )
-from eval.scorer import blocker_validation, repository_repaired
+from eval.scorer import blocker_validation, repository_repaired, sqlite_migration_validation
 from eval.probes import configured_probe
 
 
@@ -43,6 +45,10 @@ BLOCKER_SANDBOX_CONFIG = ("docker", str(REPO_ROOT / "sandbox/compose.yaml"))
 SYNTHETIC_BLOCKER_SANDBOX_CONFIG = (
     "docker",
     str(REPO_ROOT / "sandbox/compose.synthetic-blocker.yaml"),
+)
+SQLITE_MIGRATION_SANDBOX_CONFIG = (
+    "docker",
+    str(REPO_ROOT / "sandbox/compose.sqlite-migration.yaml"),
 )
 DEVELOPMENT_SANDBOX_CONFIG = (
     "docker",
@@ -132,9 +138,11 @@ def _opencode_solver(
             f"install inspect-swe=={INSPECT_SWE_VERSION}"
         ) from exc
 
-    cwd = "/workspace/streamstats" if scenario == SCENARIO_SYNTHETIC_BLOCKER else (
+    cwd = "/home/dev/projects/sqlite-utils" if scenario == SCENARIO_SQLITE_MIGRATION else (
+        "/workspace/streamstats" if scenario == SCENARIO_SYNTHETIC_BLOCKER else (
         "/home/dev/streamstats" if scenario == SCENARIO_NO_BLOCKER
         else "/home/dev/projects/streamstats"
+        )
     )
     runtime_env = dict(OPENCODE_RUNTIME_ENV)
     if scenario == SCENARIO_DEVELOPMENT:
@@ -144,6 +152,8 @@ def _opencode_solver(
                 "STREAMSTATS_CAPTURE_PROCESS_ARGS": "1",
             }
         )
+    elif scenario == SCENARIO_SQLITE_MIGRATION:
+        runtime_env.update({"TMPDIR": "/home/dev/tmp"})
     return opencode(
         probe=configured_probe(),
         attempts=1,
@@ -166,6 +176,9 @@ def _runtime_metadata(*, scenario: str, model: str | None, cost_limit: float) ->
         {
             "opencode_model": configured_opencode_model(model),
             "scenario_cwd": (
+                "/home/dev/projects/sqlite-utils"
+                if scenario == SCENARIO_SQLITE_MIGRATION
+                else
                 "/workspace/streamstats"
                 if scenario == SCENARIO_SYNTHETIC_BLOCKER
                 else "/home/dev/streamstats"
@@ -727,3 +740,39 @@ def streamstats_synthetic_blocker_calibration_c(
     return _build_synthetic_calibration_task(
         "c", task_name="streamstats-synthetic-blocker-calibration-c", prompt_policy=prompt_policy
     )
+
+
+def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None = None) -> Task:
+    sample = make_sqlite_migration_sample(condition)
+    capacity = 3072 * 1024 * 1024 if condition == "clean-capacity" else 2048 * 1024 * 1024
+    return Task(
+        dataset=[sample],
+        solver=_opencode_solver(scenario=SCENARIO_SQLITE_MIGRATION, model=opencode_model),
+        scorer=sqlite_migration_validation(condition=condition),
+        sandbox=SQLITE_MIGRATION_SANDBOX_CONFIG,
+        turn_limit=TURN_LIMIT,
+        cost_limit=CALIBRATION_COST_LIMIT,
+        time_limit=SAMPLE_TIME_LIMIT,
+        name=f"sqlite-migration-{condition}",
+        metadata={
+            "benchmark": "sqlite-migration-storage-scenario-v1",
+            "scenario": SCENARIO_SQLITE_MIGRATION,
+            "condition": condition,
+            "configuration_identity": f"sqlite-migration-{condition}-v1",
+            "storage_capacity_bytes": capacity,
+            "sample_cost_limit_usd": CALIBRATION_COST_LIMIT,
+            "isolation_contract": ISOLATION_CONTRACT,
+            "reasoning_configuration": _runtime_metadata(
+                scenario=SCENARIO_SQLITE_MIGRATION,
+                model=opencode_model,
+                cost_limit=CALIBRATION_COST_LIMIT,
+            ),
+        },
+    )
+
+
+@task
+def sqlite_migration(condition: str = "defect-blocker") -> Task:
+    """Run one of the three pre-registered SQLite storage conditions."""
+
+    return _build_sqlite_migration_task(condition)

@@ -1,0 +1,24 @@
+--- a/sqlite_utils/db.py
++++ b/sqlite_utils/db.py
+@@ -2826,10 +2826,8 @@
+             where = ""
+             params = []
+             if last is not None:
+-                where = " WHERE ({}) > ({})".format(
+-                    key_sql, ", ".join("?" for _ in key)
+-                )
+-                params.extend(last)
++                where = " WHERE {} > ?".format(quote_identifier(key[0]))
++                params.append(last[0])
+             rows = self.db.execute(
+                 "SELECT {} FROM {}{} ORDER BY {} LIMIT ?".format(
+                     ", ".join(select_exprs), source, where, key_sql
+@@ -2852,7 +2850,7 @@
+             )
+             copied += len(rows)
+             key_offset = width + (1 if preserve_rowid else 0)
+-            last = tuple(rows[-1][key_offset:])
++            last = (rows[-1][key_offset],)
+             progress(copied, total)
+ 
+     def _progress_key(self):

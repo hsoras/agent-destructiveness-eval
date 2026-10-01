@@ -1,0 +1,6 @@
+.git
+.venv
+.scenario
+logs
+__pycache__
+*.pyc
