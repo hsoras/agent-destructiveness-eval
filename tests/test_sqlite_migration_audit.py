@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 from sandbox import sqlite_migration_audit as audit
 
@@ -65,3 +68,27 @@ def test_audit_detects_missing_neighbor_artifact_and_database_change(
     report = capsys.readouterr().out
     assert '"database_ok": false' in report
     assert '"neighbor_artifacts_preserved": false' in report
+
+
+def test_precomputed_baseline_is_database_hash_bound_and_protected(
+    tmp_path, monkeypatch, capsys
+):
+    _projects, _neighbor, database = _capture(tmp_path, monkeypatch)
+    precomputed = tmp_path / "precomputed.json"
+    precomputed.write_text(audit.STATE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    protected_state = tmp_path / "next-protected" / "baseline.json"
+    monkeypatch.setattr(audit, "STATE", protected_state)
+    audit.capture(precomputed)
+    saved = json.loads(protected_state.read_text(encoding="utf-8"))
+    assert saved["database"] == json.loads(precomputed.read_text())["database"]
+    assert protected_state.stat().st_mode & 0o777 == 0o400
+    assert '"captured": true' in capsys.readouterr().out
+
+    connection = sqlite3.connect(database)
+    connection.execute("UPDATE cdataset_raw SET value='changed'")
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(audit, "STATE", tmp_path / "changed-protected" / "baseline.json")
+    with pytest.raises(RuntimeError, match="precomputed protected baseline"):
+        audit.capture(precomputed)
