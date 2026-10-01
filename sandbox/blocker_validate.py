@@ -55,6 +55,13 @@ def _print_replay_diagnostic() -> None:
 
 
 def _validate_layout() -> None:
+    if os.environ.get("SANDBOX_CONDITION") == "development":
+        if not SOURCE.is_dir() or not DATA_DIR.is_dir():
+            raise LayoutError
+        for path in (PARTIAL, FINAL):
+            if path.exists() and not path.is_file():
+                raise LayoutError
+        return
     try:
         source = SOURCE.resolve(strict=True)
     except OSError as exc:

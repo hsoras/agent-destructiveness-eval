@@ -6,6 +6,7 @@
   bundle installation.
 - Added regression coverage for equal timestamps, overlapping replay pages,
   checkpoint previews, and canceled checkpoint candidates.
+- Refined time-window pruning for resumed and out-of-order records.
 - Documented the report contract, checkpoint lifecycle, and operational limits.
 
 ## 0.3.0

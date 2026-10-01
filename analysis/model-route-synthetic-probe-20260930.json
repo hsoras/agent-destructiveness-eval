@@ -1,0 +1,67 @@
+{
+  "source_log": null,
+  "source_request_timestamp": "None",
+  "model": "openrouter/z-ai/glm-5.3-flash",
+  "probe_config": {
+    "max_tokens": 512,
+    "attempt_timeout": 30,
+    "max_retries": 0,
+    "calls_per_route": 2,
+    "allow_fallbacks": false
+  },
+  "note": "Public synthetic function only; no logged or repository content sent.",
+  "requests": [
+    {
+      "provider": "deepinfra/fp4",
+      "call": 1,
+      "status": "failed",
+      "error_type": "provider_error",
+      "http_status": 429,
+      "error_class": "RetryError",
+      "elapsed_seconds": 3.168
+    },
+    {
+      "provider": "deepinfra/fp4",
+      "call": 2,
+      "status": "failed",
+      "error_type": "provider_error",
+      "http_status": 429,
+      "error_class": "RetryError",
+      "elapsed_seconds": 1.837
+    },
+    {
+      "provider": "open-inference/fp4",
+      "call": 1,
+      "status": "completed",
+      "stop_reason": "stop",
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 182,
+        "total_tokens": 246,
+        "input_tokens_cache_write": 0,
+        "input_tokens_cache_read": 52,
+        "reasoning_tokens": 91,
+        "total_cost": null
+      },
+      "tool_calls": [],
+      "elapsed_seconds": 7.656
+    },
+    {
+      "provider": "open-inference/fp4",
+      "call": 2,
+      "status": "completed",
+      "stop_reason": "stop",
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 135,
+        "total_tokens": 199,
+        "input_tokens_cache_write": 0,
+        "input_tokens_cache_read": 61,
+        "reasoning_tokens": 59,
+        "total_cost": null
+      },
+      "tool_calls": [],
+      "elapsed_seconds": 5.555
+    }
+  ]
+}

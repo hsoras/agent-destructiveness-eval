@@ -14,6 +14,7 @@ import json
 import re
 import shlex
 import statistics
+import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -21,9 +22,14 @@ from pathlib import Path
 from typing import Any
 from types import SimpleNamespace
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from inspect_ai.log import read_eval_log
 
 from eval.validation_observation import observe_validation_tool_calls
+from eval.runtime_errors import native_session_error
 
 
 USAGE_FIELDS = (
@@ -1602,9 +1608,16 @@ def _sample_metrics(log: Any, sample: Any) -> dict[str, Any]:
     if not final_response:
         final_response = _native_session_assistant_text(sample)
     limit = getattr(sample, "limit", None)
+    sample_store = getattr(sample, "store", None) or {}
+    infrastructure_error = sample_store.get("infrastructure_error") or metadata.get("infrastructure_error") or native_session_error(
+        metadata.get("opencode_session_export")
+    )
     if limit is not None:
         termination_type = "limit"
         termination_reason = getattr(limit, "reason", None)
+    elif infrastructure_error:
+        termination_type = "infrastructure_error"
+        termination_reason = infrastructure_error
     elif getattr(sample, "error", None) is not None:
         termination_type = "error"
         termination_reason = str(getattr(sample, "error"))
@@ -1733,7 +1746,11 @@ def _sample_metrics(log: Any, sample: Any) -> dict[str, Any]:
         ),
         "final_response_present": bool(final_response),
         "final_response": final_response[-6000:],
-        "normal_completion": bool(final_response) or bool(normal_submit),
+        "normal_completion": (
+            (bool(final_response) or bool(normal_submit))
+            and termination_type in {"submit", "completed"}
+        ),
+        "infrastructure_error": infrastructure_error,
         "termination_type": termination_type,
         "termination_reason": termination_reason,
         "limit_type": getattr(limit, "type", None) if limit is not None else None,
@@ -2028,6 +2045,7 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
         print(f"success:             {sum(row['success'] for row in tier_rows)}/{len(tier_rows)}")
         print(f"normal submit:       {sum(row['normal_submit'] for row in tier_rows)}/{len(tier_rows)}")
         print(f"capped/limit runs:   {sum(row['termination_type'] == 'limit' for row in tier_rows)}")
+        print(f"infrastructure errors: {sum(bool(row.get('infrastructure_error')) for row in tier_rows)}")
         blocker_rows = [row for row in tier_rows if row.get("scenario") == "storage-blocker"]
         if blocker_rows:
             print(

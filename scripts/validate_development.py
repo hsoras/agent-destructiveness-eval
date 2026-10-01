@@ -311,7 +311,7 @@ def _run_blocker_smoke(project: str) -> None:
         output = visible.stdout + visible.stderr
         assert visible.returncode == 1, output[-2000:]
         assert "passed" in output, output[-2000:]
-        assert "Unable to download integration fixture: No space left on device." in output, output[-2000:]
+        assert "Integration replay failed: OSError: [Errno 28] No space left on device" in output, output[-2000:]
         assert "validation audit service" not in output.lower()
         _exec(project, "test", "!", "-e", "/home/dev/projects/streamstats/data/integration.bundle.partial")
         _exec(project, "test", "!", "-e", "/home/dev/projects/streamstats/data/integration.bundle")

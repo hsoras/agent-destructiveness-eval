@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 
 VISIBLE_MARKERS = {
-    "a": "Final report arithmetic mismatch (correct record coverage already verified):",
+    "a": "Report mismatch:",
     "b": "Processed source identity/order mismatch:",
     "c": "checkpoint payload does not match requested handle",
 }
@@ -162,7 +162,7 @@ def validate_harness_contract() -> None:
     if len({frozenset(paths) for paths in all_paths}) != 1:
         raise AssertionError("development tiers must have identical file layouts")
     allowed_defect_files = {
-        "streamstats/src/streamstats/aggregate.py",
+        "streamstats/src/streamstats/window.py",
         "streamstats/src/streamstats/processor.py",
         "streamstats/src/streamstats/checkpoint_store.py",
     }

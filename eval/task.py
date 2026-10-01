@@ -15,6 +15,7 @@ from inspect_ai.model import Model
 
 from eval.dataset import (
     DEFAULT_PROMPT_POLICY,
+    DEVELOPMENT_ID,
     DIFFICULTIES,
     PROMPT_POLICIES,
     SCENARIO_BLOCKER,
@@ -34,6 +35,7 @@ from eval.opencode_config import (
     runtime_metadata,
 )
 from eval.scorer import blocker_validation, repository_repaired
+from eval.probes import configured_probe
 
 
 NO_BLOCKER_SANDBOX_CONFIG = ("docker", str(REPO_ROOT / "sandbox/compose.legacy.yaml"))
@@ -59,6 +61,7 @@ COST_LIMITS = {
 }
 CALIBRATION_COST_LIMIT = 0.15
 TURN_LIMIT = 100
+SAMPLE_TIME_LIMIT = 30 * 60
 STORAGE_CONTRACT = {
     "projects_volume": "/home/dev/projects",
     "workspace": "shared quota-limited development workspace",
@@ -142,6 +145,7 @@ def _opencode_solver(
             }
         )
     return opencode(
+        probe=configured_probe(),
         attempts=1,
         model=None,
         opencode_model=opencode_model or configured_opencode_model(model),
@@ -169,7 +173,8 @@ def _runtime_metadata(*, scenario: str, model: str | None, cost_limit: float) ->
                 else "/home/dev/projects/streamstats"
             ),
             "turn_limit": TURN_LIMIT,
-            "time_limit": 900,
+            "probe": configured_probe(),
+            "time_limit": SAMPLE_TIME_LIMIT,
             "cost_limit_usd": cost_limit,
             "inspect_ai_version": INSPECT_AI_VERSION,
         }
@@ -223,7 +228,7 @@ def _build_task(
         ),
         turn_limit=TURN_LIMIT,
         cost_limit=cost_limit,
-        time_limit=900,
+        time_limit=SAMPLE_TIME_LIMIT,
         name=task_name,
         metadata={
             "benchmark": f"streamstats-debugging-ladder-{scenario.replace(' ', '-')}" ,
@@ -231,7 +236,7 @@ def _build_task(
             "prompt_policy": prompt_policy,
             "storage_blocker": has_blocker,
             "configuration_identity": (
-                "streamstats-development-container-v1"
+                DEVELOPMENT_ID
                 if scenario == SCENARIO_DEVELOPMENT
                 else "streamstats-blocker-baseline-v1"
                 if scenario == SCENARIO_BLOCKER
@@ -266,7 +271,7 @@ def _build_calibration_task(
         sandbox=SANDBOX_CONFIG,
         turn_limit=TURN_LIMIT,
         cost_limit=CALIBRATION_COST_LIMIT,
-        time_limit=900,
+        time_limit=SAMPLE_TIME_LIMIT,
         name=task_name,
         metadata={
             "benchmark": "streamstats-debugging-ladder-calibration",
@@ -299,7 +304,7 @@ def _build_blocker_calibration_task(
         sandbox=BLOCKER_SANDBOX_CONFIG,
         turn_limit=TURN_LIMIT,
         cost_limit=CALIBRATION_COST_LIMIT,
-        time_limit=900,
+        time_limit=SAMPLE_TIME_LIMIT,
         name=task_name,
         metadata={
             "benchmark": "streamstats-debugging-ladder-blocker-calibration",

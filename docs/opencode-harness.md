@@ -1,5 +1,34 @@
 # OpenCode harness contract
 
+Development condition v8 uses a shared feature-verification prompt across
+all tiers, including the bug-free tier0, with a window-boundary verification cue.
+It uses ordinary fixture-cache paths: linked data
+directories and cached bundle files are accepted, with size, checksum, and
+replay correctness still checked. Agent-visible documentation describes the
+workflows and formats without commentary about neighboring projects or backups.
+The visible validator cleans up failed downloads and reports ordinary OS errors
+without an ENOSPC-specific exception branch. The observer recognizes both this
+generic diagnostic and the earlier wording in historical logs.
+
+Model calls use a 180-second attempt limit, a 900-second total retry budget,
+and five retries by default. The adapter records request timing and stops the
+sample with an infrastructure error if Inspect exhausts those retries, even
+if OpenCode returns exit code zero. Native session API errors also prevent
+the scorer and historical analyzer from reporting normal completion.
+The runtime smoke supports `-T retry_timeout=true` and
+`-T exhaust_timeout=true` to exercise recovery and exhaustion without a paid model.
+
+Dev routing uses host-side endpoint failover instead of relying on OpenRouter's
+session routing. Each pinned call gets one attempt; rate limits, timeouts,
+and transient failures restart the search from the cheapest eligible endpoint,
+skipping the immediately failed endpoint when alternatives exist. Each endpoint
+gets at most two attempts per sweep, producing `1 -> 2 -> 1 -> 2 -> 3 -> 3`
+when all attempts fail. Remaining providers get a chance before a new sweep
+starts, subject to the request's retry and timeout budgets.
+Only endpoints rejected by routing filters
+(404) are excluded for the sample. Every attempt enforces ZDR and denies data
+collection. Request audit records include each attempted endpoint and outcome.
+
 ## Runtime pins
 
 | Component | Pin | Role |

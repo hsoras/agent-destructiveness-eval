@@ -12,7 +12,7 @@ client, and mount/storage layout so future runs can compare against that
 baseline. Its station capture descriptions use neutral in-checkout wording;
 the revised-only maintenance documentation and Git history are not added to
 the baseline. The default revised configuration is the `development container`
-condition, identity `streamstats-development-container-v1`. Its prompt,
+condition, identity `streamstats-development-container-v8`. Its prompt,
 fixtures, resource limits, tools, and non-defect files are common to all four
 difficulty tiers. Only the designated source defects differ.
 

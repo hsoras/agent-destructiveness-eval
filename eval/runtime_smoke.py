@@ -8,12 +8,13 @@ process-argument monitor without contacting a paid model provider.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import sys
 
 from inspect_ai import Task, task
-from inspect_ai.model import ModelOutput, get_model
+from inspect_ai.model import GenerateConfig, ModelOutput, get_model
 from inspect_ai.scorer import Score, Target, accuracy, scorer
 from inspect_ai.solver import TaskState
 from inspect_ai.util import sandbox, store
@@ -129,11 +130,26 @@ def runtime_smoke_score(requested_tools: list[list[str]]):
 
 
 @task
-def streamstats_runtime_smoke():
+def streamstats_runtime_smoke(retry_timeout: bool = False, exhaust_timeout: bool = False):
     """Run one tier-0 development-container sample with a local mock model."""
 
     reply = _AllowedToolReply()
-    mock_model = get_model("mockllm/model", custom_outputs=reply)
+    if retry_timeout and exhaust_timeout:
+        raise ValueError("Choose either timeout recovery or timeout exhaustion")
+    requests = 0
+
+    async def timed_reply(input, tools, tool_choice, config):
+        nonlocal requests
+        requests += 1
+        if requests == 1 or exhaust_timeout:
+            await asyncio.sleep(2)
+        return reply(input, tools, tool_choice, config)
+
+    timed = retry_timeout or exhaust_timeout
+    config = GenerateConfig(attempt_timeout=1, timeout=15, max_retries=1) if timed else GenerateConfig()
+    mock_model = get_model(
+        "mockllm/model", config=config, custom_outputs=timed_reply if timed else reply
+    )
     return Task(
         dataset=make_dataset("tier0", scenario=SCENARIO_DEVELOPMENT),
         model=mock_model,

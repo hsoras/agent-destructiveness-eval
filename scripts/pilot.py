@@ -147,6 +147,43 @@ def openrouter_privacy_arg() -> str:
     )
 
 
+def openrouter_dev_arg(quantizations: list[str] | None = None) -> str:
+    """Try eligible ZDR endpoints in price order, with provider failover."""
+    routing = {
+        "sort": "price", "allow_fallbacks": False,
+        "data_collection": "deny", "zdr": True,
+    }
+    if quantizations:
+        routing["quantizations"] = quantizations
+    return "provider=" + json.dumps(routing, separators=(",", ":"))
+
+
+def fetch_openrouter_dev_routes(model: str, quantizations=None, *, opener=urlopen) -> list[str]:
+    """Order active tool-capable endpoints by prompt plus completion price."""
+    model_id = _openrouter_model_id(model)
+    request = Request(
+        f"https://openrouter.ai/api/v1/models/{quote(model_id, safe='/')}/endpoints",
+        headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+    )
+    try:
+        with opener(request, timeout=10) as response:
+            endpoints = json.loads(response.read())["data"]["endpoints"]
+        candidates = [e for e in endpoints if e.get("status", 0) == 0
+            and "tools" in e.get("supported_parameters", [])
+            and (not quantizations or e.get("quantization") in quantizations)]
+        candidates.sort(key=lambda e: (
+            float(e["pricing"]["prompt"]) + float(e["pricing"]["completion"]), e["tag"]
+        ))
+        routes = list(dict.fromkeys(e["tag"] for e in candidates))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("could not retrieve OpenRouter dev endpoint ordering") from exc
+    if not routes:
+        raise ValueError("no active tool-capable endpoints match the dev filters")
+    # Catalog ordering is not a privacy assertion: every actual request must
+    # still carry deny + ZDR; OpenRouter rejects ineligible pinned endpoints.
+    return routes
+
+
 def _openrouter_model_id(model: str) -> str:
     """Return the OpenRouter catalog id without Inspect's provider prefix."""
 
@@ -265,6 +302,10 @@ def write_model_cost_config(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--dev", action="store_true",
+        help="cheapest-first OpenRouter ZDR routing with fallbacks and a $0.20 per-sample cost limit",
+    )
+    parser.add_argument(
         "--model",
         required=True,
         help="model id; use a fully-qualified Inspect name unless --provider is set",
@@ -299,6 +340,12 @@ def main() -> int:
         help="require no provider data collection and Zero Data Retention",
     )
     parser.add_argument("--runs", type=int, default=1, help="independent epochs per tier")
+    parser.add_argument(
+        "--probe",
+        choices=("indirect", "direct", "all"),
+        default=None,
+        help="tool-free follow-up after completion; all launches independent indirect and direct runs",
+    )
     parser.add_argument(
         "--difficulty",
         choices=(*DIFFICULTIES, "all", *CALIBRATION_DIFFICULTIES),
@@ -337,14 +384,26 @@ def main() -> int:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=3,
-        help="maximum retries for a failed model API request (default: 3)",
+        default=5,
+        help="maximum retries for a failed model API request (default: 5; additional endpoints in --dev)",
     )
     parser.add_argument(
         "--timeout",
         type=int,
-        default=120,
-        help="model API request timeout in seconds (default: 120)",
+        default=900,
+        help="total model request retry budget in seconds (default: 900)",
+    )
+    parser.add_argument(
+        "--attempt-timeout",
+        type=int,
+        default=180,
+        help="hard deadline for one model API attempt in seconds (default: 180)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="maximum completion tokens per model call (default: 8192)",
     )
     parser.add_argument(
         "--turn-limit",
@@ -377,11 +436,34 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.dev:
+        if any(argument.strip().startswith("strict_tools=") for argument in args.model_arg):
+            parser.error("--dev uses strict_tools=false to preserve OpenCode's optional tool arguments; omit strict_tools overrides")
+        if args.openrouter_provider or any(
+            argument.strip().startswith("provider=") for argument in args.model_arg
+        ):
+            parser.error("--dev selects providers automatically; omit --provider and provider= model arguments")
+        if args.inspect_provider and args.inspect_provider != "openrouter":
+            parser.error("--dev requires OpenRouter")
+        if args.cost_limit is not None and args.cost_limit > 0.20:
+            parser.error("--dev cost limit cannot exceed $0.20 per sample")
+        if args.cost_limit is None:
+            args.cost_limit = 0.20
+        args.inspect_provider = "openrouter"
+
     if args.blocker:
         args.scenario = "blocker"
 
     if args.cost_limit is not None and args.cost_limit <= 0:
         parser.error("--cost-limit must be greater than zero")
+    if args.attempt_timeout <= 0:
+        parser.error("--attempt-timeout must be greater than zero")
+    if args.max_retries < 0:
+        parser.error("--max-retries must be zero or greater")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+    if args.max_tokens <= 0:
+        parser.error("--max-tokens must be greater than zero")
 
     try:
         if args.openrouter_provider:
@@ -397,7 +479,19 @@ def main() -> int:
             "--model must be an OpenRouter route (for example z-ai/glm-5.3-flash)"
         )
 
-    if args.openrouter_provider:
+    if args.dev:
+        try:
+            dev_routes = fetch_openrouter_dev_routes(model, args.quantization)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.model_arg.insert(0, openrouter_dev_arg(args.quantization))
+        # OpenCode's native tools include optional properties. The compatible
+        # provider defaults to strict=True without converting their schemas,
+        # which strict validators reject before the agent can begin.
+        args.model_arg.append("strict_tools=false")
+        print("dev routing: cheapest-first, ZDR only, explicit endpoint failover; sample budget $" + str(args.cost_limit))
+        print("dev endpoint order: " + ", ".join(dev_routes))
+    elif args.openrouter_provider:
         if any(argument.strip().startswith("provider=") for argument in args.model_arg):
             parser.error("use --provider or --model-arg provider=..., not both")
         try:
@@ -497,6 +591,10 @@ def main() -> int:
         str(args.max_retries),
         "--timeout",
         str(args.timeout),
+        "--attempt-timeout",
+        str(args.attempt_timeout),
+        "--max-tokens",
+        str(args.max_tokens),
         "--turn-limit",
         str(args.turn_limit),
         "--cache=false",
@@ -518,18 +616,34 @@ def main() -> int:
     if args.max_sandboxes is not None:
         command.extend(["--max-sandboxes", str(args.max_sandboxes)])
 
-    print("$ " + shlex.join(command))
     environment = fresh_eval_environment()
+    environment.pop("STREAMSTATS_PROBE", None)
+    environment.pop("STREAMSTATS_DEV_ROUTES", None)
+    if args.dev:
+        environment["STREAMSTATS_DEV_ROUTES"] = json.dumps(dev_routes)
     # The task solver receives the same fully-qualified route that Inspect uses
     # for pricing and model generation. OpenCode's provider name selects its
     # request format; the Inspect bridge still owns the actual OpenRouter call.
     environment["STREAMSTATS_OPENCODE_MODEL"] = model
     try:
-        return subprocess.run(
-            command,
-            check=False,
-            env=environment,
-        ).returncode
+        probe_modes = ("indirect", "direct") if args.probe == "all" else (args.probe,)
+        exit_code = 0
+        for probe_mode in probe_modes:
+            run_command = command.copy()
+            run_environment = environment.copy()
+            if probe_mode is not None:
+                run_environment["STREAMSTATS_PROBE"] = probe_mode
+            if args.probe == "all":
+                run_command[run_command.index("--log-dir") + 1] = str(
+                    Path(args.log_dir) / probe_mode
+                )
+                print(f"probe: {probe_mode}", flush=True)
+            print("$ " + shlex.join(run_command), flush=True)
+            result = subprocess.run(run_command, check=False, env=run_environment)
+            # Still run the other probe after a failed evaluation, and report
+            # the first nonzero exit code once both independent runs finish.
+            exit_code = exit_code or result.returncode
+        return exit_code
     finally:
         if temporary_cost_dir is not None:
             temporary_cost_dir.cleanup()

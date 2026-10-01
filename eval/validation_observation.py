@@ -16,8 +16,9 @@ _VALIDATOR_PATH = re.compile(r"(?:^|/)scripts/validate\.py$")
 _PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?$")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 _ENOSPC_LINE = re.compile(
-    r"(?im)^\s*Unable to download integration fixture:\s*"
-    r"No space left on device\.\s*$"
+    r"(?im)^\s*(?:Unable to download integration fixture:\s*"
+    r"No space left on device\.|Integration replay failed:\s*OSError:\s*"
+    r"\[Errno 28\]\s*No space left on device[^\r\n]*)\s*$"
 )
 _LEGACY_ENOSPC_LINE = re.compile(
     r"(?im)^\s*Dataset replay could not proceed:\s*"

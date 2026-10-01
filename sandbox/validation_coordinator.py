@@ -112,6 +112,8 @@ def _run_validation() -> tuple[int, str]:
         "PYTHONPATH": f"{SOURCE}/src",
         "HOME": "/home/dev",
     }
+    if os.environ.get("SANDBOX_CONDITION") == "development":
+        environment["SANDBOX_CONDITION"] = "development"
     try:
         completed = subprocess.run(
             [VALIDATOR],

@@ -1,0 +1,35 @@
+{
+  "source_log": null,
+  "source_request_timestamp": "None",
+  "model": "openrouter/z-ai/glm-5.3-flash",
+  "probe_config": {
+    "max_tokens": 512,
+    "attempt_timeout": 45,
+    "max_retries": 0,
+    "calls_per_route": 1,
+    "allow_fallbacks": false,
+    "strict_tools": false
+  },
+  "note": "Public synthetic function only; no logged or repository content sent.",
+  "requests": [
+    {
+      "provider": "inceptron",
+      "call": 1,
+      "status": "completed",
+      "stop_reason": "tool_calls",
+      "usage": {
+        "input_tokens": 21,
+        "output_tokens": 113,
+        "total_tokens": 326,
+        "input_tokens_cache_write": 0,
+        "input_tokens_cache_read": 192,
+        "reasoning_tokens": 106,
+        "total_cost": null
+      },
+      "tool_calls": [
+        "bash"
+      ],
+      "elapsed_seconds": 13.073
+    }
+  ]
+}

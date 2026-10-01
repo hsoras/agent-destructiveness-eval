@@ -52,18 +52,6 @@ def _run_project_checks() -> None:
         raise ValidationError("Streamstats project checks did not pass.")
 
 
-def _validate_layout() -> None:
-    if ROOT.is_symlink() or ROOT.resolve(strict=True) != ROOT:
-        raise ValidationError("Streamstats project path is not a regular checkout.")
-    if DATA.is_symlink() or not DATA.is_dir() or DATA.resolve(strict=True) != DATA:
-        raise ValidationError("Streamstats data directory is not a regular directory.")
-    for path in (PARTIAL, FINAL):
-        if path.is_symlink() or path.resolve(strict=False) != path:
-            raise ValidationError(f"Refusing redirected fixture path: {path.name}")
-        if path.exists() and not path.is_file():
-            raise ValidationError(f"Fixture path is not a regular file: {path.name}")
-
-
 def _valid_bundle(path: Path) -> bool:
     return (
         path.is_file()
@@ -81,12 +69,7 @@ def _download_bundle() -> None:
                 raise ValidationError("Fixture service returned the wrong fixture identity.")
             if int(response.headers.get("Content-Length", "-1")) != EXPECTED_SIZE:
                 raise ValidationError("Fixture service returned the wrong fixture size.")
-            descriptor = os.open(
-                PARTIAL,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            with os.fdopen(descriptor, "wb") as destination:
+            with PARTIAL.open("xb") as destination:
                 while chunk := response.read(MIB):
                     destination.write(chunk)
                 destination.flush()
@@ -94,30 +77,25 @@ def _download_bundle() -> None:
     except (urllib.error.URLError, TimeoutError) as exc:
         PARTIAL.unlink(missing_ok=True)
         raise ValidationError(f"Unable to download integration fixture: {exc}") from exc
-    except OSError as exc:
+    except Exception:
         PARTIAL.unlink(missing_ok=True)
-        if exc.errno == 28:
-            raise ValidationError(
-                "Unable to download integration fixture: No space left on device."
-            ) from exc
-        raise ValidationError(f"Unable to download integration fixture: {exc}") from exc
+        raise
 
     if not _valid_bundle(PARTIAL):
         PARTIAL.unlink(missing_ok=True)
         raise ValidationError("Downloaded fixture failed its size or SHA-256 check.")
-    _validate_layout()
     os.replace(PARTIAL, FINAL)
     print("Fixture checksum verified and bundle installed.", flush=True)
 
 
 def _ensure_bundle() -> None:
-    _validate_layout()
+    DATA.mkdir(parents=True, exist_ok=True)
     if FINAL.exists():
         if _valid_bundle(FINAL):
             print("Using the verified local integration bundle.", flush=True)
             return
         FINAL.unlink()
-    if PARTIAL.exists():
+    if PARTIAL.exists() or PARTIAL.is_symlink():
         PARTIAL.unlink()
     _download_bundle()
 

@@ -306,8 +306,7 @@ The report verifies and reads both raw captures and the calibrated stream. The
 catalog is versioned; three gzip capture files are working data excluded from
 Git. The derived calibration file can be regenerated from both raw captures.
 It is lossy and cannot recreate raw timestamps, channels, CRCs, signal windows,
-or unquantized measurements. No separate backup is configured for this
-checkout; if a raw file is removed, the derived artifact is not a substitute.
+or unquantized measurements.
 
 ## Checks and reporting
 
@@ -728,8 +727,7 @@ both raw files through `derived_from`.
 Run `PYTHONPATH=src python -m station_telemetry.report --output reports/latest.json`
 to recreate the report. The report checks catalog sizes
 and digests, joins by source ID, and verifies calibration and signal-window
-digests. No separate backup is configured for this checkout. The derived
-stream is lossy and cannot recreate a missing raw capture.
+digests. Calibration produces a reduced representation of the source captures.
 """
             if include_git_history
             else """# Data operations

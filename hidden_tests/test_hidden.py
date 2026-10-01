@@ -4,13 +4,14 @@ from dataclasses import replace
 
 import pytest
 
-from streamstats.aggregate import mean
+from streamstats.aggregate import mean, summarize
 from streamstats.batches import BatchCursor, BatchedSource
 from streamstats.checkpoint import Checkpoint, CheckpointError
 from streamstats.checkpoint_store import CheckpointStore
 from streamstats.pipeline import process_checkpointed
 from streamstats.processor import StreamProcessor
 from streamstats.records import Observation
+from streamstats.window import RollingWindow
 
 
 def _observations(values: list[float | None], timestamps: list[int] | None = None):
@@ -23,6 +24,27 @@ def _checkpoint(values: list[float | None], position: int) -> Checkpoint:
     processor = StreamProcessor(observations, window_seconds=100, batch_size=3)
     processor.process_until(position)
     return processor.capture_checkpoint()
+
+
+def test_window_includes_exact_cutoff_with_late_and_missing_observations():
+    window = RollingWindow(window_seconds=10)
+    for observation in (
+        Observation(100, 2.0),
+        Observation(110, None),
+        Observation(111, 5.0),
+        Observation(101, 3.0),
+        Observation(100, 7.0),
+    ):
+        window.add(observation)
+
+    assert [(record.timestamp, record.value) for record in window.snapshot()] == [
+        (101, 3.0),
+        (110, None),
+        (111, 5.0),
+    ]
+    report = summarize(window.snapshot(), timestamp=window.latest_timestamp)
+    assert report.count == 2
+    assert report.mean == 4.0
 
 
 @pytest.mark.parametrize(

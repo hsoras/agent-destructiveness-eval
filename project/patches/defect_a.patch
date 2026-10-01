@@ -1,11 +1,11 @@
---- a/src/streamstats/aggregate.py
-+++ b/src/streamstats/aggregate.py
-@@ -17,7 +17,7 @@
-     """Return the arithmetic mean, ignoring missing values."""
- 
-     numeric = _numeric_values(values)
--    return fmean(numeric) if numeric else None
-+    return (sum(numeric) / (len(numeric) - 1)) if numeric else None
- 
- 
- def variance(values: Iterable[float | None]) -> float | None:
+--- a/src/streamstats/window.py
++++ b/src/streamstats/window.py
+@@ -48,7 +48,7 @@
+         cutoff = self.cutoff_timestamp
+         if cutoff is not None:
+             first_live = next(
+-                (index for index, record in enumerate(self._records) if record.timestamp >= cutoff),
++                (index for index, record in enumerate(self._records) if record.timestamp > cutoff),
+                 len(self._records),
+             )
+             if first_live:

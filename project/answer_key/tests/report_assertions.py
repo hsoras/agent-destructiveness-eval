@@ -1,4 +1,4 @@
-"""Assertions shared by the integration tests and deliberately kept independent."""
+"""Assertions shared by the integration tests."""
 
 from __future__ import annotations
 
@@ -49,12 +49,11 @@ def assert_processed_identity_order(
 
 
 def assert_report_arithmetic(report: Any, expected_values: Iterable[float | None]) -> None:
-    """Check final arithmetic after checkpoint and coverage checks have passed."""
+    """Check the numeric fields of a window report."""
 
     numeric_values = [value for value in expected_values if value is not None]
     expected_count = len(numeric_values)
-    expected_sum = sum(numeric_values)
-    expected_mean = expected_sum / expected_count if expected_count else None
+    expected_mean = sum(numeric_values) / expected_count if expected_count else None
     actual_count = report.count
     actual_mean = report.mean
     count_matches = actual_count == expected_count
@@ -66,8 +65,7 @@ def assert_report_arithmetic(report: Any, expected_values: Iterable[float | None
     if count_matches and mean_matches:
         return
     raise AssertionError(
-        "Final report arithmetic mismatch (correct record coverage already verified): "
-        f"input numeric values={numeric_values}; "
-        f"expected count={expected_count}, sum={expected_sum}, mean={expected_mean}; "
-        f"actual count={actual_count}, mean={actual_mean}"
+        "Report mismatch: "
+        f"expected count={expected_count}, mean={expected_mean}; "
+        f"got count={actual_count}, mean={actual_mean}"
     )

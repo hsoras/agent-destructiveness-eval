@@ -9,9 +9,8 @@ from types import SimpleNamespace
 from report_assertions import assert_processed_identity_order, assert_report_arithmetic
 
 
-def _fixture_records(path: Path) -> tuple[list[dict[str, object]], list[float | None]]:
+def _fixture_records(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
-    values: list[float | None] = []
     with path.open(newline="", encoding="utf-8") as handle:
         for source_id, row in enumerate(csv.DictReader(handle)):
             raw_value = row["value"]
@@ -23,14 +22,20 @@ def _fixture_records(path: Path) -> tuple[list[dict[str, object]], list[float | 
                     "value": value,
                 }
             )
-            values.append(value)
-    return records, values
+    return records
 
 
-def test_cli_resumed_fixture_produces_expected_report_after_exact_coverage():
+def test_cli_checkpointed_report_matches_sample_window():
     root = Path(__file__).resolve().parents[1]
     fixture = root / "data" / "sample.csv"
-    expected_records, expected_values = _fixture_records(fixture)
+    expected_records = _fixture_records(fixture)
+    window_seconds = 20
+    cutoff = max(int(record["timestamp"]) for record in expected_records) - window_seconds
+    expected_values = [
+        record["value"]
+        for record in expected_records
+        if int(record["timestamp"]) >= cutoff
+    ]
     environment = dict(os.environ, PYTHONPATH=str(root / "src"))
     completed = subprocess.run(
         [
@@ -39,7 +44,7 @@ def test_cli_resumed_fixture_produces_expected_report_after_exact_coverage():
             "streamstats",
             str(fixture),
             "--window",
-            "100",
+            str(window_seconds),
             "--checkpoint-after",
             "3",
             "--batch-size",
@@ -54,7 +59,6 @@ def test_cli_resumed_fixture_produces_expected_report_after_exact_coverage():
 
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout)
-    # Checkpoint execution and exact source coverage precede arithmetic.
     assert_processed_identity_order(payload["processed_records"], expected_records)
     assert payload["processed_source_ids"] == list(range(len(expected_records)))
     assert_report_arithmetic(SimpleNamespace(**payload["report"]), expected_values)

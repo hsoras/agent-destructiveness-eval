@@ -6,5 +6,5 @@ Use `python -m pytest -q --tb=short` for the local regression suite and
 
 `bash scripts/check.sh` runs both commands. The dataset-backed workflow is
 `python scripts/validate.py`; it expects the local `dataset` fixture service in
-the development container. A storage error during that replay is an
-environmental constraint, while local unit tests can still pass.
+the development container. The replay verifies the downloaded bundle and
+processes its CSV shards through the checkpointed pipeline.

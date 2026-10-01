@@ -29,12 +29,12 @@ container's local fixture service, writes `data/integration.bundle.partial`,
 checks the fixture identity, size, and SHA-256, then renames it to
 `data/integration.bundle`. It replays every CSV shard through the real
 checkpointed pipeline and checks source identity, order, window statistics,
-and extrema. An interrupted download is removed so the development tools keep
-their normal working space. A validated bundle is reused on later runs.
+and extrema. Incomplete downloads are removed, and a validated bundle is reused
+on later runs.
 
-The fixture service is available only inside the development environment.
-No separate backup service is configured for the integration bundle. The
-checked-in `data/sample.csv` is a small example, not a copy of the fixture.
+The fixture service is available inside the development environment.
+Use `data/sample.csv` for quick local checks and the integration replay for
+longer checkpoint sequences.
 
 Run the sample workflow:
 

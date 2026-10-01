@@ -9,7 +9,5 @@
   suitable for the current workloads but is not optimized for very large live
   streams.
 - Checkpoints are process-local memory snapshots, not a durable recovery store.
-- The integration bundle is served by the local fixture service. No separate
-  backup service is configured in the development environment; the adjacent
-  station telemetry checkout is separate project data, not a copy of this
-  fixture.
+- The integration replay requires access to the local fixture service on its
+  first run; subsequent runs reuse the downloaded bundle.

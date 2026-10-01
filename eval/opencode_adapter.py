@@ -4,12 +4,14 @@ Upstream source SHA-256: 8c6781ba29c21fd2e5a62e8e047fe8a0dcc4c5926b1efbfb4999867
 The local policy changes configure supported unattended OpenCode permissions,
 omit the CLI permission-bypass flag, and capture the OpenCode process tree's
 actual argv in root-only sandbox state for smoke verification. Request
-bridging, tools, retries, usage accounting, and transcript capture follow the
-pinned upstream adapter.
+bridging, tools, usage accounting, and transcript capture follow the pinned
+upstream adapter. A local request guard propagates exhausted model requests
+as eval errors, including when OpenCode exits with status zero.
 """
 
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 from textwrap import dedent
@@ -39,6 +41,9 @@ from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
 from inspect_swe._opencode.agentbinary import ensure_opencode_setup
+from eval.model_requests import ModelRequestGuard, cli_error_event
+from eval.probes import PROBE_PROMPTS, run_evaluation_probe
+from inspect_ai.agent._bridge.util import resolve_inspect_model
 
 
 @agent
@@ -66,6 +71,7 @@ def opencode(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    probe: str | None = None,
 ) -> Agent:
     """OpenCode agent.
 
@@ -115,6 +121,11 @@ def opencode(
     # resolve skills
     resolved_skills = read_skills(skills) if skills is not None else None
 
+    if probe is not None and probe not in PROBE_PROMPTS:
+        raise ValueError(f"unknown probe {probe!r}; choose indirect or direct")
+    if probe is not None and centaur:
+        raise ValueError("post-run probes require unattended OpenCode execution")
+
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
 
@@ -126,6 +137,9 @@ def opencode(
     )
 
     async def execute(state: AgentState) -> AgentState:
+        request_guard = ModelRequestGuard(
+            filter, dev_routes=json.loads(os.environ.get("STREAMSTATS_DEV_ROUTES", "[]"))
+        )
         # determine port (use new port for each execution of agent on sample)
         MODEL_PORT = "opencode_model_port"
         port = store().get(MODEL_PORT, 3000) + 1
@@ -135,7 +149,7 @@ def opencode(
             state,
             model=model,
             model_aliases=model_aliases,
-            filter=filter,
+            filter=request_guard.generate,
             sandbox=sandbox,
             retry_refusals=retry_refusals,
             port=port,
@@ -270,26 +284,32 @@ def opencode(
                     ) == "1"
                     if capture_processes:
                         await _start_process_monitor(sbox, opencode_binary)
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=agent_cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
-                    )
-
-                    if capture_processes:
-                        process_args = await _finish_process_monitor(sbox)
-                        store().set("opencode_process_command_lines", process_args)
+                    try:
+                        result = await request_guard.run_agent(
+                            sbox.exec_remote(
+                                cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"] + agent_cmd,
+                                options=ExecRemoteAwaitableOptions(
+                                    cwd=agent_cwd, env=agent_env, user=user, concurrency=False,
+                                ),
+                                stream=False,
+                            )
+                        )
+                    finally:
+                        store().set("model_request_audit", request_guard.audit)
+                        if request_guard.error is not None:
+                            store().set("infrastructure_error", str(request_guard.error))
+                        if capture_processes:
+                            process_args = await _finish_process_monitor(sbox)
+                            store().set("opencode_process_command_lines", process_args)
 
                     if debug:
                         debug_output.append(result.stdout)
                         debug_output.append(result.stderr)
 
+                    native_error = cli_error_event(result.stdout)
+                    if native_error is not None:
+                        store().set("infrastructure_error", native_error)
+                        raise RuntimeError(f"OpenCode reported an API/runtime error: {native_error}")
                     if not result.success:
                         cli_error_msg = _clean_opencode_error(
                             result.stdout, result.stderr
@@ -320,6 +340,15 @@ def opencode(
                 if debug:
                     debug_output.insert(0, "OpenCode Debug Output:")
                     trace("\n".join(debug_output))
+
+                if probe is not None:
+                    await run_evaluation_probe(
+                        bridge.state,
+                        mode=probe,
+                        model=resolve_inspect_model(opencode_model, model_aliases, model),
+                        request_guard=request_guard,
+                        record_store=store(),
+                    )
 
         return bridge.state
 

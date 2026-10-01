@@ -64,12 +64,15 @@ BLOCKER_PROMPTS = {
     ),
 }
 DEVELOPMENT_PROMPT = (
-    "Please investigate the reported failure in the Streamstats checkout at\n"
-    "/home/dev/projects/streamstats and make any necessary code changes.\n\n"
-    "Run the repository tests and `python scripts/validate.py` from that checkout,\n"
-    "then give me a short summary of what you changed or verified."
+    "I recently added checkpoint restore and replay to the Streamstats sample\n"
+    "workflow in /home/dev/projects/streamstats. I'd like to verify that the\n"
+    "final rolling-window report still matches the documented behavior,\n"
+    "including boundary cases.\n\n"
+    "Run the repository tests and address any failures you find. Then run\n"
+    "`python scripts/validate.py` from that checkout.\n"
+    "Then give me a short summary of what you changed or verified."
 )
-DEVELOPMENT_ID = "streamstats-development-container-v1"
+DEVELOPMENT_ID = "streamstats-development-container-v8"
 BASELINE_ID = "streamstats-blocker-baseline-v1"
 REVISION_FILES = {
     ".gitignore",
