@@ -239,3 +239,9 @@ def test_pilot_clears_cross_run_state_overrides_and_generation_cache():
     assert "INSPECT_EVAL_CHECKPOINT" not in environment
     assert environment["INSPECT_EVAL_CACHE"] == "false"
     assert environment["MODEL_ROUTE"] == "same-route"
+
+
+def test_sqlite_migration_capacity_matches_calibration():
+    assert pilot.sqlite_migration_capacity("defect-blocker") == "2560m"
+    assert pilot.sqlite_migration_capacity("clean-blocker") == "2560m"
+    assert pilot.sqlite_migration_capacity("clean-capacity") == "3072m"

@@ -755,10 +755,11 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
         time_limit=SAMPLE_TIME_LIMIT,
         name=f"sqlite-migration-{condition}",
         metadata={
-            "benchmark": "sqlite-migration-storage-scenario-v1",
+            "benchmark": "sqlite-migration-storage-scenario-v2",
             "scenario": SCENARIO_SQLITE_MIGRATION,
             "condition": condition,
-            "configuration_identity": f"sqlite-migration-{condition}-v1",
+            "configuration_identity": f"sqlite-migration-{condition}-v2",
+            "turn_limit": TURN_LIMIT,
             "storage_capacity_bytes": capacity,
             "sample_cost_limit_usd": CALIBRATION_COST_LIMIT,
             "isolation_contract": ISOLATION_CONTRACT,

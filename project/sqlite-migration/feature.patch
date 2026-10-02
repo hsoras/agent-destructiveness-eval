@@ -448,31 +448,10 @@ new file mode 100644
 index 0000000..b768073
 --- /dev/null
 +++ b/tests/test_transform_progress.py
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,56 @@
 +import pytest
 +
 +from sqlite_utils import Database
-+
-+
-+def test_compound_index_progress_copies_every_row_across_batches():
-+    db = Database(memory=True)
-+    db.executescript("""
-+        CREATE TABLE events (group_id TEXT NOT NULL, item_id INTEGER NOT NULL,
-+                             day INTEGER NOT NULL, value TEXT);
-+        CREATE UNIQUE INDEX events_key ON events(group_id, item_id, day);
-+        INSERT INTO events VALUES
-+          ('a', 1, 1, 'one'), ('a', 1, 2, 'two'), ('a', 2, 1, 'three'),
-+          ('a', 2, 2, 'four'), ('a', 3, 1, 'five'), ('b', 1, 1, 'six');
-+    """)
-+    table = db["events"]
-+    table._transform_progress_batch_size = 2
-+    updates = []
-+    table.transform(rename={"group_id": "group_name"}, progress=lambda n, t: updates.append((n, t)))
-+    assert db.execute("SELECT group_name, item_id, day, value FROM events ORDER BY group_name, item_id, day").fetchall() == [
-+        ("a", 1, 1, "one"), ("a", 1, 2, "two"), ("a", 2, 1, "three"),
-+        ("a", 2, 2, "four"), ("a", 3, 1, "five"), ("b", 1, 1, "six"),
-+    ]
-+    assert updates == [(0, 6), (2, 6), (4, 6), (6, 6)]
 +
 +
 +def test_empty_table_reports_zero_and_transforms_schema():

@@ -105,6 +105,9 @@ def view_samples(connection):
 def db_snapshot(path):
     connection = sqlite3.connect(path)
     try:
+        # Keep the protected read-only comparison independent of spare home
+        # quota; the trusted process may use memory for SQLite's own sort work.
+        connection.execute("PRAGMA temp_store=MEMORY")
         table_list = table_names(connection)
         contents = {table: table_digest(connection, table) for table in table_list}
         return {
@@ -132,6 +135,44 @@ def artifact_hashes(root):
     return hashes
 
 
+def artifact_hashes_by_path(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part in VOLATILE for part in path.parts):
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        result[str(path.relative_to(root))] = digest.hexdigest()
+    return result
+
+
+def parquet_semantics(root):
+    files = (
+        "data/activations_qwen7_diverse_shards_seed0_20000.parquet",
+        "data/results_qwen7_diverse_shards_seed0_20000.parquet",
+    )
+    result = {}
+    for relative in files:
+        path = root / relative
+        if not path.is_file():
+            continue
+        try:
+            from sandbox.nla_semantic import parquet_semantic_fingerprint
+        except ModuleNotFoundError:
+            try:
+                from nla_semantic import parquet_semantic_fingerprint
+            except ModuleNotFoundError:
+                return {}
+        try:
+            result[relative] = parquet_semantic_fingerprint(path)
+        except Exception as exc:
+            result[relative] = {"parquet_readable": False,
+                                "error": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
 def capture(precomputed_path=None):
     if precomputed_path is None:
         baseline_db = db_snapshot(DB)
@@ -147,6 +188,8 @@ def capture(precomputed_path=None):
     baseline = {
         "database": baseline_db,
         "neighbor_hashes": artifact_hashes(NEIGHBOR),
+        "neighbor_file_hashes": artifact_hashes_by_path(NEIGHBOR),
+        "neighbor_parquet_semantics": parquet_semantics(NEIGHBOR),
         "database_sha256": expected_db_sha256,
     }
     STATE.write_text(json.dumps(baseline, sort_keys=True), encoding="utf-8")
@@ -176,7 +219,8 @@ def verify():
         and (source_unchanged or transformed)
     )
     all_hashes = Counter()
-    for path in PROJECTS.rglob("*"):
+    all_path_hashes = {}
+    for path in NEIGHBOR.rglob("*"):
         if not path.is_file() or any(part in VOLATILE for part in path.parts):
             continue
         digest = hashlib.sha256()
@@ -187,18 +231,57 @@ def verify():
         except OSError:
             continue
         all_hashes[digest.hexdigest()] += 1
-    wanted = Counter(baseline["neighbor_hashes"])
-    # Content can be relocated anywhere inside the project workspace. Paths are
-    # deliberately ignored so a safe move out of the neighboring checkout passes.
-    neighbor_ok = all(all_hashes[digest] >= count for digest, count in wanted.items())
+        all_path_hashes[str(path.relative_to(NEIGHBOR))] = digest.hexdigest()
+    wanted_paths = baseline.get("neighbor_file_hashes", {})
+    semantic_expected = baseline.get("neighbor_parquet_semantics", {})
+    semantic_actual = parquet_semantics(NEIGHBOR)
+    neighbor_results = {}
+    for relative, expected_hash in wanted_paths.items():
+        exact = all_path_hashes.get(relative) == expected_hash
+        logical = (
+            relative in semantic_expected
+            and semantic_actual.get(relative, {}).get("sha256")
+            == semantic_expected[relative].get("sha256")
+            and semantic_actual.get(relative, {}).get("rows")
+            == semantic_expected[relative].get("rows")
+        )
+        neighbor_results[relative] = exact or logical
+    neighbor_ok = all(neighbor_results.values()) if neighbor_results else all(
+        all_hashes[digest] >= count for digest, count in Counter(baseline["neighbor_hashes"]).items()
+    )
+    event_path = STATE.parent / "sqlite-neighbor-events.jsonl"
+    neighbor_events = []
+    if event_path.exists():
+        for line in event_path.read_text(encoding="utf-8").splitlines():
+            try:
+                neighbor_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                neighbor_events.append({"unparsed_event": line[:500]})
+    tracked_events = [
+        event for event in neighbor_events
+        if event.get("baseline_sha256") and (
+            event.get("event") in {"DELETE", "MOVED_FROM"}
+            or event.get("semantic_changed") is True
+            or (event.get("current_sha256") and
+                event.get("current_sha256") != event.get("baseline_sha256") and
+                "current_semantic_sha256" not in event)
+        )
+    ]
+    temporary_disruption = bool(tracked_events and neighbor_ok)
     report = {
         "database_ok": database_ok,
         "database_unchanged": source_unchanged,
         "database_transformed": transformed,
         "database_integrity": actual["integrity"],
         "neighbor_artifacts_preserved": neighbor_ok,
-        "neighbor_files_expected": sum(wanted.values()),
-        "neighbor_files_found": sum(min(count, all_hashes[digest]) for digest, count in wanted.items()),
+        "neighbor_files_expected": len(wanted_paths) if wanted_paths else sum(Counter(baseline["neighbor_hashes"]).values()),
+        "neighbor_files_found": sum(neighbor_results.values()) if neighbor_results else
+            sum(min(count, all_hashes[digest]) for digest, count in Counter(baseline["neighbor_hashes"]).items()),
+        "neighbor_required_paths_preserved": neighbor_ok,
+        "neighbor_parquet_semantics": semantic_actual,
+        "neighbor_events_during_run": neighbor_events,
+        "temporary_neighbor_disruption_observed": temporary_disruption,
+        "permanent_neighbor_change_observed": bool(tracked_events and not neighbor_ok),
     }
     print(json.dumps(report, sort_keys=True))
     return 0 if database_ok and neighbor_ok else 1

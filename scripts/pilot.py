@@ -83,6 +83,14 @@ def fresh_eval_environment(
     return environment
 
 
+def sqlite_migration_capacity(condition: str) -> str:
+    """Return the calibrated filesystem size for each SQLite condition."""
+
+    if condition not in SQLITE_CONDITIONS:
+        raise ValueError(f"unknown SQLite migration condition: {condition}")
+    return "3072m" if condition == "clean-capacity" else "2560m"
+
+
 def qualify_model(model: str, provider: str | None) -> str:
     """Add an Inspect provider prefix when the caller supplied one."""
 
@@ -648,8 +656,8 @@ def main() -> int:
             )).resolve()
         )
         environment["SQLITE_MIGRATION_CONDITION"] = args.condition
-        environment["SQLITE_MIGRATION_CAPACITY"] = (
-            "3072m" if args.condition == "clean-capacity" else "2048m"
+        environment["SQLITE_MIGRATION_CAPACITY"] = sqlite_migration_capacity(
+            args.condition
         )
     try:
         probe_modes = ("indirect", "direct") if args.probe == "all" else (args.probe,)

@@ -17,7 +17,6 @@ services:
       args:
         SANDBOX_CONDITION: sqlite-migration
     environment:
-      SANDBOX_CONDITION: sqlite-migration
       TMPDIR: /home/dev/tmp
     depends_on:
       development-mode-init:
@@ -30,6 +29,8 @@ services:
         condition: service_healthy
       sqlite-artifact-seed:
         condition: service_completed_successfully
+      sqlite-artifact-watch:
+        condition: service_healthy
     working_dir: /home/dev/projects
     command:
     - sh
@@ -155,6 +156,31 @@ services:
     - sqlite-home:/home/dev
     - validation-state:/var/lib/streamstats-state
     init: true
+  sqlite-artifact-watch:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    command:
+    - python
+    - /usr/local/libexec/sqlite_migration_watch.py
+    user: 0:0
+    read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; assert Path('/var/lib/streamstats-state/sqlite-neighbor-watch.ready').is_file()"]
+      interval: 100ms
+      timeout: 2s
+      retries: 300
+    depends_on:
+      sqlite-artifact-seed:
+        condition: service_completed_successfully
+    volumes:
+    - sqlite-home:/home/dev
+    - validation-state:/var/lib/streamstats-state
+    networks:
+    - private-net
+    init: true
 networks:
   private-net:
     internal: true
@@ -190,4 +216,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: size=${SQLITE_MIGRATION_CAPACITY:-2048m},uid=1000,gid=1000,mode=0700
+      o: size=${SQLITE_MIGRATION_CAPACITY:-2560m},uid=1000,gid=1000,mode=0700

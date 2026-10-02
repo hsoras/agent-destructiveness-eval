@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ARG SANDBOX_CONDITION=baseline
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates file git gzip nodejs npm procps ripgrep \
+    && apt-get install --no-install-recommends -y ca-certificates file git gzip inotify-tools nodejs npm procps ripgrep \
     && python -m pip install --no-cache-dir "pytest>=8,<9" "setuptools>=68" \
     && rm -rf /var/lib/apt/lists/*
 
@@ -42,12 +42,18 @@ COPY sandbox/project_history.py /usr/local/sbin/project_history.py
 COPY sandbox/runtime_guard.py /usr/local/libexec/runtime-guard.py
 COPY sandbox/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_seed.py
 COPY sandbox/sqlite_migration_audit.py /usr/local/libexec/sqlite_migration_audit.py
+COPY sandbox/sqlite_migration_watch.py /usr/local/libexec/sqlite_migration_watch.py
+COPY sandbox/nla_semantic.py /usr/local/libexec/nla_semantic.py
 COPY project/sqlite-migration/defect.patch /usr/local/libexec/sqlite-migration-defect.patch
+COPY project/sqlite-migration/progress-contract.md /usr/local/libexec/sqlite-migration-progress-contract.md
+COPY project/sqlite-migration/reproduce_progress.py /usr/local/libexec/sqlite-migration-reproduce-progress.py
 COPY sandbox/sqlite_migration_hidden_test.py /usr/local/libexec/sqlite-migration-tests/test_transform_progress.py
 RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
         /usr/local/libexec/runtime-guard.py /usr/local/sbin/streamstats-init \
         /usr/local/libexec/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_audit.py \
+        /usr/local/libexec/sqlite_migration_watch.py \
+        /usr/local/libexec/nla_semantic.py \
         /usr/local/libexec/project_history.py /usr/local/sbin/project_history.py \
     && chmod 0400 /usr/local/libexec/sqlite-migration-defect.patch \
         /usr/local/libexec/sqlite-migration-tests/test_transform_progress.py \
@@ -65,9 +71,15 @@ RUN if [ "$SANDBOX_CONDITION" = "baseline" ]; then \
     fi \
     && if [ "$SANDBOX_CONDITION" = "sqlite-migration" ]; then \
       python -m pip install --no-cache-dir \
-        'click>=8.3.1' 'click-default-group>=1.2.3' pluggy python-dateutil sqlite-fts4 tabulate; \
+        'click>=8.3.1' 'click-default-group>=1.2.3' pluggy python-dateutil sqlite-fts4 tabulate 'numpy==2.2.6' 'pyarrow==25.0.1'; \
     fi \
     && rm -f /tmp/validate-client.py
+
+# Keep evaluator-side programs and their revealing filenames out of the
+# unprivileged task user's directory listings in the SQLite sandbox.
+RUN if [ "$SANDBOX_CONDITION" = "sqlite-migration" ]; then \
+      chown root:root /usr/local/libexec && chmod 0500 /usr/local/libexec; \
+    fi
 
 WORKDIR /home/dev/projects
 USER dev
