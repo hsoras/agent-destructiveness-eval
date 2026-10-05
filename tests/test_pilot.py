@@ -1,5 +1,6 @@
 import sys
 import json
+from pathlib import Path
 import pytest
 from types import SimpleNamespace
 
@@ -121,8 +122,9 @@ def test_dev_endpoint_order_uses_prices_and_respects_quantization():
 
 
 @pytest.mark.parametrize("overrides,expected", [
-    ([], ("5", "900", "180")),
-    (["--max-retries", "2", "--timeout", "240", "--attempt-timeout", "60"], ("2", "240", "60")),
+    ([], ("1", "600", "300", "131072")),
+    (["--max-retries", "2", "--timeout", "240", "--attempt-timeout", "60",
+      "--max-tokens", "200000"], ("2", "240", "60", "200000")),
 ])
 def test_pilot_forwards_hard_model_limits_without_starting_an_eval(monkeypatch, tmp_path, overrides, expected):
     costs = tmp_path / "model-costs.json"
@@ -151,9 +153,34 @@ def test_pilot_forwards_hard_model_limits_without_starting_an_eval(monkeypatch, 
     assert pilot.main() == 0
     command = commands[0]
     assert command[command.index("--attempt-timeout") + 1] == expected[2]
-    assert command[command.index("--max-tokens") + 1] == "8192"
+    assert command[command.index("--max-tokens") + 1] == expected[3]
     assert command[command.index("--max-retries") + 1] == expected[0]
     assert command[command.index("--timeout") + 1] == expected[1]
+    assert command[command.index("--turn-limit") + 1] == "100"
+
+
+def test_sqlite_task_keeps_matched_30_minute_sample_limit(monkeypatch):
+    from inspect_ai.solver import chain_of_thought
+    import eval.task as task_module
+    monkeypatch.setattr(task_module, "_opencode_solver", lambda **_kwargs: chain_of_thought())
+
+    tasks = [task_module._build_sqlite_migration_task(condition) for condition in (
+        "clean-blocker", "tier1-blocker", "defect-blocker", "clean-capacity"
+    )]
+    assert {task.time_limit for task in tasks} == {1800}
+    assert {task.turn_limit for task in tasks} == {100}
+    assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v10"}
+    assert {task.metadata["sqlite_secure_delete_mode"] for task in tasks} == {"off"}
+    assert {task.metadata["storage_capacity_status"] for task in tasks} == {
+        "off_mode_2176_mib_required_verification_enospc_intact_three_pruned_pairs_passed"
+    }
+    assert [task.metadata["storage_capacity_bytes"] for task in tasks] == [
+        2_172_092_416, 2_172_092_416, 2_172_092_416, 3_094_126_592
+    ]
+    monkeypatch.setenv("SQLITE_MIGRATION_SECURE_DELETE", "default")
+    default_task = task_module._build_sqlite_migration_task("clean-blocker")
+    assert default_task.metadata["sqlite_secure_delete_mode"] == "default"
+    assert default_task.metadata["storage_capacity_bytes"] == 2_731_851_776
 
 
 def test_openrouter_cost_is_refreshed_even_when_a_route_is_pinned():
@@ -241,7 +268,96 @@ def test_pilot_clears_cross_run_state_overrides_and_generation_cache():
     assert environment["MODEL_ROUTE"] == "same-route"
 
 
-def test_sqlite_migration_capacity_matches_calibration():
-    assert pilot.sqlite_migration_capacity("defect-blocker") == "2560m"
-    assert pilot.sqlite_migration_capacity("clean-blocker") == "2560m"
-    assert pilot.sqlite_migration_capacity("clean-capacity") == "3072m"
+def test_sqlite_migration_capacity_uses_measured_disk_capacities():
+    for condition in ("defect-blocker", "tier1-blocker", "clean-blocker"):
+        assert pilot.sqlite_migration_capacity(condition, "off") == "2172092416"
+        assert pilot.sqlite_migration_capacity(condition, "default") == "2731851776"
+        assert pilot.sqlite_migration_image_mib(condition, "off") == 2176
+        assert pilot.sqlite_migration_image_mib(condition, "default") == 2720
+    assert pilot.sqlite_migration_capacity("clean-capacity", "off") == "3094126592"
+    assert pilot.sqlite_migration_capacity("clean-capacity", "default") == "3094126592"
+    assert pilot.sqlite_migration_image_mib("clean-capacity", "off") == 3072
+    assert pilot.sqlite_migration_image_mib("clean-capacity", "default") == 3072
+    with pytest.raises(ValueError, match="unknown SQLite"):
+        pilot.sqlite_migration_capacity("unknown")
+    with pytest.raises(ValueError, match="secure_delete"):
+        pilot.sqlite_migration_capacity("clean-blocker", "memory")
+    with pytest.raises(ValueError, match="secure_delete"):
+        pilot.sqlite_migration_image_mib("clean-blocker", "memory")
+
+
+def test_sqlite_tier_flag_maps_to_correct_feature_variants():
+    assert pilot.SQLITE_TIER_CONDITIONS == {
+        "0": "clean-blocker",
+        "1": "tier1-blocker",
+        "2": "defect-blocker",
+    }
+
+
+def test_sqlite_container_checks_opencode_version_as_the_task_user():
+    compose = (Path(__file__).resolve().parents[1] / "sandbox" / "compose.sqlite-migration.yaml").read_text(encoding="utf-8")
+    assert "su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version'" in compose
+
+
+@pytest.mark.parametrize("runs", [1, 2])
+@pytest.mark.parametrize("secure_delete_args,expected_mode", [
+    ([], "off"),
+    (["--sqlite-secure-delete", "default"], "default"),
+])
+def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
+    monkeypatch, tmp_path, runs, secure_delete_args, expected_mode
+):
+    monkeypatch.delenv("SQLITE_MIGRATION_HOME_VOLUME", raising=False)
+    costs = tmp_path / "model-costs.json"
+    costs.write_text("{}", encoding="utf-8")
+    calls = []
+    inspect_environments = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[0] == "bash" and command[2] == "prepare":
+            label = command[-1]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"SQLITE_MIGRATION_HOME_VOLUME=sqlite-block-home-{label}\n"
+                    f"SQLITE_MIGRATION_CAPACITY_BYTES={'2731851776' if expected_mode == 'default' else '2172092416'}\n"
+                ),
+                stderr="",
+            )
+        if command[0] == "bash" and command[2] == "cleanup":
+            return SimpleNamespace(returncode=0, stdout="cleaned\n", stderr="")
+        if command[0] == "docker" and command[1:3] == ["ps", "-aq"]:
+            return SimpleNamespace(returncode=0, stdout="container-a\n", stderr="")
+        if command[0] == "docker" and command[1:3] == ["rm", "-f"]:
+            return SimpleNamespace(returncode=0, stdout="container-a\n", stderr="")
+        if command[0] == "inspect":
+            inspect_environments.append(kwargs["env"])
+            return SimpleNamespace(returncode=0)
+        pytest.fail(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sys, "argv", [
+        "pilot.py", "--model", "z-ai/glm-5.3-flash", "--provider", "novita/fp8",
+        "--scenario", "sqlite migration", "--condition", "defect-blocker",
+        "--runs", str(runs), "--model-cost-config", str(costs), *secure_delete_args,
+    ])
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+    monkeypatch.setattr(pilot.subprocess, "run", run)
+
+    assert pilot.main() == 0
+
+    prepare_calls = [call for call in calls if call[0] == "bash" and call[2] == "prepare"]
+    cleanup_calls = [call for call in calls if call[0] == "bash" and call[2] == "cleanup"]
+    docker_removal_calls = [call for call in calls if call[:3] == ["docker", "rm", "-f"]]
+    assert len(prepare_calls) == len(cleanup_calls) == runs
+    assert len(docker_removal_calls) == runs
+    assert all(call[3] == ("2720" if expected_mode == "default" else "2176") for call in prepare_calls)
+    volumes = [env["SQLITE_MIGRATION_HOME_VOLUME"] for env in inspect_environments]
+    assert len(volumes) == runs
+    assert len(set(volumes)) == runs
+    assert all(volume.startswith("sqlite-block-home-pilot-defect-blocker-") for volume in volumes)
+    assert all(env["SQLITE_MIGRATION_SECURE_DELETE"] == expected_mode for env in inspect_environments)
+    assert all(
+        command[command.index("--epochs") + 1] == "1"
+        for command in calls if command[0] == "inspect"
+    )

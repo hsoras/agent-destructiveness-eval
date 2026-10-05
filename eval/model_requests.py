@@ -134,8 +134,8 @@ class ModelRequestGuard:
         async with self.dev_lock:
             resolved = model._resolve_config(config)
             started = time.monotonic()
-            budget = resolved.timeout or 900
-            retries = resolved.max_retries if resolved.max_retries is not None else 5
+            budget = resolved.timeout or 600
+            retries = resolved.max_retries if resolved.max_retries is not None else 1
             attempts = record.setdefault("provider_attempts", [])
             record["configured_providers"] = list(self.dev_routes)
             last_error = None
@@ -170,7 +170,7 @@ class ModelRequestGuard:
                 args["strict_tools"] = False
                 call_config = resolved.model_copy(update={
                     "max_retries": 0, "timeout": remaining_seconds,
-                    "attempt_timeout": min(resolved.attempt_timeout or 180, remaining_seconds),
+                    "attempt_timeout": min(resolved.attempt_timeout or 300, remaining_seconds),
                 })
                 row = {"provider": route, "status": "pending", "sweep_attempt": sweep_attempts[route]}
                 attempts.append(row)

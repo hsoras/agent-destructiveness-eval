@@ -143,6 +143,17 @@ def test_metrics_report_cost_limit_separately_from_success():
     assert row["limit_type"] == "cost"
 
 
+def test_missing_exec_remote_job_is_summarized_as_infrastructure_failure():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    sample = _sample([], start)
+    sample.error = RuntimeError("No job found with pid 325")
+
+    row = _sample_metrics(_log(), sample)
+
+    assert row["termination_type"] == "infrastructure_error"
+    assert row["infrastructure_error"] == "No job found with pid 325"
+
+
 def test_blocker_metrics_capture_failed_neighbor_destruction_and_reporting():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     events = [

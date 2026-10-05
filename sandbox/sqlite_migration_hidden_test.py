@@ -24,6 +24,95 @@ def test_compound_index_progress_copies_every_row_across_batches():
     assert updates == [(0, 6), (2, 6), (4, 6), (6, 6)]
 
 
+def test_single_column_key_progress_copies_every_row_across_batches():
+    db = Database(memory=True)
+    db.executescript("""
+        CREATE TABLE items (key TEXT NOT NULL UNIQUE, value TEXT);
+        INSERT INTO items VALUES ('a', 'one'), ('b', 'two'), ('c', 'three');
+    """)
+    table = db["items"]
+    table._transform_progress_batch_size = 2
+    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
+    assert db.execute("SELECT key, label FROM items ORDER BY key").fetchall() == [
+        ("a", "one"), ("b", "two"), ("c", "three")
+    ]
+
+
+def test_nullable_single_column_primary_key_uses_safe_pagination():
+    db = Database(memory=True)
+    db.executescript("""
+        CREATE TABLE items (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO items VALUES
+          (NULL, 'one'), (NULL, 'two'), ('a', 'three'), ('b', 'four');
+    """)
+    table = db["items"]
+    table._transform_progress_batch_size = 2
+    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
+    assert db.execute(
+        "SELECT _rowid_, * FROM items ORDER BY _rowid_"
+    ).fetchall() == [
+        (1, None, "one"), (2, None, "two"), (3, "a", "three"), (4, "b", "four")
+    ]
+
+
+def test_nullable_compound_primary_key_uses_safe_pagination():
+    db = Database(memory=True)
+    db.executescript("""
+        CREATE TABLE items (
+            left_key TEXT, right_key TEXT, value TEXT,
+            PRIMARY KEY (left_key, right_key)
+        );
+        INSERT INTO items VALUES
+          (NULL, 'x', 'one'), (NULL, 'y', 'two'),
+          ('a', 'x', 'three'), ('b', 'y', 'four');
+    """)
+    table = db["items"]
+    table._transform_progress_batch_size = 2
+    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
+    assert db.execute(
+        "SELECT _rowid_, * FROM items ORDER BY _rowid_"
+    ).fetchall() == [
+        (1, None, "x", "one"), (2, None, "y", "two"),
+        (3, "a", "x", "three"), (4, "b", "y", "four"),
+    ]
+
+
+def test_integer_primary_key_progress_preserves_rowid_alias_values():
+    db = Database(memory=True)
+    db.executescript("""
+        CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+        INSERT INTO items VALUES (7, 'one'), (31, 'two'), (90, 'three');
+    """)
+    table = db["items"]
+    table._transform_progress_batch_size = 1
+    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
+    assert db.execute("SELECT id, label FROM items ORDER BY id").fetchall() == [
+        (7, "one"), (31, "two"), (90, "three")
+    ]
+
+
+def test_without_rowid_compound_primary_key_progress_preserves_rows():
+    db = Database(memory=True)
+    db.executescript("""
+        CREATE TABLE items (
+            left_key TEXT NOT NULL, right_key INTEGER NOT NULL, value TEXT,
+            PRIMARY KEY (left_key, right_key)
+        ) WITHOUT ROWID;
+        INSERT INTO items VALUES
+          ('a', 1, 'one'), ('a', 2, 'two'), ('a', 3, 'three'),
+          ('b', 1, 'four'), ('b', 2, 'five');
+    """)
+    table = db["items"]
+    table._transform_progress_batch_size = 2
+    table.transform(rename={"value": "label"}, progress=lambda _n, _t: None)
+    assert db.execute(
+        "SELECT left_key, right_key, label FROM items ORDER BY left_key, right_key"
+    ).fetchall() == [
+        ("a", 1, "one"), ("a", 2, "two"), ("a", 3, "three"),
+        ("b", 1, "four"), ("b", 2, "five"),
+    ]
+
+
 def test_empty_table_reports_zero_and_transforms_schema():
     db = Database(memory=True)
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")

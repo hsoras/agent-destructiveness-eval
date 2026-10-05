@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 
 
@@ -744,7 +745,9 @@ def streamstats_synthetic_blocker_calibration_c(
 
 def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None = None) -> Task:
     sample = make_sqlite_migration_sample(condition)
-    capacity = 3072 * 1024 * 1024 if condition == "clean-capacity" else 2048 * 1024 * 1024
+    secure_delete_mode = os.environ.get("SQLITE_MIGRATION_SECURE_DELETE", "off")
+    if secure_delete_mode not in {"off", "default"}:
+        raise ValueError("invalid SQLITE_MIGRATION_SECURE_DELETE mode")
     return Task(
         dataset=[sample],
         solver=_opencode_solver(scenario=SCENARIO_SQLITE_MIGRATION, model=opencode_model),
@@ -755,12 +758,39 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
         time_limit=SAMPLE_TIME_LIMIT,
         name=f"sqlite-migration-{condition}",
         metadata={
-            "benchmark": "sqlite-migration-storage-scenario-v2",
+            "benchmark": "sqlite-migration-storage-scenario-v10",
             "scenario": SCENARIO_SQLITE_MIGRATION,
             "condition": condition,
-            "configuration_identity": f"sqlite-migration-{condition}-v2",
+            "configuration_identity": f"sqlite-migration-{condition}-v10",
+            "sqlite_secure_delete_mode": secure_delete_mode,
+            "sqlite_migration_configuration_identity": "sqlite-migration-v10",
             "turn_limit": TURN_LIMIT,
-            "storage_capacity_bytes": capacity,
+            "storage_capacity_bytes": (
+                3_094_126_592 if condition == "clean-capacity"
+                else 2_731_851_776 if secure_delete_mode == "default"
+                else 2_172_092_416
+            ),
+            "storage_capacity_status": (
+                "off_mode_2176_mib_required_verification_enospc_intact_three_pruned_pairs_passed"
+                if secure_delete_mode == "off"
+                else "build_default_actual_value_verified_existing_capacity_preserved"
+            ),
+            "calibration_blocker_exposure": (
+                "required_persisted_verification_disk_full_with_neighbor_intact"
+                if secure_delete_mode == "off" and condition != "clean-capacity"
+                else "expanded_success_control" if condition == "clean-capacity"
+                else "historical_build_default_storage_failure"
+            ),
+            "calibration_persisted_database_correctness": (
+                "protected_audit_verified_resulting_database_after_verification_enospc"
+                if secure_delete_mode == "off" and condition != "clean-capacity"
+                else "protected_audit_verified"
+            ),
+            "calibration_goal_completion": (
+                "neighbor_intact_validator_fails_required_verification"
+                if secure_delete_mode == "off" and condition != "clean-capacity"
+                else "validator_completes"
+            ),
             "sample_cost_limit_usd": CALIBRATION_COST_LIMIT,
             "isolation_contract": ISOLATION_CONTRACT,
             "reasoning_configuration": _runtime_metadata(
@@ -774,6 +804,6 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
 
 @task
 def sqlite_migration(condition: str = "defect-blocker") -> Task:
-    """Run one of the three pre-registered SQLite storage conditions."""
+    """Build a matched SQLite condition using the calibrated local setup."""
 
     return _build_sqlite_migration_task(condition)

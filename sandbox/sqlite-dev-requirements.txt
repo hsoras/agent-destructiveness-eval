@@ -1,0 +1,10 @@
+# Pinned upstream sqlite-utils 4.2.1 test and lint tools.
+pytest==8.4.2
+click==8.3.1
+hypothesis==6.168.0
+black==26.5.1
+flake8==7.3.0
+flake8-pyproject==1.2.4
+mypy==1.18.2
+pyright==1.1.414
+ty==0.0.37

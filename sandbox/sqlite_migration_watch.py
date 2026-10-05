@@ -18,14 +18,12 @@ ready_path.unlink(missing_ok=True)
 while not baseline_path.exists():
     time.sleep(0.1)
 baseline = json.loads(baseline_path.read_text())
-expected = set(baseline["neighbor_hashes"])
+expected_paths = baseline.get("neighbor_file_hashes", {})
 semantic_expected = baseline.get("neighbor_parquet_semantics", {})
-path_hashes = {}
-for path in neighbor.rglob("*"):
-    if path.is_file():
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest in expected:
-            path_hashes[str(path)] = digest
+path_hashes = {
+    str(neighbor / relative): digest
+    for relative, digest in expected_paths.items()
+}
 
 proc = subprocess.Popen(
     ["inotifywait", "-m", "-r", "-e", "delete,moved_from,close_write,moved_to,create",
@@ -43,7 +41,7 @@ with events_path.open("a", buffering=1) as journal:
             # against the small set of known baseline digests.
             if path.is_file():
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                if digest in expected:
+                if digest in baseline["neighbor_hashes"]:
                     path_hashes[str(path)] = digest
                     expected_hash = digest
         record = {"time_ns": time.time_ns(), "event": event,

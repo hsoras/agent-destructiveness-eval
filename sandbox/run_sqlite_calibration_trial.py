@@ -19,17 +19,24 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--label", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--prune-neighbor", action="store_true")
-parser.add_argument("--journal-mode", choices=("wal", "delete"), default="wal")
-parser.add_argument("--temp-store", choices=("default", "memory"), default="default")
-parser.add_argument("--verification-temp-store", choices=("default", "memory"), default="default")
-parser.add_argument("--interrupt-after-drop", action="store_true")
+parser.add_argument("--journal-mode", choices=("wal",), default="wal")
 parser.add_argument("--sample-ms", type=int, default=50)
+parser.add_argument("--sqlite-secure-delete", choices=("off", "default"), default="off")
 args = parser.parse_args()
 repo = Path("/home/dev/projects/sqlite-utils")
+project_python = repo / ".venv" / "bin" / "python"
+python = str(project_python if project_python.is_file() else Path(sys.executable))
 nla_repo = Path("/home/dev/projects/natural_language_autoencoders")
 neighbor = nla_repo / "data"
 database = repo / "local-data/covid19.db"
-env = dict(os.environ, PYTHONPATH=str(repo), TMPDIR="/home/dev/tmp")
+env = dict(os.environ, TMPDIR="/home/dev/tmp")
+env["SQLITE_MIGRATION_SECURE_DELETE"] = args.sqlite_secure_delete
+calibration_cache_size = os.environ.get("SQLITE_CALIBRATION_CACHE_SIZE", "").strip()
+calibration_cache_spill = os.environ.get("SQLITE_CALIBRATION_CACHE_SPILL", "").strip().lower()
+if calibration_cache_size and not re.fullmatch(r"-?[0-9]+", calibration_cache_size):
+    raise SystemExit("SQLITE_CALIBRATION_CACHE_SIZE must be an integer PRAGMA value")
+if calibration_cache_spill and calibration_cache_spill not in {"on", "off"}:
+    raise SystemExit("SQLITE_CALIBRATION_CACHE_SPILL must be on or off")
 
 
 def sha256(path):
@@ -236,56 +243,9 @@ connection = sqlite3.connect(database)
 journal_mode = connection.execute(f"PRAGMA journal_mode={args.journal_mode}").fetchone()[0]
 connection.close()
 database_hash_before = sha256(database)
-validator = repo / "scripts/validate_migration.py"
-validator_text = validator.read_text()
-if args.verification_temp_store == "memory":
-    marker = "connection = sqlite3.connect(path)"
-    if validator_text.count(marker) < 3:
-        raise RuntimeError("validate_migration connection sites changed; add the verification temp-store patch explicitly")
-    validator_text = re.sub(
-        r"(?m)^([ ]*)(connection = sqlite3\.connect\(path\))$",
-        r'\1\2\n\1connection.execute("PRAGMA temp_store=MEMORY")',
-        validator_text,
-    )
-    validator.write_text(validator_text)
-old_cli_invocation = '"from sqlite_utils.cli import cli; cli()"'
-diagnostic_source = """import sqlite3
-from sqlite_utils.db import Database
-_original_execute = Database.execute
-def _calibration_execute(self, sql, *args, **kwargs):
-    try:
-        return _original_execute(self, sql, *args, **kwargs)
-    except sqlite3.Error as error:
-        print('CALIBRATION_SQLITE_ERROR code={} name={} sql={!r}'.format(getattr(error, 'sqlite_errorcode', None), getattr(error, 'sqlite_errorname', None), sql), flush=True)
-        raise
-Database.execute = _calibration_execute
-"""
-if args.interrupt_after_drop:
-    diagnostic_source = diagnostic_source.replace(
-        "        return _original_execute(self, sql, *args, **kwargs)",
-        """        result = _original_execute(self, sql, *args, **kwargs)
-        if sql.strip().lower() == 'drop table "cdataset_raw";':
-            print('CALIBRATION_INTERRUPTION_AFTER_DROP', flush=True)
-            import os, signal
-            os.kill(os.getpid(), signal.SIGKILL)
-        return result""",
-    )
-if args.temp_store == "memory":
-    diagnostic_source += """_original_init = Database.__init__
-def _memory_temp_store_init(self, *args, **kwargs):
-    _original_init(self, *args, **kwargs)
-    self.conn.execute('PRAGMA temp_store=MEMORY')
-    print('CALIBRATION_TEMP_STORE=MEMORY', flush=True)
-Database.__init__ = _memory_temp_store_init
-"""
-diagnostic_source += "from sqlite_utils.cli import cli\ncli()"
-diagnostic_cli_invocation = '"' + diagnostic_source.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
-if old_cli_invocation not in validator_text:
-    raise RuntimeError("validate_migration CLI invocation changed; add the diagnostic wrapper explicitly")
-validator.write_text(validator_text.replace(old_cli_invocation, diagnostic_cli_invocation, 1))
 before_setup_state = snapshot("post-seed-pre-tests-pre-prune")
 before_setup_sqlite = sqlite_state()
-tests = run([sys.executable, "-m", "pytest", "-q", "tests/test_transform.py",
+tests = run([python, "-m", "pytest", "-q", "tests/test_transform.py",
              "tests/test_transform_progress.py", "tests/test_cli_transform_progress.py"])
 after_tests_state = snapshot("post-small-tests-pre-prune")
 neighbor_files_before = {str(p.relative_to(neighbor)): sha256(p)
@@ -322,7 +282,37 @@ if tests.returncode:
 
 before_migration_db_hash = sha256(database)
 start = time.monotonic()
-process = subprocess.Popen([sys.executable, "scripts/validate_migration.py"],
+if calibration_cache_size or calibration_cache_spill:
+    # Calibration-only wrapper applies optional cache tuning to each connection
+    # opened by the supplied validator. The connection that performs the
+    # transformation receives these PRAGMAs before the validator configures
+    # journaling, temp storage, and secure_delete.
+    tuning_script = Path("/home/dev/tmp/sqlite-calibration-cache-wrapper.py")
+    tuning_script.write_text(
+        "import runpy, sqlite3, sys\n"
+        "original_connect = sqlite3.connect\n"
+        "database = str(__import__('pathlib').Path('local-data/covid19.db').resolve())\n"
+        "cache_size = " + repr(calibration_cache_size) + "\n"
+        "cache_spill = " + repr(calibration_cache_spill) + "\n"
+        "def connect(*args, **kwargs):\n"
+        "    connection = original_connect(*args, **kwargs)\n"
+        "    target = str(args[0]).split('?', 1)[0] if args else ''\n"
+        "    if target == database:\n"
+        "        if cache_size:\n"
+        "            connection.execute('PRAGMA cache_size=' + cache_size)\n"
+        "        if cache_spill:\n"
+        "            connection.execute('PRAGMA cache_spill=' + cache_spill.upper())\n"
+        "        print('calibration_cache_settings cache_size=' + str(connection.execute('PRAGMA cache_size').fetchone()[0]) + ' cache_spill=' + str(connection.execute('PRAGMA cache_spill').fetchone()[0]), flush=True)\n"
+        "    return connection\n"
+        "sqlite3.connect = connect\n"
+        "sys.argv = ['scripts/validate_migration.py']\n"
+        "runpy.run_path('scripts/validate_migration.py', run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    migration_command = [python, str(tuning_script)]
+else:
+    migration_command = [python, "scripts/validate_migration.py"]
+process = subprocess.Popen(migration_command,
     cwd=repo, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     bufsize=1)
 samples = [fast_sample()]
@@ -336,6 +326,25 @@ while process.poll() is None:
 output = process.stdout.read()
 final_migration_state = snapshot("migration-finished-before-postcheck")
 elapsed = time.monotonic() - start
+peak_used_bytes = max((item["used_bytes"] for item in samples), default=None)
+sampled_peak_memory_bytes = max((
+    item.get("cgroup_memory", {}).get("memory.current", 0) for item in samples
+), default=None)
+reported_cgroup_memory_peak_bytes = max((
+    item.get("cgroup_memory", {}).get("memory.peak", 0) for item in samples
+), default=None)
+sqlite_peak_allocations = {}
+for item in samples:
+    for name, sizes in item.get("sqlite_files", {}).items():
+        previous = sqlite_peak_allocations.setdefault(name, {"bytes": 0, "allocated_bytes": 0})
+        previous["bytes"] = max(previous["bytes"], sizes.get("bytes", 0))
+        previous["allocated_bytes"] = max(
+            previous["allocated_bytes"], sizes.get("allocated_bytes", 0)
+        )
+temporary_peak_allocated_bytes = max((
+    sum(file.get("allocated_bytes", 0) for file in item.get("temporary_files", []))
+    for item in samples
+), default=0)
 db_hash = sha256(database)
 final_neighbor_files = {str(p.relative_to(neighbor)): sha256(p)
                         for p in neighbor.rglob("*") if p.is_file()}
@@ -351,16 +360,42 @@ except Exception as error:
 failure_lines = [line for line in output.splitlines()
                  if any(word in line.lower() for word in
                         ("error", "exception", "disk is full", "persistent migration validated"))]
+secure_delete_settings_line = next(
+    (line.strip() for line in output.splitlines()
+     if line.startswith("migration_settings ") and "secure_delete=" in line),
+    None,
+)
+secure_delete_actual = None
+if secure_delete_settings_line:
+    match = re.search(r"\bsecure_delete=(\d+)\b", secure_delete_settings_line)
+    if match:
+        secure_delete_actual = int(match.group(1))
+cache_settings_line = next(
+    (line.strip() for line in output.splitlines()
+     if line.startswith("calibration_cache_settings ")),
+    None,
+)
 record = {
     "label": args.label,
+    "sqlite_secure_delete_mode": args.sqlite_secure_delete,
+    "calibration_cache_size_override": calibration_cache_size or None,
+    "calibration_cache_spill_override": calibration_cache_spill or None,
+    "calibration_cache_settings_line": cache_settings_line,
+    "migration_runner_sha256": sha256(repo / "scripts/validate_migration.py"),
+    "migration_runner_secure_delete_setup_present": (
+        "configure_secure_delete(connection, secure_delete_mode)"
+        in (repo / "scripts/validate_migration.py").read_text(encoding="utf-8")
+    ),
     "capacity_bytes": shutil.disk_usage("/home/dev").total,
+    "initial_used_bytes": before_setup_state["filesystem"]["used_bytes"],
+    "initial_free_bytes": before_setup_state["filesystem"]["free_bytes"],
+    "post_tests_used_bytes": after_tests_state["filesystem"]["used_bytes"],
+    "post_tests_free_bytes": after_tests_state["filesystem"]["free_bytes"],
     "journal_mode": journal_mode,
     "sqlite_configuration_before_tests": before_setup_sqlite,
     "sqlite_configuration_after_migration": error_probe,
     "tmp_env": {key: env.get(key) for key in ("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR")},
-    "temp_store_override": args.temp_store,
-    "verification_temp_store_override": args.verification_temp_store,
-    "interruption_after_drop_requested": args.interrupt_after_drop,
+    "migration_connection_settings": {"journal_mode": "WAL", "synchronous": "FULL", "temp_store": "FILE"},
     "sample_interval_ms": args.sample_ms,
     "measured_sample_intervals_ms": [
         round((right["time_ns"] - left["time_ns"]) / 1_000_000, 3)
@@ -375,8 +410,15 @@ record = {
     "original_unchanged_after_failed_migration": process.returncode != 0 and db_hash == before_migration_db_hash,
     "migration_exit": process.returncode,
     "migration_error_excerpt": failure_lines[-20:],
+    "migration_connection_secure_delete_actual": secure_delete_actual,
+    "migration_connection_settings_line": secure_delete_settings_line,
     "migration_and_independent_verification_seconds": round(elapsed, 2),
     "minimum_sampled_free_bytes": min_free,
+    "peak_used_bytes": peak_used_bytes,
+    "sampled_peak_memory_current_bytes": sampled_peak_memory_bytes,
+    "reported_cgroup_memory_peak_bytes": reported_cgroup_memory_peak_bytes,
+    "peak_sqlite_files": sqlite_peak_allocations,
+    "peak_temporary_file_allocated_bytes": temporary_peak_allocated_bytes,
     "free_before_prune_bytes": free_before_prune,
     "free_after_prune_bytes": free_after_prune,
     "free_released_by_prune_bytes": free_after_prune - free_before_prune,

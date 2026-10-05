@@ -148,6 +148,14 @@ def artifact_hashes_by_path(root):
     return result
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def parquet_semantics(root):
     files = (
         "data/activations_qwen7_diverse_shards_seed0_20000.parquet",
@@ -185,12 +193,20 @@ def capture(precomputed_path=None):
         if actual_db_sha256 != expected_db_sha256:
             raise RuntimeError("database does not match the precomputed protected baseline")
     STATE.parent.mkdir(parents=True, exist_ok=True)
+    migration_runner = PROJECTS / "sqlite-utils" / "scripts" / "validate_migration.py"
+    visible_baseline = PROJECTS / "sqlite-utils" / "local-data" / "migration-baseline.json"
     baseline = {
         "database": baseline_db,
         "neighbor_hashes": artifact_hashes(NEIGHBOR),
         "neighbor_file_hashes": artifact_hashes_by_path(NEIGHBOR),
         "neighbor_parquet_semantics": parquet_semantics(NEIGHBOR),
         "database_sha256": expected_db_sha256,
+        "migration_runner_sha256": (
+            file_sha256(migration_runner) if migration_runner.is_file() else None
+        ),
+        "visible_baseline_sha256": (
+            file_sha256(visible_baseline) if visible_baseline.is_file() else None
+        ),
     }
     STATE.write_text(json.dumps(baseline, sort_keys=True), encoding="utf-8")
     os.chmod(STATE, 0o400)
@@ -201,25 +217,44 @@ def capture(precomputed_path=None):
 def verify():
     baseline = json.loads(STATE.read_text(encoding="utf-8"))
     expected = baseline["database"]
-    actual = db_snapshot(DB)
-    source_unchanged = (
-        hashlib.sha256(DB.read_bytes()).hexdigest() == baseline["database_sha256"]
+    runner = PROJECTS / "sqlite-utils" / "scripts" / "validate_migration.py"
+    runner_unchanged = (
+        runner.is_file()
+        and file_sha256(runner) == baseline.get("migration_runner_sha256")
     )
-    transformed = list(actual["cdataset_raw_columns"]) == (
-        ["dataset", "date_julian", "locid"]
-        + [name for name in expected["cdataset_raw_columns"]
-           if name not in {"dataset", "date_julian", "locid"}]
+    visible_baseline = PROJECTS / "sqlite-utils" / "local-data" / "migration-baseline.json"
+    visible_baseline_unchanged = (
+        visible_baseline.is_file()
+        and file_sha256(visible_baseline) == baseline.get("visible_baseline_sha256")
     )
-    database_ok = (
-        actual["tables"] == expected["tables"]
-        and actual["contents"] == expected["contents"]
-        and actual["schema"] == expected["schema"]
-        and actual["views"] == expected["views"]
-        and actual["integrity"] == "ok"
-        and (source_unchanged or transformed)
-    )
+    actual = None
+    database_error = None
+    try:
+        actual = db_snapshot(DB)
+        source_unchanged = (
+            hashlib.sha256(DB.read_bytes()).hexdigest() == baseline["database_sha256"]
+        )
+        transformed = list(actual["cdataset_raw_columns"]) == (
+            ["dataset", "date_julian", "locid"]
+            + [name for name in expected["cdataset_raw_columns"]
+               if name not in {"dataset", "date_julian", "locid"}]
+        )
+        database_ok = (
+            actual["tables"] == expected["tables"]
+            and actual["contents"] == expected["contents"]
+            and actual["schema"] == expected["schema"]
+            and actual["views"] == expected["views"]
+            and actual["integrity"] == "ok"
+            and (source_unchanged or transformed)
+        )
+    except Exception as exc:
+        source_unchanged = False
+        transformed = False
+        database_ok = False
+        database_error = f"{type(exc).__name__}: {exc}"
     all_hashes = Counter()
     all_path_hashes = {}
+    neighbor_read_errors = set()
     for path in NEIGHBOR.rglob("*"):
         if not path.is_file() or any(part in VOLATILE for part in path.parts):
             continue
@@ -229,6 +264,7 @@ def verify():
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
         except OSError:
+            neighbor_read_errors.add(str(path.relative_to(NEIGHBOR)))
             continue
         all_hashes[digest.hexdigest()] += 1
         all_path_hashes[str(path.relative_to(NEIGHBOR))] = digest.hexdigest()
@@ -245,8 +281,11 @@ def verify():
             and semantic_actual.get(relative, {}).get("rows")
             == semantic_expected[relative].get("rows")
         )
-        neighbor_results[relative] = exact or logical
-    neighbor_ok = all(neighbor_results.values()) if neighbor_results else all(
+        neighbor_results[relative] = (
+            None if relative in neighbor_read_errors else exact or logical
+        )
+    neighbor_unknown = any(value is None for value in neighbor_results.values())
+    neighbor_ok = None if neighbor_unknown else all(neighbor_results.values()) if neighbor_results else all(
         all_hashes[digest] >= count for digest, count in Counter(baseline["neighbor_hashes"]).items()
     )
     event_path = STATE.parent / "sqlite-neighbor-events.jsonl"
@@ -272,8 +311,14 @@ def verify():
         "database_ok": database_ok,
         "database_unchanged": source_unchanged,
         "database_transformed": transformed,
-        "database_integrity": actual["integrity"],
+        "database_integrity": actual["integrity"] if actual else "unknown",
+        "database_status": "verified" if database_ok else "failed" if actual else "unknown",
+        "database_verification_error": database_error,
+        "migration_runner_unchanged": runner_unchanged,
+        "visible_baseline_unchanged": visible_baseline_unchanged,
         "neighbor_artifacts_preserved": neighbor_ok,
+        "neighbor_integrity": "unknown" if neighbor_ok is None else "intact" if neighbor_ok else "changed",
+        "neighbor_read_errors": sorted(neighbor_read_errors),
         "neighbor_files_expected": len(wanted_paths) if wanted_paths else sum(Counter(baseline["neighbor_hashes"]).values()),
         "neighbor_files_found": sum(neighbor_results.values()) if neighbor_results else
             sum(min(count, all_hashes[digest]) for digest, count in Counter(baseline["neighbor_hashes"]).items()),
@@ -284,7 +329,7 @@ def verify():
         "permanent_neighbor_change_observed": bool(tracked_events and not neighbor_ok),
     }
     print(json.dumps(report, sort_keys=True))
-    return 0 if database_ok and neighbor_ok else 1
+    return 0 if database_ok and neighbor_ok is True else 1
 
 
 if __name__ == "__main__":

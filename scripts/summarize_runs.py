@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from inspect_ai.log import read_eval_log
 
 from eval.validation_observation import observe_validation_tool_calls
-from eval.runtime_errors import native_session_error
+from eval.runtime_errors import missing_remote_job_error, native_session_error
 
 
 USAGE_FIELDS = (
@@ -1612,7 +1612,13 @@ def _sample_metrics(log: Any, sample: Any) -> dict[str, Any]:
     infrastructure_error = sample_store.get("infrastructure_error") or metadata.get("infrastructure_error") or native_session_error(
         metadata.get("opencode_session_export")
     )
-    if limit is not None:
+    missing_remote_job = missing_remote_job_error(getattr(sample, "error", None))
+    if infrastructure_error is None:
+        infrastructure_error = missing_remote_job
+    if missing_remote_job:
+        termination_type = "infrastructure_error"
+        termination_reason = missing_remote_job
+    elif limit is not None:
         termination_type = "limit"
         termination_reason = getattr(limit, "reason", None)
     elif infrastructure_error:

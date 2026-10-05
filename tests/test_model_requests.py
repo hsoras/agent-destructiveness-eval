@@ -11,7 +11,7 @@ from eval.model_requests import (
     ModelRequestGuard, InfrastructureRequestError, cli_error_event,
     request_failure_details,
 )
-from eval.runtime_errors import native_session_error
+from eval.runtime_errors import missing_remote_job_error, native_session_error
 from eval.scorer import _termination_reason
 
 
@@ -56,6 +56,45 @@ def test_dev_reconsiders_transient_failures_but_excludes_ineligible_routes(monke
     assert all(c.max_retries == 0 for _, c in calls)
     assert all(isinstance(c.timeout, int) and isinstance(c.attempt_timeout, int) for _, c in calls)
     assert all(GenerateConfig.model_validate(c.model_dump()) for _, c in calls)
+
+
+def test_dev_missing_request_limits_use_revision5_fallbacks(monkeypatch):
+    import eval.model_requests as requests
+    calls = []
+
+    class ProviderFailure(Exception):
+        status_code = 503
+
+    class Original:
+        model_args = {}
+        def __str__(self): return "openrouter/test/model"
+        def _resolve_config(self, config): return config
+
+    class Candidate:
+        def __init__(self, route): self.route = route
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def generate(self, **kwargs):
+            calls.append((self.route, kwargs["config"]))
+            if self.route == "first":
+                raise ProviderFailure("unavailable")
+            return ModelOutput.from_content("test/model", "done")
+
+    monkeypatch.setattr(
+        requests, "get_model",
+        lambda *args, **kwargs: Candidate(kwargs["provider"]["only"][0]),
+    )
+
+    async def scenario():
+        config = GenerateConfig(max_retries=None, timeout=None, attempt_timeout=None)
+        guard = ModelRequestGuard(dev_routes=["first", "second"])
+        await guard.generate(Original(), [], [], None, config)
+
+    asyncio.run(scenario())
+    assert [route for route, _ in calls] == ["first", "second"]
+    assert all(config.max_retries == 0 for _, config in calls)
+    assert all(config.attempt_timeout == 300 for _, config in calls)
+    assert all(590 <= config.timeout <= 600 for _, config in calls)
 
 
 def test_dev_real_inspect_http_429_switches_without_waiting_retry_after(monkeypatch):
@@ -164,6 +203,17 @@ def test_terminal_native_api_error_is_not_normal_completion():
     ) == "infrastructure_error"
     export["messages"].append({"data": {"role": "assistant"}})
     assert native_session_error(export) is None
+
+
+def test_missing_exec_remote_job_is_classified_as_infrastructure_error():
+    error = RuntimeError("No job found with pid 325")
+    assert missing_remote_job_error(error) == "No job found with pid 325"
+    assert missing_remote_job_error(RuntimeError("command exited with status 1")) is None
+    assert _termination_reason(
+        SimpleNamespace(error=error, limit=None),
+        final_response="partial output",
+        normal_submit=False,
+    ) == "infrastructure_error"
 
 
 def test_cli_error_is_detected_even_when_process_exits_zero():

@@ -1,0 +1,9 @@
+diff --git a/sqlite_utils/db.py b/sqlite_utils/db.py
+--- a/sqlite_utils/db.py
++++ b/sqlite_utils/db.py
+@@ -2853,4 +2853,4 @@
+             copied += len(rows)
+             key_offset = width + (1 if preserve_rowid else 0)
+-            last = tuple(rows[-1][key_offset:])
++            last = tuple(rows[0][key_offset:])
+             progress(copied, total)
