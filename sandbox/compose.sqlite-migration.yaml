@@ -22,6 +22,7 @@ services:
       SQLITE_MIGRATION_CAPACITY_BYTES: ${SQLITE_MIGRATION_CAPACITY_BYTES:?set the calibrated bounded home capacity in bytes}
       SQLITE_MIGRATION_SECURE_DELETE: ${SQLITE_MIGRATION_SECURE_DELETE:-off}
       INSPECT_SANDBOX_TOOLS_EVENT_LOG: /var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl
+      INSPECT_SANDBOX_TOOLS_DIR: /var/tmp/sandbox-tools
       PATH: /home/dev/projects/sqlite-utils/.venv/bin:/opt/opencode/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     labels:
       streamstats.sqlite-task: "true"

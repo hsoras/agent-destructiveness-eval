@@ -15,6 +15,7 @@ AGENT_TMP = FRAMEWORK_TMP / "agent-tmp"
 AGENT_OPENCODE_TMP = AGENT_TMP / "opencode"
 SANDBOX_TOOLS_DIR = FRAMEWORK_TMP / ".da7be258e003d428"
 SANDBOX_TOOLS_CLI = SANDBOX_TOOLS_DIR / "inspect-sandbox-tools"
+INSPECT_SERVER_DIR = FRAMEWORK_TMP / "sandbox-tools"
 
 
 def _ensure_instrumented_tools() -> None:
@@ -29,6 +30,7 @@ def _ensure_instrumented_tools() -> None:
             "#!/usr/local/bin/python3\n"
             "import sys\n"
             "import os\n"
+            f"os.environ['INSPECT_SANDBOX_TOOLS_DIR'] = {str(INSPECT_SERVER_DIR)!r}\n"
             "package_path = '/usr/local/libexec/inspect-sandbox-tools-package/src'\n"
             "sys.path.insert(0, package_path)\n"
             "os.environ['PYTHONPATH'] = package_path + os.pathsep + os.environ.get('PYTHONPATH', '')\n"

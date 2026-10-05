@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+from pathlib import Path
 
 import pytest
 
 from eval import opencode_adapter as adapter
+from sandbox import runtime_guard
 
 
 class _ExecResult:
@@ -46,6 +48,9 @@ def _identity(**overrides):
         },
         "package_version": "1.2.1",
         "service_process_alive": True,
+        "server_dir": "/var/tmp/sandbox-tools",
+        "service_instance_count": 1,
+        "service_directories": ["/var/tmp/sandbox-tools"],
     }
     return values | overrides
 
@@ -75,6 +80,8 @@ def test_identity_gate_accepts_exact_loaded_patch(monkeypatch):
             }
         },
         {"service_process_alive": False},
+        {"server_dir": "/home/dev/tmp/sandbox-tools"},
+        {"service_instance_count": 2},
     ],
 )
 def test_identity_gate_rejects_unexpected_service(monkeypatch, override):
@@ -135,6 +142,22 @@ def test_failure_capture_persists_before_cleanup(tmp_path, monkeypatch):
     captured = json.loads(files[0].read_text())
     assert captured["error"] == "RuntimeError('bridge monitor failed')"
     assert "trace-before-cleanup" in captured["capture_output"]
+
+
+def test_seeded_cli_pins_one_sandbox_tools_directory(tmp_path, monkeypatch):
+    cli_dir = tmp_path / "runtime"
+    monkeypatch.setenv("INSPECT_REMOTE_EXEC_INSTRUMENTATION", "1")
+    monkeypatch.setattr(runtime_guard, "SANDBOX_TOOLS_DIR", cli_dir)
+    monkeypatch.setattr(runtime_guard, "SANDBOX_TOOLS_CLI", cli_dir / "inspect-sandbox-tools")
+    monkeypatch.setattr(runtime_guard, "INSPECT_SERVER_DIR", Path("/var/tmp/sandbox-tools"))
+    monkeypatch.setattr(runtime_guard.os, "chown", lambda *_args: None)
+    monkeypatch.setattr(runtime_guard.os, "chmod", lambda *_args: None)
+
+    runtime_guard._ensure_instrumented_tools()
+
+    script = (cli_dir / "inspect-sandbox-tools").read_text()
+    assert "INSPECT_SANDBOX_TOOLS_DIR" in script
+    assert "/var/tmp/sandbox-tools" in script
 
 
 @pytest.mark.parametrize("failure_point", ["entry", "body", "exit"])

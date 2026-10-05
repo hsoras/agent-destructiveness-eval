@@ -65,7 +65,7 @@ def _expected_remote_controller_hash() -> str:
 async def _verify_remote_service_identity(sbox: Any) -> dict[str, Any]:
     """Require the running daemon to attest its actual patched controller."""
     expected_hash = _expected_remote_controller_hash()
-    script = r'''import json, os, pathlib, time
+    script = r'''import json, pathlib, time
 path = pathlib.Path('/var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl')
 deadline = time.monotonic() + 8
 rows = []
@@ -80,6 +80,8 @@ while time.monotonic() < deadline:
         identities = [row for row in rows if row.get('event') == 'service_runtime_identity' and row.get('startup_id') == start.get('startup_id')]
         if identities:
             identity = identities[-1]
+            identity['service_instance_count'] = len(starts)
+            identity['service_directories'] = sorted({row.get('server_dir') for row in starts if row.get('server_dir')})
             identity['service_started_at'] = start.get('started_at')
             identity['service_proc_start_ticks'] = start.get('proc_start_ticks')
             identity['service_pid'] = start.get('service_pid')
@@ -119,6 +121,16 @@ raise SystemExit(2)
         )
     if not controller_path.startswith(required_root):
         problems.append(f"controller loaded from unexpected path {controller_path!r}")
+    if identity.get("server_dir") != "/var/tmp/sandbox-tools":
+        problems.append(f"service uses unexpected server directory {identity.get('server_dir')!r}")
+    if identity.get("service_instance_count") != 1 or identity.get(
+        "service_directories"
+    ) != ["/var/tmp/sandbox-tools"]:
+        problems.append(
+            "multiple or inconsistent service instances are already running: "
+            f"count={identity.get('service_instance_count')!r}, "
+            f"directories={identity.get('service_directories')!r}"
+        )
     if identity.get("package_version") not in (None, "1.2.1"):
         problems.append(f"unexpected service package version {identity.get('package_version')!r}")
     if not identity.get("startup_id") or not identity.get("service_process_alive"):

@@ -20,15 +20,17 @@ import uuid
 _startup_id: str | None = None
 _started_at: str | None = None
 _event_log_path: str | None = None
+_server_dir: str | None = None
 PATCH_ID = "inspect-sandbox-tools-1.2.1-remote-exec-retry-trace-v2"
 
 
 def start_service(server_dir: str | os.PathLike[str] | None = None) -> str:
     """Start a unique trace instance and persist the server identity."""
-    global _startup_id, _started_at, _event_log_path
+    global _startup_id, _started_at, _event_log_path, _server_dir
     _startup_id = uuid.uuid4().hex
     _started_at = datetime.now(timezone.utc).isoformat()
     _event_log_path = os.environ.get("INSPECT_SANDBOX_TOOLS_EVENT_LOG")
+    _server_dir = str(server_dir) if server_dir is not None else None
     record_event(
         "service_start",
         startup_id=_startup_id,
@@ -89,6 +91,7 @@ def record_event(event: str, **fields: object) -> None:
         "service_pid": os.getpid(),
         "startup_id": _startup_id,
         "service_started_at": _started_at,
+        "server_dir": _server_dir,
         **fields,
     }
     try:
