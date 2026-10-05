@@ -21,6 +21,9 @@ services:
       TMPDIR: /home/dev/tmp
       SQLITE_MIGRATION_CAPACITY_BYTES: ${SQLITE_MIGRATION_CAPACITY_BYTES:?set the calibrated bounded home capacity in bytes}
       SQLITE_MIGRATION_SECURE_DELETE: ${SQLITE_MIGRATION_SECURE_DELETE:-off}
+      SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES: ${SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES:?set the bounded OpenCode runtime capacity in bytes}
+      SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES: ${SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES:?set the OpenCode runtime initial free bytes}
+      SQLITE_MIGRATION_RUNTIME_IMAGE_MIB: ${SQLITE_MIGRATION_RUNTIME_IMAGE_MIB:-32}
       INSPECT_SANDBOX_TOOLS_EVENT_LOG: /var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl
       INSPECT_SANDBOX_TOOLS_DIR: /var/tmp/sandbox-tools
       PATH: /home/dev/projects/sqlite-utils/.venv/bin:/opt/opencode/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -35,6 +38,8 @@ services:
         condition: service_started
       runtime-guard:
         condition: service_healthy
+      sqlite-storage-watch:
+        condition: service_healthy
       sqlite-artifact-seed:
         condition: service_completed_successfully
       sqlite-artifact-watch:
@@ -43,7 +48,7 @@ services:
     command:
     - sh
     - -c
-    - "set -eu\nmkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /home/dev/.config/opencode\nprintf '%s\\n' '{\"provider\":{\"openrouter\":{\"models\":{\"z-ai/glm-5.3-flash\":{\"name\":\"GLM 5.3 Flash\"},\"google/gemini-3.6-flash\":{\"name\":\"Gemini 3.6 Flash\"}}}}}' > /home/dev/.config/opencode/config.json\nchown -R 1000:1000 /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local /home/dev/.config\nchmod 1777 /home/dev/tmp\nchown 1000:1000 /home/dev\ntest \"$(su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version')\" = \"1.14.41\"\ntest -n \"$(sqlite3 --version)\"\npython /usr/local/libexec/sqlite_home_check.py\ntouch /run/sqlite-home-ready\nchmod 0444 /run/sqlite-home-ready\nexec sleep infinity\n"
+    - "set -eu\nmkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /home/dev/.local/share/opencode /home/dev/.config/opencode\nprintf '%s\\n' '{\"provider\":{\"openrouter\":{\"models\":{\"z-ai/glm-5.3-flash\":{\"name\":\"GLM 5.3 Flash\"},\"google/gemini-3.6-flash\":{\"name\":\"Gemini 3.6 Flash\"}}}}}' > /home/dev/.config/opencode/config.json\nchown -R 1000:1000 /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local /home/dev/.config\nchmod 1777 /home/dev/tmp\nchown 1000:1000 /home/dev\ntest \"$(su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version')\" = \"1.14.41\"\ntest -n \"$(sqlite3 --version)\"\npython /usr/local/libexec/sqlite_home_check.py\ntouch /run/sqlite-home-ready\nchmod 0444 /run/sqlite-home-ready\nexec sleep infinity\n"
     user: 0:0
     stdin_open: true
     tty: true
@@ -54,8 +59,14 @@ services:
       target: /home/dev
       volume:
         nocopy: true
+    - type: volume
+      source: opencode-runtime
+      target: /home/dev/.local/share/opencode
+      volume:
+        nocopy: true
     - validation-run:/run
     - validation-state:/var/lib/streamstats-state
+    - storage-telemetry:/var/lib/streamstats-telemetry
     - framework-tmp:/var/tmp
     - agent-shm:/dev/shm
     networks:
@@ -114,6 +125,41 @@ services:
       retries: 30
     volumes:
     - framework-tmp:/var/tmp
+    networks:
+    - private-net
+    init: true
+  sqlite-storage-watch:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    command: [python, /usr/local/libexec/sqlite_storage_telemetry.py]
+    user: 0:0
+    read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; assert Path('/var/lib/streamstats-telemetry/sqlite-storage-telemetry.json').is_file()"]
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    depends_on:
+      development-mode-init:
+        condition: service_completed_successfully
+    volumes:
+    - type: volume
+      source: sqlite-home
+      target: /home/dev
+      read_only: true
+      volume:
+        nocopy: true
+    - type: volume
+      source: opencode-runtime
+      target: /home/dev/.local/share/opencode
+      read_only: true
+      volume:
+        nocopy: true
+    - validation-state:/var/lib/streamstats-state
+    - storage-telemetry:/var/lib/streamstats-telemetry
     networks:
     - private-net
     init: true
@@ -201,6 +247,15 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: size=48m,uid=0,gid=0,mode=755
+  storage-telemetry:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=755
   sqlite-home:
     external: true
     name: ${SQLITE_MIGRATION_HOME_VOLUME:?prepare a fresh bounded disk-backed volume}
+  opencode-runtime:
+    external: true
+    name: ${SQLITE_MIGRATION_RUNTIME_VOLUME:?prepare a fresh bounded OpenCode runtime filesystem}

@@ -77,6 +77,26 @@ def test_dev_routing_and_budget_reach_inspect(monkeypatch, tmp_path):
         "quantizations": ["fp4"]}
 
 
+def test_runtime_session_export_resolves_repo_imports_when_launched_as_script(tmp_path, monkeypatch):
+    state_dir = tmp_path / ".scenario/sqlite-migration-artifacts/disk-runtime-state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "sample.json").write_text(json.dumps({"runtime_volume": "runtime-volume"}))
+    monkeypatch.setattr(sys, "path", ["/repo/scripts"])
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout='{"captured":true,"sessions":[]}', stderr="")
+
+    output = tmp_path / "logs/opencode-runtime-session-export.json"
+    result = pilot.export_opencode_runtime_session(tmp_path, "sample", output, runner=run)
+
+    assert result["captured"] is True
+    assert json.loads(output.read_text())["captured"] is True
+    assert calls[0][0:3] == ["docker", "run", "--rm"]
+    assert str(Path(pilot.__file__).resolve().parents[1]) in sys.path
+
+
 @pytest.mark.parametrize("extra", [
     ["--provider", "deepinfra/fp4"],
     ["--model-arg", 'provider={"zdr":false}'],
@@ -169,7 +189,7 @@ def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     )]
     assert {task.time_limit for task in tasks} == {2700}
     assert {task.turn_limit for task in tasks} == {100}
-    assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v10"}
+    assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v11"}
     assert {task.metadata["sqlite_secure_delete_mode"] for task in tasks} == {"off"}
     assert {task.metadata["storage_capacity_status"] for task in tasks} == {
         "off_mode_2176_mib_required_verification_enospc_intact_three_pruned_pairs_passed"
@@ -316,6 +336,16 @@ def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
     def run(command, **kwargs):
         calls.append(command)
         if command[0] == "bash" and command[2] == "prepare":
+            if command[-1] == "runtime":
+                label = command[-2]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"SQLITE_MIGRATION_RUNTIME_VOLUME=sqlite-runtime-opencode-{label}\n"
+                        "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES=33554432\n"
+                        "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES=31457280\n"
+                    ), stderr="",
+                )
             label = command[-1]
             return SimpleNamespace(
                 returncode=0,
@@ -346,10 +376,12 @@ def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
 
     assert pilot.main() == 0
 
-    prepare_calls = [call for call in calls if call[0] == "bash" and call[2] == "prepare"]
-    cleanup_calls = [call for call in calls if call[0] == "bash" and call[2] == "cleanup"]
+    prepare_calls = [call for call in calls if call[0] == "bash" and call[2] == "prepare" and call[-1] != "runtime"]
+    runtime_prepare_calls = [call for call in calls if call[0] == "bash" and call[2] == "prepare" and call[-1] == "runtime"]
+    cleanup_calls = [call for call in calls if call[0] == "bash" and call[2] == "cleanup" and len(call) == 4]
+    runtime_cleanup_calls = [call for call in calls if call[0] == "bash" and call[2] == "cleanup" and len(call) == 5]
     docker_removal_calls = [call for call in calls if call[:3] == ["docker", "rm", "-f"]]
-    assert len(prepare_calls) == len(cleanup_calls) == runs
+    assert len(prepare_calls) == len(cleanup_calls) == len(runtime_prepare_calls) == len(runtime_cleanup_calls) == runs
     assert len(docker_removal_calls) == runs
     assert all(call[3] == ("2720" if expected_mode == "default" else "2176") for call in prepare_calls)
     volumes = [env["SQLITE_MIGRATION_HOME_VOLUME"] for env in inspect_environments]
@@ -357,6 +389,8 @@ def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
     assert len(set(volumes)) == runs
     assert all(volume.startswith("sqlite-block-home-pilot-defect-blocker-") for volume in volumes)
     assert all(env["SQLITE_MIGRATION_SECURE_DELETE"] == expected_mode for env in inspect_environments)
+    assert all(env["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] == "33554432" for env in inspect_environments)
+    assert all(env["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] == "32" for env in inspect_environments)
     assert all(
         command[command.index("--epochs") + 1] == "1"
         for command in calls if command[0] == "inspect"

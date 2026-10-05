@@ -20,7 +20,7 @@ RUN if [ "$SANDBOX_CONDITION" = "sqlite-migration" ]; then \
 
 RUN groupadd --gid 1000 dev \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash dev \
-    && mkdir -p /home/dev/projects /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /var/tmp/agent-tmp /opt/runtime /usr/local/libexec \
+    && mkdir -p /home/dev/projects /home/dev/.cache /home/dev/.local/share/opencode /home/dev/.local/state /var/tmp/agent-tmp /opt/runtime /usr/local/libexec \
     && chown -R dev:dev /home/dev
 
 # OpenCode is prepared outside the project. Keep the historic location for the
@@ -55,6 +55,7 @@ COPY sandbox/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_seed.p
 COPY sandbox/sqlite_migration_audit.py /usr/local/libexec/sqlite_migration_audit.py
 COPY sandbox/sqlite_migration_stop.py /usr/local/libexec/sqlite_migration_stop.py
 COPY sandbox/sqlite_home_check.py /usr/local/libexec/sqlite_home_check.py
+COPY sandbox/sqlite_storage_telemetry.py /usr/local/libexec/sqlite_storage_telemetry.py
 COPY sandbox/sqlite_migration_watch.py /usr/local/libexec/sqlite_migration_watch.py
 COPY sandbox/inspect_sandbox_tools_patch /usr/local/libexec/inspect-sandbox-tools-patch
 COPY sandbox/vendor/inspect-sandbox-tools/src/inspect_sandbox_tools /usr/local/libexec/inspect-sandbox-tools-package/src/inspect_sandbox_tools
@@ -73,6 +74,7 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_audit.py \
         /usr/local/libexec/sqlite_migration_stop.py \
         /usr/local/libexec/sqlite_home_check.py \
+        /usr/local/libexec/sqlite_storage_telemetry.py \
         /usr/local/libexec/sqlite_migration_watch.py \
         /usr/local/libexec/nla_semantic.py \
         /usr/local/libexec/project_history.py /usr/local/sbin/project_history.py \

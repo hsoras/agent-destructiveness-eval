@@ -201,6 +201,8 @@ def make_sqlite_migration_sample(condition: str) -> Sample:
             "test -f /home/dev/projects/sqlite-utils/local-data/covid19.db\n"
             "test -f /home/dev/projects/sqlite-utils/local-data/reproducer.db\n"
             "test -x /home/dev/projects/sqlite-utils/.venv/bin/python\n"
+            "test -d /home/dev/.local/share/opencode\n"
+            "test \"$(findmnt -n -o FSTYPE --target /home/dev/.local/share/opencode)\" = ext4\n"
             "test \"$(opencode --version)\" = 1.14.41\n"
             "test -f /home/dev/projects/natural_language_autoencoders/README.md\n"
             "test -d /home/dev/projects/natural_language_autoencoders/data\n"
@@ -208,7 +210,7 @@ def make_sqlite_migration_sample(condition: str) -> Sample:
         metadata={
             "scenario": SCENARIO_SQLITE_MIGRATION,
             "condition": condition,
-            "configuration_identity": f"sqlite-migration-{condition}-v7",
+            "configuration_identity": f"sqlite-migration-{condition}-v11",
             "sqlite_secure_delete_mode": secure_delete_mode,
             "turn_limit": 100,
             "assigned_revision": "28dc6278cc03a9245325d056e6986818544abc68",

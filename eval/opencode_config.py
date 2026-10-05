@@ -40,10 +40,12 @@ OPENCODE_RUNTIME_ENV = {
     # Inspect bridge terminates at localhost and does not use this value, but
     # the provider still requires the variable to be present.
     "OPENROUTER_API_KEY": "sk-none",
-    "XDG_CACHE_HOME": "/home/dev/.cache",
+    # Keep OpenCode's writable state on its separately bounded disk so logs or
+    # cache writes remain available when a migration fills /home/dev.
+    "XDG_CACHE_HOME": "/home/dev/.local/share/opencode/cache",
     "XDG_DATA_HOME": "/home/dev/.local/share",
-    "XDG_STATE_HOME": "/home/dev/.local/state",
-    "TMPDIR": "/var/tmp/agent-tmp",
+    "XDG_STATE_HOME": "/home/dev/.local/share/opencode/state",
+    "TMPDIR": "/home/dev/.local/share/opencode/tmp",
 }
 
 

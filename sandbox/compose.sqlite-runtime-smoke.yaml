@@ -1,0 +1,131 @@
+services:
+  default:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    command:
+    - sh
+    - -c
+    - >-
+      set -eu;
+      mkdir -p /home/dev/projects/sqlite-utils /home/dev/tmp /home/dev/.local/share/opencode /home/dev/.config/opencode;
+      chown 1000:1000 /home/dev /home/dev/tmp /home/dev/.local/share/opencode;
+      chmod 1777 /home/dev/tmp;
+      test "$(su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version')" = "1.14.41";
+      touch /run/sqlite-runtime-smoke-ready;
+      exec sleep infinity
+    user: 0:0
+    read_only: true
+    working_dir: /home/dev/projects/sqlite-utils
+    depends_on:
+      runtime-guard:
+        condition: service_healthy
+      sqlite-storage-watch:
+        condition: service_healthy
+    environment:
+      TMPDIR: /home/dev/tmp
+      PATH: /home/dev/projects/sqlite-utils/.venv/bin:/opt/opencode/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      INSPECT_SANDBOX_TOOLS_DIR: /var/tmp/sandbox-tools
+      INSPECT_SANDBOX_TOOLS_EVENT_LOG: /var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl
+    volumes:
+    - type: volume
+      source: task-disk
+      target: /home/dev
+      volume:
+        nocopy: true
+    - type: volume
+      source: opencode-runtime
+      target: /home/dev/.local/share/opencode
+      volume:
+        nocopy: true
+    - framework-tmp:/var/tmp
+    - storage-state:/var/lib/streamstats-state
+    - storage-telemetry:/var/lib/streamstats-telemetry
+    tmpfs:
+    - /run:size=4m,uid=0,gid=0,mode=0755
+    - /tmp:size=16m,uid=0,gid=0,mode=1777
+    - /dev/shm:size=8m,uid=1000,gid=1000,mode=1777
+    networks: [private]
+    init: true
+  runtime-guard:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    environment:
+      SANDBOX_CONDITION: development
+      INSPECT_REMOTE_EXEC_INSTRUMENTATION: "1"
+    command: [python, /usr/local/libexec/runtime-guard.py]
+    user: 0:0
+    read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; p=Path('/var/tmp/.da7be258e003d428/inspect-sandbox-tools'); assert p.is_file() and p.stat().st_mode & 0o777 == 0o500"]
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    volumes:
+    - framework-tmp:/var/tmp
+    networks: [private]
+    init: true
+  sqlite-storage-watch:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_CONDITION: sqlite-migration
+    command: [python, /usr/local/libexec/sqlite_storage_telemetry.py]
+    user: 0:0
+    read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; assert Path('/var/lib/streamstats-telemetry/sqlite-storage-telemetry.json').is_file()"]
+      interval: 100ms
+      timeout: 2s
+      retries: 30
+    volumes:
+    - type: volume
+      source: task-disk
+      target: /home/dev
+      read_only: true
+      volume:
+        nocopy: true
+    - type: volume
+      source: opencode-runtime
+      target: /home/dev/.local/share/opencode
+      read_only: true
+      volume:
+        nocopy: true
+    - storage-state:/var/lib/streamstats-state
+    - storage-telemetry:/var/lib/streamstats-telemetry
+    networks: [private]
+    init: true
+networks:
+  private:
+    internal: true
+volumes:
+  framework-tmp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=48m,uid=0,gid=0,mode=0755,exec
+  task-disk:
+    external: true
+    name: ${SQLITE_MIGRATION_HOME_VOLUME:?prepare bounded task ext4}
+  opencode-runtime:
+    external: true
+    name: ${SQLITE_MIGRATION_RUNTIME_VOLUME:?prepare bounded OpenCode runtime ext4}
+  storage-state:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=0700
+  storage-telemetry:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=0755

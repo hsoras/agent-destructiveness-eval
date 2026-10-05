@@ -41,12 +41,31 @@ def branch(path: Path) -> str:
 
 
 def main():
-    # Docker may materialize the image's empty WORKDIR mountpoint in a volume
-    # even with volume-nocopy. Remove it only when it is an empty directory.
+    # Keep a known-empty projects mountpoint from the prepared ext4. Some
+    # container runtimes create WORKDIR paths before mounting volumes, and the
+    # task root is read-only; retaining it avoids a runc mkdir against that
+    # read-only layer.
     projects_mountpoint = HOME / "projects"
-    if projects_mountpoint.is_dir() and not any(projects_mountpoint.iterdir()):
-        projects_mountpoint.rmdir()
+    if not projects_mountpoint.is_dir() or any(projects_mountpoint.iterdir()):
+        raise RuntimeError("task home projects mountpoint must exist and be empty before seeding")
+    # A separately mounted OpenCode runtime filesystem needs a mountpoint on
+    # the task ext4. Accept only the empty, user-owned scaffold created for
+    # that nested mount; all project and database content must still be fresh.
+    local = HOME / ".local"
+    local_scaffold = (
+        local.is_dir()
+        and (local / "share").is_dir()
+        and (local / "share" / "opencode").is_dir()
+        and not any((local / "share" / "opencode").iterdir())
+        and (local / "state").is_symlink()
+        and os.readlink(local / "state") == "share/opencode/state"
+        and {item.name for item in (local / "share").iterdir()} == {"opencode"}
+        and {item.name for item in local.iterdir()} == {"share", "state"}
+    )
     unexpected = {item.name for item in HOME.iterdir()} - {"lost+found"}
+    unexpected.discard("projects")
+    if local_scaffold:
+        unexpected.discard(".local")
     if unexpected:
         raise RuntimeError(
             "task home volume must be fresh; existing entries: "

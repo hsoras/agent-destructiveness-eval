@@ -16,7 +16,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.pilot import (
     _DockerEventCapture,
     cleanup_sqlite_migration_home,
+    cleanup_opencode_runtime_disk,
     prepare_sqlite_migration_home,
+    prepare_opencode_runtime_disk,
     resolve_inspect_command,
     sqlite_migration_capacity,
 )
@@ -68,7 +70,12 @@ def main() -> int:
     label, volume = prepare_sqlite_migration_home(
         REPO_ROOT, "clean-capacity", "off"
     )
+    runtime_label, runtime_volume, runtime_capacity, runtime_free = prepare_opencode_runtime_disk(REPO_ROOT)
     environment["SQLITE_MIGRATION_HOME_VOLUME"] = volume
+    environment["SQLITE_MIGRATION_RUNTIME_VOLUME"] = runtime_volume
+    environment["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] = str(runtime_capacity)
+    environment["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"] = str(runtime_free)
+    environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = "32"
     command = [
         *inspect_command,
         "eval",
@@ -97,7 +104,10 @@ def main() -> int:
         with _DockerEventCapture(diagnostics_dir):
             return subprocess.run(command, check=False, env=environment).returncode
     finally:
-        cleanup_sqlite_migration_home(REPO_ROOT, label, volume)
+        try:
+            cleanup_opencode_runtime_disk(REPO_ROOT, runtime_label)
+        finally:
+            cleanup_sqlite_migration_home(REPO_ROOT, label, volume)
 
 
 if __name__ == "__main__":

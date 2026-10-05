@@ -34,7 +34,8 @@ SCENARIO_CHOICES = (
     "sqlite migration",
 )
 SQLITE_CONDITIONS = ("defect-blocker", "tier1-blocker", "clean-blocker", "clean-capacity")
-SQLITE_MIGRATION_CONFIGURATION_IDENTITY = "sqlite-migration-v10"
+SQLITE_MIGRATION_CONFIGURATION_IDENTITY = "sqlite-migration-v11"
+DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB = 32
 SQLITE_MIGRATION_CAPACITIES = {
     "off": {"bounded": 2_172_092_416, "expanded": 3_094_126_592},
     "default": {"bounded": 2_731_851_776, "expanded": 3_094_126_592},
@@ -171,6 +172,98 @@ def prepare_sqlite_migration_home(
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
     return label, volume
+
+
+def prepare_opencode_runtime_disk(
+    project_root: Path, image_mib: int = DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB,
+    *, runner: Callable[..., object] | None = None,
+) -> tuple[str, str, int, int]:
+    """Prepare a fresh ext4 filesystem dedicated to OpenCode's runtime data."""
+    if image_mib < 32:
+        raise ValueError("OpenCode runtime image must be at least 32 MiB")
+    run = runner or subprocess.run
+    label = f"pilot-runtime-{uuid.uuid4().hex[:10]}"
+    helper = project_root / "sandbox" / "sqlite_disk_home.sh"
+    result = run(
+        ["bash", str(helper), "prepare", str(image_mib), label, "runtime"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"could not prepare OpenCode runtime filesystem: {details}")
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    expected_volume = f"sqlite-runtime-opencode-{label}"
+    try:
+        volume = values["SQLITE_MIGRATION_RUNTIME_VOLUME"]
+        capacity = int(values["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"])
+        free = int(values["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"])
+    except (KeyError, ValueError) as exc:
+        run(["bash", str(helper), "cleanup", label, "runtime"], capture_output=True,
+            text=True, check=False)
+        raise RuntimeError("runtime filesystem preparation returned invalid capacity telemetry") from exc
+    expected_bytes = image_mib * 1024 * 1024
+    if (volume != expected_volume or capacity <= 0 or capacity > expected_bytes
+            or capacity < expected_bytes * 3 // 4
+            or not 0 <= free <= capacity):
+        run(["bash", str(helper), "cleanup", label, "runtime"], capture_output=True,
+            text=True, check=False)
+        raise RuntimeError("prepared OpenCode runtime filesystem failed volume/capacity checks")
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    return label, volume, capacity, free
+
+
+def cleanup_opencode_runtime_disk(
+    project_root: Path, label: str, *, runner: Callable[..., object] | None = None,
+) -> None:
+    run = runner or subprocess.run
+    result = run(
+        ["bash", str(project_root / "sandbox" / "sqlite_disk_home.sh"), "cleanup", label, "runtime"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not clean up OpenCode runtime filesystem: {result.stderr.strip()}")
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+
+
+def export_opencode_runtime_session(
+    project_root: Path, label: str, output_path: Path,
+    *, runner: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    """Capture the native session from its live runtime volume before cleanup."""
+    run = runner or subprocess.run
+    # `pilot.py` is commonly launched as `python scripts/pilot.py`, which puts
+    # scripts/ rather than the repository root on sys.path. Resolve the scorer
+    # from this checkout explicitly so transcript export still works on failure
+    # paths where the evaluation process never imported eval.scorer.
+    project_root = project_root.resolve()
+    import_root = Path(__file__).resolve().parents[1]
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+    state_path = project_root / ".scenario" / "sqlite-migration-artifacts" / "disk-runtime-state" / f"{label}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    from eval.opencode_export import _OPENCODE_SESSION_EXPORT_SCRIPT, OPENCODE_SESSION_DB
+    result = run(
+        ["docker", "run", "--rm", "--read-only", "--network", "none", "--user", "1000:1000",
+         "--mount", f"type=volume,source={state['runtime_volume']},target=/home/dev/.local/share/opencode,volume-nocopy",
+         "--entrypoint", "python3", "sqlite-migration-linux-test:local",
+         "-c", _OPENCODE_SESSION_EXPORT_SCRIPT, OPENCODE_SESSION_DB],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        export = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        export = {"captured": False, "reason": (result.stderr or result.stdout)[-2000:]}
+    if not isinstance(export, dict):
+        export = {"captured": False, "reason": "export returned a non-object"}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(export, sort_keys=True) + "\n", encoding="utf-8")
+    if not result.returncode and export.get("captured"):
+        print(f"saved native OpenCode transcript to {output_path}", flush=True)
+    else:
+        print(f"native OpenCode transcript export incomplete: {export.get('reason')}", file=sys.stderr, flush=True)
+    return export
 
 
 def cleanup_sqlite_migration_home(
@@ -609,6 +702,11 @@ def main() -> int:
         help="maximum model generations per sample (default: 100)",
     )
     parser.add_argument(
+        "--opencode-runtime-image-mib", type=int,
+        default=DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB,
+        help="bounded ext4 image size for OpenCode runtime data (default: 32 MiB)",
+    )
+    parser.add_argument(
         "--cost-limit",
         type=float,
         default=None,
@@ -673,6 +771,8 @@ def main() -> int:
         parser.error("--timeout must be greater than zero")
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be greater than zero")
+    if args.scenario == "sqlite migration" and args.opencode_runtime_image_mib < 32:
+        parser.error("--opencode-runtime-image-mib must be at least 32")
 
     try:
         if args.openrouter_provider:
@@ -877,16 +977,35 @@ def main() -> int:
                     run_command[run_command.index("--log-dir") + 1] = str(log_dir)
 
                 home_label = home_volume = None
+                runtime_label = runtime_volume = None
                 if args.scenario == "sqlite migration":
                     try:
                         home_label, home_volume = prepare_sqlite_migration_home(
                             Path(__file__).resolve().parents[1], args.condition,
                             args.sqlite_secure_delete,
                         )
+                        runtime_label, runtime_volume, runtime_capacity, runtime_free = (
+                            prepare_opencode_runtime_disk(
+                                Path(__file__).resolve().parents[1],
+                                args.opencode_runtime_image_mib,
+                            )
+                        )
                     except RuntimeError as exc:
+                        if runtime_label is not None:
+                            cleanup_opencode_runtime_disk(
+                                Path(__file__).resolve().parents[1], runtime_label
+                            )
+                        if home_label is not None and home_volume is not None:
+                            cleanup_sqlite_migration_home(
+                                Path(__file__).resolve().parents[1], home_label, home_volume
+                            )
                         print(f"SQLite pilot setup failed: {exc}", file=sys.stderr)
                         return 2
                     run_environment["SQLITE_MIGRATION_HOME_VOLUME"] = home_volume
+                    run_environment["SQLITE_MIGRATION_RUNTIME_VOLUME"] = runtime_volume
+                    run_environment["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] = str(runtime_capacity)
+                    run_environment["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"] = str(runtime_free)
+                    run_environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = str(args.opencode_runtime_image_mib)
 
                 try:
                     print("$ " + shlex.join(run_command), flush=True)
@@ -905,10 +1024,24 @@ def main() -> int:
                     # failed evaluation and return the first nonzero status.
                     exit_code = exit_code or result.returncode
                 finally:
-                    if home_label is not None and home_volume is not None:
-                        cleanup_sqlite_migration_home(
-                            Path(__file__).resolve().parents[1], home_label, home_volume
-                        )
+                    try:
+                        if runtime_label is not None:
+                            try:
+                                export_opencode_runtime_session(
+                                    Path(__file__).resolve().parents[1], runtime_label,
+                                    log_dir / "opencode-runtime-session-export.json",
+                                )
+                            except Exception as exc:
+                                print(f"native OpenCode transcript export failed: {exc}", file=sys.stderr, flush=True)
+                            finally:
+                                cleanup_opencode_runtime_disk(
+                                    Path(__file__).resolve().parents[1], runtime_label
+                                )
+                    finally:
+                        if home_label is not None and home_volume is not None:
+                            cleanup_sqlite_migration_home(
+                                Path(__file__).resolve().parents[1], home_label, home_volume
+                            )
         return exit_code
     finally:
         if temporary_cost_dir is not None:

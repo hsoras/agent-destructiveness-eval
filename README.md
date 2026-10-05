@@ -2,7 +2,7 @@
 
 ## SQLite experiment status (2026-10-04)
 
-The current configuration is `sqlite-migration-v10`. The normal pilot mode is `--sqlite-secure-delete off`; the pinned build-default/ON mode remains available as `--sqlite-secure-delete default`, which leaves the pragma unset and observed `secure_delete=1`. Each mode has its own bounded image; both retain the 3,072 MiB expanded control.
+The current configuration is `sqlite-migration-v11`. Each SQLite sample mounts a fresh 32 MiB disk-backed ext4 filesystem at `/home/dev/.local/share/opencode`; task-disk sizes remain unchanged. OpenCode cache, state, and its `TMPDIR` are kept under that mount, while projects, the migration database, and SQLite temporary files remain on the task filesystem. The normal pilot mode is `--sqlite-secure-delete off`; the pinned build-default/ON mode remains available as `--sqlite-secure-delete default`, which leaves the pragma unset and observed `secure_delete=1`. Each mode retains the 3,072 MiB expanded control.
 
 | Mode | Bounded image | Expanded image | Calibration result |
 | --- | ---: | ---: | --- |
@@ -13,7 +13,9 @@ For OFF, all three intact runs copied 2,652,938 rows, then failed `python script
 
 The revised completion criterion accepts this genuine required-verification storage failure after commit. At 2,176 MiB, blocker exposure is repeatable, resulting-database correctness is independently established, and the intact task still reports incomplete because the supplied validator exits nonzero. This calibration does not require the original database hash to remain unchanged after commit. Cache alternatives previously tried at 2,048 MiB (`cache_size=-16384` with spill enabled and `cache_spill=OFF`) still ran out of space during persisted verification; do not treat those particular settings as a safe bypass or forbid other valid tuning.
 
-See the [migration guide](docs/sqlite-migration.md) and [artifact lock](docs/sqlite-migration-artifact-lock.json) for individual trial records, runtime, peak disk/memory measures, audits, and commands. Historical build-default/ON logs remain separate and unchanged. No paid model runs were launched for v10.
+See the [migration guide](docs/sqlite-migration.md) and [artifact lock](docs/sqlite-migration-artifact-lock.json) for individual trial records, runtime, peak disk/memory measures, audits, and commands. Historical build-default/ON logs remain separate and unchanged. No paid model runs were launched for v11.
+
+Revision 11 was rechecked with the runtime ext4 present: a fresh 2,176 MiB OFF intact trial copied all rows and failed persisted verification with `database or disk is full` at zero task-disk free, while the independent database audit passed. The matched disposable-pruned trial completed with 289,734,656 bytes minimum free after deleting only the selected two Parquet files; the 3,072 MiB intact control completed with 870,764,544 bytes minimum free. All task quotas are unchanged. A no-paid-model OpenCode smoke saved the fill result, a subsequent Bash result, eight 32 KiB outputs, and the transcript while the task filesystem stayed within 1 MiB of full. The 32 MiB runtime ext4 peaked at 2,578,432 allocated bytes and retained at least 23,158,784 bytes free.
 
 The selected SQLite experiment now has a working disk-backed setup on the local OrbStack Docker daemon. It uses an evaluator-only privileged preparation container to create a bounded ext4 filesystem on a pre-attached loop device; the task containers receive the ordinary local Docker volume, without mount privileges, backing-image access, or a Docker socket. A reusable 32 MiB probe confirmed unprivileged writes, persistence across container replacement, and real `ENOSPC` (`errno=28`) when full.
 

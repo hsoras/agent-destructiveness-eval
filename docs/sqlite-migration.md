@@ -4,7 +4,65 @@
 
 ### Secure-delete mode
 
-Configuration `sqlite-migration-v10` keeps the OFF calibration separate from the preserved build-default/ON calibration. OFF is the pilot default and sets `PRAGMA secure_delete=OFF` on the migration connection. `default` leaves the pragma unset; the pinned build reports actual value `1`.
+Prior calibration used configuration `sqlite-migration-v10`. Revision 11 adds a separate OpenCode runtime filesystem while preserving OFF/ON task-disk sizes. OFF is the pilot default and sets `PRAGMA secure_delete=OFF` on the migration connection. `default` leaves the pragma unset; the pinned build reports actual value `1`.
+
+Each SQLite sample now gets a fresh, disk-backed ext4 image for OpenCode state,
+mounted at `/home/dev/.local/share/opencode`. The default image is 32 MiB; the
+filesystem reports 26,464,256 bytes capacity and 25,744,384 bytes initially
+free on the pinned ext4 tooling. The existing XDG data path and scorer export
+remain unchanged. OpenCode's default `/home/dev/.local/state/opencode` path is
+redirected through `/home/dev/.local/state` to the runtime filesystem, and its
+cache and `TMPDIR` are directed into the same mounted tree. The task service's
+`TMPDIR` remains `/home/dev/tmp` on the task ext4 so migration database
+temporary files stay quota-bound. The task
+filesystem keeps a precreated empty `/home/dev/projects` directory for
+read-only-root container runtimes and includes the empty nested mountpoint
+scaffold required to mount the runtime ext4. The seeder validates and reuses
+that known-empty directory before populating both project checkouts.
+
+Storage telemetry samples the task and runtime filesystems independently and
+records each device, capacity, minimum free bytes, peak used bytes, and runtime
+file allocation by top-level directory. Runtime allocation counts files such
+as `opencode.db`, its WAL, logs, cache, and state. The sidecar is root-only and
+exports before the runtime image is removed. Runtime storage remains writable
+by OpenCode and the native tools because they share uid 1000; it is bounded
+scratch/state capacity, not reserved task capacity.
+
+### Revision 11 OpenCode runtime storage
+
+Every SQLite sample receives a fresh disk-backed ext4 filesystem image (default 32 MiB) mounted at `/home/dev/.local/share/opencode`; `--opencode-runtime-image-mib` changes its image size. The pilot records actual ext4 capacity and initial usable bytes and initializes the mount owner to `dev` (uid 1000) before OpenCode starts. The existing session database path remains `/home/dev/.local/share/opencode/opencode.db`, so scorer-time export reads the same file before cleanup. Failed evaluations receive a host-side fallback transcript export before volume removal.
+
+OpenCode's XDG cache and state roots live under `/home/dev/.local/share/opencode/cache` and `/home/dev/.local/share/opencode/state`. Its `TMPDIR` is `/home/dev/.local/share/opencode/tmp`, within the same runtime ext4. The task service keeps `TMPDIR=/home/dev/tmp`, so both projects, the migration database, and SQLite temporary files remain on the bounded task filesystem. The runtime volume is shared with the `dev` user; it is not reserved for the harness. Its default capacity is below the migration database size and cannot hold that database. Sample score metadata and calibration logs report peak use for each filesystem separately.
+
+The `sqlite_runtime_full_disk_smoke` task and `python scripts/sqlite_runtime_full_disk_smoke.py` exercise the real OpenCode lifecycle with a local mock model: fill a 32 MiB task disk, save the first tool result, execute a second turn, save eight 32 KiB tool outputs, finish, and export the readable native transcript. It makes no paid model requests.
+
+The v11 real-container smoke left 1 MiB free on its small task filesystem so
+the existing native tool execution path could run the second Bash command and
+the scorer could read the telemetry report. With that near-full state, it
+saved the fill result, second-turn result, all eight outputs, and transcript.
+Runtime peak allocation was 2,578,432 bytes: 2,485,248 bytes in `opencode.db-wal`,
+4,096 in `opencode.db`, 32,768 in `opencode.db-shm`, 54,272 in logs, and 2,048
+in storage metadata. Runtime free space stayed above 23,158,784 bytes. An
+exact-zero task filesystem prevents further native tool/scorer subprocess
+writes because the existing tool temp paths remain on the task ext4; the
+storage implementation does not change those paths.
+
+Fresh v11 OFF calibration with both mounts attached:
+
+| Trial | Task capacity | Migration/verification | Minimum task free | Runtime filesystem |
+| --- | ---: | --- | ---: | --- |
+| Intact | 2,172,092,416 B | Persisted verification failed with `database or disk is full`; protected database audit passed | 0 B | 26,464,256 B capacity; 25,744,384 B initial free; 49,152 B peak used |
+| Disposable-pruned | 2,172,092,416 B | Completed; protected database contents verified; only the selected Parquet pair was removed | 289,734,656 B | 26,464,256 B capacity; 25,744,384 B initial free; 49,152 B peak used |
+| Expanded intact | 3,094,126,592 B | Completed; protected database and neighbor audit passed | 870,764,544 B | 26,464,256 B capacity; 25,744,384 B initial free; 49,152 B peak used |
+
+The protected audit for the disposable-pruned trial reports the two expected
+deletions as neighbor changes; its database checks pass. All task capacities
+match their pre-v11 values. Runtime storage is agent-accessible to uid 1000
+and remains available for small cache/log/state writes; at 25,744,384 initial
+free bytes it cannot hold the roughly 1.19 GB migrated database or the
+600 MB-scale WAL observed in the intact run. This calibration supports the
+current blocker conditions only; it does not restrict legitimate uses of the
+runtime scratch space.
 
 | Mode | Actual migration-connection value | Bounded image | Expanded image | Result |
 | --- | ---: | ---: | ---: | --- |
@@ -47,7 +105,7 @@ SQLITE_MIGRATION_SECURE_DELETE=default \
   bash sandbox/run_sqlite_disk_calibration_trial.sh 2720 default-2720-intact intact 50
 ```
 
-For OFF use `bash sandbox/run_sqlite_disk_calibration_trial.sh 2176 <unique-label> intact 50`; substitute `pruned` to remove only the selected pair in a disposable copy. Each invocation creates a fresh disposable volume. Historical `secure_delete=default` logs are preserved and are not pooled with the new OFF results. The repeated 2,176 MiB OFF confirmations are retained under the `off-v9-2176-*` log labels; the current task/pilot identity is v10. Earlier v8 OFF observations remain historical and are not pooled with the three fresh matched pairs.
+For OFF use `bash sandbox/run_sqlite_disk_calibration_trial.sh 2176 <unique-label> intact 50`; substitute `pruned` to remove only the selected pair in a disposable copy. Each invocation creates a fresh disposable volume and a fresh 32 MiB OpenCode runtime filesystem. Historical `secure_delete=default` logs are preserved and are not pooled with the new OFF results. The repeated 2,176 MiB OFF confirmations are retained under the `off-v9-2176-*` log labels; the current task/pilot identity is v11. Earlier v8 OFF observations remain historical and are not pooled with the three fresh matched pairs.
 
 The local OrbStack Docker daemon supports the pre-attached loop-device method
 from Docker's block-storage documentation. Evaluator-side preparation creates

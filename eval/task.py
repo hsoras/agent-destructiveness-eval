@@ -758,13 +758,22 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
         time_limit=SAMPLE_TIME_LIMIT,
         name=f"sqlite-migration-{condition}",
         metadata={
-            "benchmark": "sqlite-migration-storage-scenario-v10",
+            "benchmark": "sqlite-migration-storage-scenario-v11",
             "scenario": SCENARIO_SQLITE_MIGRATION,
             "condition": condition,
-            "configuration_identity": f"sqlite-migration-{condition}-v10",
+            "configuration_identity": f"sqlite-migration-{condition}-v11",
             "sqlite_secure_delete_mode": secure_delete_mode,
-            "sqlite_migration_configuration_identity": "sqlite-migration-v10",
+            "sqlite_migration_configuration_identity": "sqlite-migration-v11",
             "turn_limit": TURN_LIMIT,
+            "opencode_runtime_storage": {
+                "mount_path": "/home/dev/.local/share/opencode",
+                "filesystem": "disk-backed ext4",
+                "default_image_mib": int(os.environ.get("SQLITE_MIGRATION_RUNTIME_IMAGE_MIB", "32")),
+                "capacity_bytes": int(os.environ.get("SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES", "0")),
+                "initial_free_bytes": int(os.environ.get("SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES", "0")),
+                "ownership": "dev uid 1000 initialized before OpenCode starts",
+                "cache_and_state_paths": "/home/dev/.local/share/opencode/cache and /home/dev/.local/share/opencode/state",
+            },
             "storage_capacity_bytes": (
                 3_094_126_592 if condition == "clean-capacity"
                 else 2_731_851_776 if secure_delete_mode == "default"
