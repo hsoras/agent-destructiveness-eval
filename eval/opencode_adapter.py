@@ -10,9 +10,14 @@ as eval errors, including when OpenCode exits with status zero.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
+import hashlib
+import anyio
 import json
 import os
 import shlex
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Literal, Sequence
@@ -44,6 +49,183 @@ from inspect_swe._opencode.agentbinary import ensure_opencode_setup
 from eval.model_requests import ModelRequestGuard, cli_error_event
 from eval.probes import PROBE_PROMPTS, run_evaluation_probe
 from inspect_ai.agent._bridge.util import resolve_inspect_model
+
+
+_REMOTE_EXEC_PATCH_ID = "inspect-sandbox-tools-1.2.1-remote-exec-retry-trace-v2"
+
+
+def _expected_remote_controller_hash() -> str:
+    controller = (
+        Path(__file__).resolve().parents[1]
+        / "sandbox/inspect_sandbox_tools_patch/_remote_tools/_exec_remote/_controller.py"
+    )
+    return hashlib.sha256(controller.read_bytes()).hexdigest()
+
+
+async def _verify_remote_service_identity(sbox: Any) -> dict[str, Any]:
+    """Require the running daemon to attest its actual patched controller."""
+    expected_hash = _expected_remote_controller_hash()
+    script = r'''import json, os, pathlib, time
+path = pathlib.Path('/var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl')
+deadline = time.monotonic() + 8
+rows = []
+while time.monotonic() < deadline:
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except Exception:
+        rows = []
+    starts = [row for row in rows if row.get('event') == 'service_start']
+    if starts:
+        start = starts[-1]
+        identities = [row for row in rows if row.get('event') == 'service_runtime_identity' and row.get('startup_id') == start.get('startup_id')]
+        if identities:
+            identity = identities[-1]
+            identity['service_started_at'] = start.get('started_at')
+            identity['service_proc_start_ticks'] = start.get('proc_start_ticks')
+            identity['service_pid'] = start.get('service_pid')
+            try:
+                stat = pathlib.Path('/proc') / str(identity['service_pid']) / 'stat'
+                fields = stat.read_text().rsplit(')', 1)[1].split()
+                identity['service_process_alive'] = fields[19] == identity.get('service_proc_start_ticks')
+            except Exception:
+                identity['service_process_alive'] = False
+            print(json.dumps(identity, sort_keys=True))
+            raise SystemExit(0)
+    time.sleep(0.1)
+print(json.dumps({'error': 'no service_runtime_identity event appeared', 'events': [r.get('event') for r in rows[-20:]]}, sort_keys=True))
+raise SystemExit(2)
+'''
+    result = await sbox.exec(["python", "-c", script], user="root", timeout=12)
+    try:
+        identity = json.loads(result.stdout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"remote service identity probe returned invalid output: {result.stdout!r} {result.stderr!r}"
+        ) from exc
+    module_paths = identity.get("module_paths", {})
+    controller_path = module_paths.get(
+        "inspect_sandbox_tools._remote_tools._exec_remote._controller", ""
+    )
+    required_root = "/usr/local/libexec/inspect-sandbox-tools-package/src/inspect_sandbox_tools/"
+    problems = []
+    if result.returncode != 0:
+        problems.append(f"identity probe exit status {result.returncode}")
+    if identity.get("patch_id") != _REMOTE_EXEC_PATCH_ID:
+        problems.append(f"unexpected patch id {identity.get('patch_id')!r}")
+    if identity.get("controller_source_sha256") != expected_hash:
+        problems.append(
+            "controller source hash mismatch "
+            f"(loaded {identity.get('controller_source_sha256')!r}, expected {expected_hash})"
+        )
+    if not controller_path.startswith(required_root):
+        problems.append(f"controller loaded from unexpected path {controller_path!r}")
+    if identity.get("package_version") not in (None, "1.2.1"):
+        problems.append(f"unexpected service package version {identity.get('package_version')!r}")
+    if not identity.get("startup_id") or not identity.get("service_process_alive"):
+        problems.append("service startup identity is missing or its process is no longer alive")
+    if problems:
+        store().set("remote_service_identity", identity)
+        raise RuntimeError("REMOTE_SERVICE_IDENTITY_REJECTED: " + "; ".join(problems))
+    store().set("remote_service_identity", identity)
+    return identity
+
+
+@asynccontextmanager
+async def _captured_sandbox_agent_bridge(sbox: Any, state: AgentState, **kwargs):
+    """Verify service identity and capture failures across bridge entry/body/exit."""
+    try:
+        async with sandbox_agent_bridge(state, **kwargs) as bridge:
+            # OpenCode has not started yet, so this gate runs before any model
+            # request can reach the remote execution service.
+            await _verify_remote_service_identity(sbox)
+            yield bridge
+    except BaseException as error:
+        try:
+            with anyio.CancelScope(shield=True):
+                await _capture_remote_execution_failure(sbox, error)
+        except BaseException as capture_error:
+            try:
+                store().set("remote_execution_failure_capture_error", repr(capture_error))
+            except Exception:
+                pass
+        raise
+
+
+async def _capture_remote_execution_failure(sbox, error: BaseException) -> None:
+    """Save service, process, cgroup, and RPC evidence before Inspect cleanup."""
+    script = r'''
+import json, pathlib, subprocess
+root = pathlib.Path('/var/lib/streamstats-state')
+def read(path):
+    try: return path.read_text(errors='replace')
+    except Exception as exc: return f'<unavailable: {exc!r}>'
+out = {
+    'processes': subprocess.run(['ps','-eo','pid,ppid,stat,lstart,comm','--sort','pid'], capture_output=True, text=True).stdout,
+    'proc1_cgroup': read(pathlib.Path('/proc/1/cgroup')),
+    'memory_current': read(pathlib.Path('/sys/fs/cgroup/memory.current')),
+    'memory_max': read(pathlib.Path('/sys/fs/cgroup/memory.max')),
+    'memory_events': read(pathlib.Path('/sys/fs/cgroup/memory.events')),
+    'lifecycle': read(root/'inspect-sandbox-tools-lifecycle.jsonl'),
+}
+try:
+    lifecycle = (root/'inspect-sandbox-tools-lifecycle.jsonl').read_text(errors='replace')
+except Exception:
+    lifecycle = ''
+for line in lifecycle.splitlines():
+    try:
+        row = json.loads(line)
+    except Exception:
+        continue
+    if row.get('event') == 'service_start' and row.get('server_dir'):
+        server = pathlib.Path(row['server_dir'])
+        out.update({
+            'service_server_dir': str(server),
+            'service_stdout': read(server/'server-stdout.log'),
+            'service_stderr': read(server/'server-stderr.log'),
+            'service_pid_file': read(server/'server.pid'),
+            'service_shutdown_status': read(server/'shutdown-status.json'),
+        })
+        break
+print(json.dumps(out, sort_keys=True))
+'''
+    try:
+        result = await sbox.exec(["python", "-c", script], user="root", timeout=20)
+        capture = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "inspect_host_pid": os.getpid(),
+            "error": repr(error),
+            "capture_exit_code": result.returncode,
+            "capture_output": result.stdout,
+            "capture_stderr": result.stderr,
+        }
+    except Exception as capture_error:
+        capture = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "inspect_host_pid": os.getpid(),
+            "error": repr(error),
+            "capture_error": repr(capture_error),
+        }
+    try:
+        store().set("inspect_remote_execution_failure_capture", capture)
+    except Exception:
+        pass
+    directory = os.environ.get("STREAMSTATS_REMOTE_EXEC_DIAGNOSTICS_DIR")
+    if directory:
+        try:
+            target = Path(directory)
+            target.mkdir(parents=True, exist_ok=True)
+            filename = (
+                "failure-"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                + "-"
+                + uuid.uuid4().hex[:8]
+                + ".json"
+            )
+            (target / filename).write_text(
+                json.dumps(capture, indent=2, sort_keys=True) + "\n"
+            )
+        except Exception:
+            pass
 
 
 @agent
@@ -145,7 +327,9 @@ def opencode(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
-        async with sandbox_agent_bridge(
+        sbox = sandbox_env(sandbox)
+        async with _captured_sandbox_agent_bridge(
+            sbox,
             state,
             model=model,
             model_aliases=model_aliases,
@@ -158,16 +342,21 @@ def opencode(
             # inert unless the CLI declares a native web tool
             web_search=True,
         ) as bridge:
-            # resolve sandbox
-            sbox = sandbox_env(sandbox)
-
             # resolve working directory (home dir if sandbox default is '/')
             agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
 
             # install opencode and its runtime dependencies in sandbox
-            opencode_binary, dependency_bin_dirs = await ensure_opencode_setup(
-                sbox, version, user
+            prepared_opencode = "/opt/opencode/node_modules/.bin/opencode"
+            prepared_check = await sbox.exec(
+                ["sh", "-c", f"test -x {shlex.quote(prepared_opencode)} && node {shlex.quote(prepared_opencode)} --version"],
+                user=user,
             )
+            if prepared_check.success and prepared_check.stdout.strip() == str(version):
+                opencode_binary, dependency_bin_dirs = prepared_opencode, []
+            else:
+                opencode_binary, dependency_bin_dirs = await ensure_opencode_setup(
+                    sbox, version, user
+                )
 
             # combine static mcp configs with bridged tools' mcp servers
             all_mcp_servers = list(mcp_servers or []) + list(bridge.mcp_server_configs)

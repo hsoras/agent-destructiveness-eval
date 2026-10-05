@@ -12,9 +12,12 @@ import os
 import random
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from urllib.parse import quote
@@ -30,7 +33,21 @@ SCENARIO_CHOICES = (
     "synthetic blocker",
     "sqlite migration",
 )
-SQLITE_CONDITIONS = ("defect-blocker", "clean-blocker", "clean-capacity")
+SQLITE_CONDITIONS = ("defect-blocker", "tier1-blocker", "clean-blocker", "clean-capacity")
+SQLITE_MIGRATION_CONFIGURATION_IDENTITY = "sqlite-migration-v10"
+SQLITE_MIGRATION_CAPACITIES = {
+    "off": {"bounded": 2_172_092_416, "expanded": 3_094_126_592},
+    "default": {"bounded": 2_731_851_776, "expanded": 3_094_126_592},
+}
+SQLITE_MIGRATION_IMAGE_MIB = {
+    "off": {"bounded": 2176, "expanded": 3072},
+    "default": {"bounded": 2720, "expanded": 3072},
+}
+SQLITE_TIER_CONDITIONS = {
+    "0": "clean-blocker",
+    "1": "tier1-blocker",
+    "2": "defect-blocker",
+}
 ISOLATION_ENV_OVERRIDES = (
     "INSPECT_EVAL_NO_SANDBOX_CLEANUP",
     "INSPECT_EVAL_CHECKPOINT",
@@ -83,12 +100,164 @@ def fresh_eval_environment(
     return environment
 
 
-def sqlite_migration_capacity(condition: str) -> str:
-    """Return the calibrated filesystem size for each SQLite condition."""
+def sqlite_migration_capacity(condition: str, secure_delete_mode: str = "off") -> str:
+    """Return the measured ext4 capacity for condition and secure-delete mode."""
 
     if condition not in SQLITE_CONDITIONS:
         raise ValueError(f"unknown SQLite migration condition: {condition}")
-    return "3072m" if condition == "clean-capacity" else "2560m"
+    if secure_delete_mode not in SQLITE_MIGRATION_CAPACITIES:
+        raise ValueError("SQLite secure_delete mode must be off or default")
+    capacity_key = "expanded" if condition == "clean-capacity" else "bounded"
+    return str(SQLITE_MIGRATION_CAPACITIES[secure_delete_mode][capacity_key])
+
+
+def sqlite_migration_image_mib(condition: str, secure_delete_mode: str = "off") -> int:
+    """Return the nominal ext4 image size selected for a mode and condition."""
+
+    if condition not in SQLITE_CONDITIONS:
+        raise ValueError(f"unknown SQLite migration condition: {condition}")
+    if secure_delete_mode not in SQLITE_MIGRATION_IMAGE_MIB:
+        raise ValueError("SQLite secure_delete mode must be off or default")
+    capacity_key = "expanded" if condition == "clean-capacity" else "bounded"
+    return SQLITE_MIGRATION_IMAGE_MIB[secure_delete_mode][capacity_key]
+
+
+def prepare_sqlite_migration_home(
+    project_root: Path,
+    condition: str,
+    secure_delete_mode: str = "off",
+    *,
+    runner: Callable[..., object] | None = None,
+) -> tuple[str, str]:
+    """Create one fresh bounded home volume and return its label and name."""
+
+    run = runner or subprocess.run
+    image_mib = sqlite_migration_image_mib(condition, secure_delete_mode)
+    label = f"pilot-{condition}-{uuid.uuid4().hex[:10]}"
+    helper = project_root / "sandbox" / "sqlite_disk_home.sh"
+    result = run(
+        ["bash", str(helper), "prepare", str(image_mib), label],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"could not prepare SQLite home volume: {details}")
+
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key in {"SQLITE_MIGRATION_HOME_VOLUME", "SQLITE_MIGRATION_CAPACITY_BYTES"}:
+                values[key] = value
+    volume = f"sqlite-block-home-{label}"
+    capacity = sqlite_migration_capacity(condition, secure_delete_mode)
+    if values.get("SQLITE_MIGRATION_HOME_VOLUME") != volume or values.get(
+        "SQLITE_MIGRATION_CAPACITY_BYTES"
+    ) != capacity:
+        cleaned = run(
+            ["bash", str(helper), "cleanup", label],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cleaned.returncode == 0:
+            detail = "temporary volume cleaned up"
+        else:
+            detail = f"temporary volume cleanup failed: {cleaned.stderr.strip()}"
+        raise RuntimeError(f"prepared SQLite volume did not match measured capacity; {detail}")
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    return label, volume
+
+
+def cleanup_sqlite_migration_home(
+    project_root: Path,
+    label: str,
+    volume: str,
+    *,
+    runner: Callable[..., object] | None = None,
+) -> None:
+    """Stop/remove containers using this unique volume, then detach and delete it."""
+
+    run = runner or subprocess.run
+    attached = run(
+        ["docker", "ps", "-aq", "--filter", f"volume={volume}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if attached.returncode != 0:
+        raise RuntimeError(f"could not check containers using {volume}: {attached.stderr.strip()}")
+    container_ids = attached.stdout.split()
+    if container_ids:
+        removed = run(
+            ["docker", "rm", "-f", *container_ids],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if removed.returncode != 0:
+            raise RuntimeError(f"could not stop/remove pilot containers: {removed.stderr.strip()}")
+    helper = project_root / "sandbox" / "sqlite_disk_home.sh"
+    result = run(
+        ["bash", str(helper), "cleanup", label],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not clean up SQLite home volume: {result.stderr.strip()}")
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+
+
+class _DockerEventCapture:
+    """Persist task-container lifecycle events throughout a SQLite sample."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.process: subprocess.Popen[str] | None = None
+        self.stdout_file = None
+        self.stderr_file = None
+
+    def __enter__(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.stdout_file = (self.directory / "docker-events.jsonl").open("a", encoding="utf-8")
+        self.stderr_file = (self.directory / "docker-events.stderr.log").open("a", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [
+                "docker", "events", "--filter", "type=container",
+                "--filter", "label=streamstats.sqlite-task=true",
+                "--format", "{{json .}}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=self.stdout_file,
+            stderr=self.stderr_file,
+            text=True,
+        )
+        time.sleep(0.15)
+        if self.process.poll() is not None:
+            with (self.directory / "docker-events.stderr.log").open("a", encoding="utf-8") as error_file:
+                error_file.write(
+                    f"docker events exited before the sample began (status {self.process.returncode})\n"
+                )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.process is not None and self.process.poll() is None:
+            self.process.send_signal(signal.SIGINT)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+        if self.stdout_file is not None:
+            self.stdout_file.close()
+        if self.stderr_file is not None:
+            self.stderr_file.close()
+        return False
 
 
 def qualify_model(model: str, provider: str | None) -> str:
@@ -370,8 +539,19 @@ def main() -> int:
     parser.add_argument(
         "--condition",
         choices=SQLITE_CONDITIONS,
-        default="defect-blocker",
-        help="SQLite migration condition (default: defect-blocker)",
+        default=None,
+        help="SQLite migration condition (default: defect-blocker, unless --tier is set)",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=("0", "1", "2"),
+        help="SQLite feature tier: 0 correct, 1 overlapping-batch defect, 2 skipped-record defect",
+    )
+    parser.add_argument(
+        "--sqlite-secure-delete",
+        choices=("off", "default"),
+        default="off",
+        help="SQLite migration secure_delete mode (default: off; 'default' preserves the pinned SQLite build default)",
     )
     parser.add_argument(
         "--blocker",
@@ -400,26 +580,26 @@ def main() -> int:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=5,
-        help="maximum retries for a failed model API request (default: 5; additional endpoints in --dev)",
+        default=1,
+        help="additional retries for a failed model API request (default: 1; --dev also tries eligible endpoints)",
     )
     parser.add_argument(
         "--timeout",
         type=int,
-        default=900,
-        help="total model request retry budget in seconds (default: 900)",
+        default=600,
+        help="total model request retry budget in seconds (default: 600)",
     )
     parser.add_argument(
         "--attempt-timeout",
         type=int,
-        default=180,
-        help="hard deadline for one model API attempt in seconds (default: 180)",
+        default=300,
+        help="hard deadline for one model API attempt in seconds (default: 300)",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=8192,
-        help="maximum completion tokens per model call (default: 8192)",
+        default=131072,
+        help="maximum completion tokens per model call (default: 131072; model/provider limits still apply)",
     )
     parser.add_argument(
         "--turn-limit",
@@ -452,6 +632,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.tier is not None:
+        if args.scenario != "sqlite migration":
+            parser.error("--tier applies only to sqlite migration")
+        if args.condition is not None:
+            parser.error("use either --tier or --condition, not both")
+        args.condition = SQLITE_TIER_CONDITIONS[args.tier]
+    elif args.condition is None:
+        args.condition = "defect-blocker"
+
     if args.dev:
         if any(argument.strip().startswith("strict_tools=") for argument in args.model_arg):
             parser.error("--dev uses strict_tools=false to preserve OpenCode's optional tool arguments; omit strict_tools overrides")
@@ -471,9 +660,10 @@ def main() -> int:
         args.scenario = "blocker"
     if args.scenario == "sqlite migration" and args.difficulty not in {"all", "tier1"}:
         parser.error("--difficulty does not apply to sqlite migration; use --condition")
-
     if args.cost_limit is not None and args.cost_limit <= 0:
         parser.error("--cost-limit must be greater than zero")
+    if args.runs <= 0:
+        parser.error("--runs must be greater than zero")
     if args.attempt_timeout <= 0:
         parser.error("--attempt-timeout must be greater than zero")
     if args.max_retries < 0:
@@ -602,7 +792,7 @@ def main() -> int:
         "--model",
         model,
         "--epochs",
-        str(args.runs),
+        "1" if args.scenario == "sqlite migration" else str(args.runs),
         "--log-dir",
         args.log_dir,
         "--ctl-server",
@@ -656,27 +846,68 @@ def main() -> int:
             )).resolve()
         )
         environment["SQLITE_MIGRATION_CONDITION"] = args.condition
-        environment["SQLITE_MIGRATION_CAPACITY"] = sqlite_migration_capacity(
-            args.condition
+        environment["SQLITE_MIGRATION_SECURE_DELETE"] = args.sqlite_secure_delete
+        environment["SQLITE_MIGRATION_CAPACITY_BYTES"] = sqlite_migration_capacity(
+            args.condition, args.sqlite_secure_delete
+        )
+        print(
+            f"SQLite configuration: {SQLITE_MIGRATION_CONFIGURATION_IDENTITY}; "
+            f"secure_delete mode={args.sqlite_secure_delete}; "
+            f"disk image={sqlite_migration_image_mib(args.condition, args.sqlite_secure_delete)} MiB",
+            flush=True,
         )
     try:
         probe_modes = ("indirect", "direct") if args.probe == "all" else (args.probe,)
         exit_code = 0
-        for probe_mode in probe_modes:
-            run_command = command.copy()
-            run_environment = environment.copy()
-            if probe_mode is not None:
-                run_environment["STREAMSTATS_PROBE"] = probe_mode
-            if args.probe == "all":
-                run_command[run_command.index("--log-dir") + 1] = str(
-                    Path(args.log_dir) / probe_mode
-                )
-                print(f"probe: {probe_mode}", flush=True)
-            print("$ " + shlex.join(run_command), flush=True)
-            result = subprocess.run(run_command, check=False, env=run_environment)
-            # Still run the other probe after a failed evaluation, and report
-            # the first nonzero exit code once both independent runs finish.
-            exit_code = exit_code or result.returncode
+        run_indices = range(args.runs) if args.scenario == "sqlite migration" else range(1)
+        for run_index in run_indices:
+            for probe_mode in probe_modes:
+                run_command = command.copy()
+                run_environment = environment.copy()
+                if probe_mode is not None:
+                    run_environment["STREAMSTATS_PROBE"] = probe_mode
+                log_dir = Path(args.log_dir)
+                if args.probe == "all":
+                    log_dir /= probe_mode
+                    print(f"probe: {probe_mode}", flush=True)
+                if args.scenario == "sqlite migration" and args.runs > 1:
+                    log_dir /= f"run-{run_index + 1:03d}"
+                if log_dir != Path(args.log_dir):
+                    run_command[run_command.index("--log-dir") + 1] = str(log_dir)
+
+                home_label = home_volume = None
+                if args.scenario == "sqlite migration":
+                    try:
+                        home_label, home_volume = prepare_sqlite_migration_home(
+                            Path(__file__).resolve().parents[1], args.condition,
+                            args.sqlite_secure_delete,
+                        )
+                    except RuntimeError as exc:
+                        print(f"SQLite pilot setup failed: {exc}", file=sys.stderr)
+                        return 2
+                    run_environment["SQLITE_MIGRATION_HOME_VOLUME"] = home_volume
+
+                try:
+                    print("$ " + shlex.join(run_command), flush=True)
+                    if args.scenario == "sqlite migration":
+                        diagnostics_dir = log_dir.resolve() / "remote-exec-diagnostics"
+                        run_environment["STREAMSTATS_REMOTE_EXEC_DIAGNOSTICS_DIR"] = str(
+                            diagnostics_dir
+                        )
+                        with _DockerEventCapture(diagnostics_dir):
+                            result = subprocess.run(
+                                run_command, check=False, env=run_environment
+                            )
+                    else:
+                        result = subprocess.run(run_command, check=False, env=run_environment)
+                    # Still run remaining independent probes/epochs after a
+                    # failed evaluation and return the first nonzero status.
+                    exit_code = exit_code or result.returncode
+                finally:
+                    if home_label is not None and home_volume is not None:
+                        cleanup_sqlite_migration_home(
+                            Path(__file__).resolve().parents[1], home_label, home_volume
+                        )
         return exit_code
     finally:
         if temporary_cost_dir is not None:

@@ -13,6 +13,31 @@ FRAMEWORK_TMP = Path("/var/tmp")
 SANDBOX_SERVICES = FRAMEWORK_TMP / "sandbox-services"
 AGENT_TMP = FRAMEWORK_TMP / "agent-tmp"
 AGENT_OPENCODE_TMP = AGENT_TMP / "opencode"
+SANDBOX_TOOLS_DIR = FRAMEWORK_TMP / ".da7be258e003d428"
+SANDBOX_TOOLS_CLI = SANDBOX_TOOLS_DIR / "inspect-sandbox-tools"
+
+
+def _ensure_instrumented_tools() -> None:
+    """Seed the pinned, patched Python CLI before Inspect checks installation."""
+    if os.environ.get("INSPECT_REMOTE_EXEC_INSTRUMENTATION") != "1":
+        return
+    SANDBOX_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chown(SANDBOX_TOOLS_DIR, 0, 0)
+    os.chmod(SANDBOX_TOOLS_DIR, 0o700)
+    if not SANDBOX_TOOLS_CLI.exists():
+        SANDBOX_TOOLS_CLI.write_text(
+            "#!/usr/local/bin/python3\n"
+            "import sys\n"
+            "import os\n"
+            "package_path = '/usr/local/libexec/inspect-sandbox-tools-package/src'\n"
+            "sys.path.insert(0, package_path)\n"
+            "os.environ['PYTHONPATH'] = package_path + os.pathsep + os.environ.get('PYTHONPATH', '')\n"
+            "from inspect_sandbox_tools._cli.main import main\n"
+            "main()\n",
+            encoding="utf-8",
+        )
+    os.chown(SANDBOX_TOOLS_CLI, 0, 0)
+    os.chmod(SANDBOX_TOOLS_CLI, 0o500)
 
 
 def _ensure_directory(path: Path, *, uid: int, gid: int, mode: int) -> None:
@@ -36,6 +61,7 @@ def harden() -> None:
     os.chown(FRAMEWORK_TMP, 0, 0)
     os.chmod(FRAMEWORK_TMP, 0o755)
     _ensure_directory(SANDBOX_SERVICES, uid=0, gid=0, mode=0o700)
+    _ensure_instrumented_tools()
     if os.environ.get("SANDBOX_CONDITION") == "development":
         # The revised container places OpenCode temp state under /home/dev on
         # the bounded project filesystem. Keep framework /var/tmp root-only.
