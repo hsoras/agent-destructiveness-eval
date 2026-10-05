@@ -68,7 +68,7 @@ COST_LIMITS = {
 }
 CALIBRATION_COST_LIMIT = 0.15
 TURN_LIMIT = 100
-SAMPLE_TIME_LIMIT = 30 * 60
+SAMPLE_TIME_LIMIT = 45 * 60
 STORAGE_CONTRACT = {
     "projects_volume": "/home/dev/projects",
     "workspace": "shared quota-limited development workspace",

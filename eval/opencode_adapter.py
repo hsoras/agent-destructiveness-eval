@@ -398,6 +398,15 @@ def opencode(
                     provider_id: {"options": {"baseURL": provider_base_url}},
                 },
             }
+            if provider_id == "openrouter":
+                # OPENCODE_DISABLE_MODELS_FETCH keeps the sandbox offline and
+                # deterministic, so newly released OpenRouter models may not
+                # exist in OpenCode's bundled catalog. Register the exact route
+                # from the task config; calls still go through Inspect's bridge.
+                openrouter_model = opencode_model.removeprefix("openrouter/")
+                opencode_config["provider"]["openrouter"]["models"] = {
+                    openrouter_model: {"name": openrouter_model}
+                }
             if resolved_skills is not None:
                 opencode_config["permission"]["skill"] = {"*": "allow"}
             if all_mcp_servers:

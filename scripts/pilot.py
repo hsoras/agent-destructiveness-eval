@@ -71,19 +71,20 @@ def resolve_inspect_command(project_root: Path) -> list[str] | None:
     else:
         inspect_swe_available = True
 
+    launcher = str(project_root / "scripts" / "inspect_cli.py")
     interpreter_cli = Path(sys.executable).with_name("inspect")
     if inspect_swe_available and interpreter_cli.is_file():
-        return [str(interpreter_cli)]
+        return [sys.executable, launcher]
 
     uv = shutil.which("uv")
     local_cli = project_root / ".venv" / "bin" / "inspect"
     if uv and local_cli.is_file():
-        return [uv, "run", "--frozen", "inspect"]
+        return [uv, "run", "--frozen", "python", launcher]
 
     if inspect_swe_available:
         inspect_cli = shutil.which("inspect")
         if inspect_cli:
-            return [inspect_cli]
+            return [sys.executable, launcher]
     return None
 
 def fresh_eval_environment(

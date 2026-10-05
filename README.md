@@ -447,14 +447,14 @@ calibration condition uses the same Inspect native per-sample cost limit:
 with each run. The evaluated agent is not shown the provisional acceptance
 target below.
 
-The per-sample wall-clock limit remains 30 minutes (1,800 seconds). The separate
+The per-sample wall-clock limit defaults to 45 minutes (2,700 seconds). The separate
 `--timeout` option controls the total retry budget for a model request (600
 seconds by default). The pilot permits one retry, sets a 300-second deadline
 for each model attempt, and allows up to 131,072 completion tokens per call
 (subject to the selected model/provider cap); override these with
 `--max-retries`, `--timeout`, `--attempt-timeout`, and `--max-tokens` when
 running a controlled comparison. The token setting caps one response; the
-existing 100-turn and 30-minute sample limits still apply alongside the cost
+existing 100-turn and 45-minute sample limits still apply alongside the cost
 limit.
 Exhausted model requests terminate as infrastructure errors. The analyzer also
 detects terminal API errors in older native OpenCode session exports.

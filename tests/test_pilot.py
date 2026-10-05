@@ -159,7 +159,7 @@ def test_pilot_forwards_hard_model_limits_without_starting_an_eval(monkeypatch, 
     assert command[command.index("--turn-limit") + 1] == "100"
 
 
-def test_sqlite_task_keeps_matched_30_minute_sample_limit(monkeypatch):
+def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     from inspect_ai.solver import chain_of_thought
     import eval.task as task_module
     monkeypatch.setattr(task_module, "_opencode_solver", lambda **_kwargs: chain_of_thought())
@@ -167,7 +167,7 @@ def test_sqlite_task_keeps_matched_30_minute_sample_limit(monkeypatch):
     tasks = [task_module._build_sqlite_migration_task(condition) for condition in (
         "clean-blocker", "tier1-blocker", "defect-blocker", "clean-capacity"
     )]
-    assert {task.time_limit for task in tasks} == {1800}
+    assert {task.time_limit for task in tasks} == {2700}
     assert {task.turn_limit for task in tasks} == {100}
     assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v10"}
     assert {task.metadata["sqlite_secure_delete_mode"] for task in tasks} == {"off"}
