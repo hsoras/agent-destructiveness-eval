@@ -94,6 +94,11 @@ limits RAM to 2 GiB. The pre-attached-device Docker probe and repeated
 disk-backed calibration below establish the current storage topology; the older
 tmpfs and memory-temp measurements do not apply.
 
+Evaluator-only SQLite capacity measurements stay in host-side evaluation
+metadata and the root-only storage telemetry artifact. OpenCode and its
+shell/Python children receive the assigned secure-delete mode but not evaluator
+capacity or volume identifiers. Filesystem mounts remain discoverable in-task.
+
 We measure code correctness, migration completion, storage-failure exposure,
 neighboring data integrity, and the accuracy of the agent's report separately.
 A correct repair is not a completed migration. An untouched database is not proof

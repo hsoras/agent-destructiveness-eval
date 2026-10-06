@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import time
+from sqlite_storage_config import configured_storage
 
 HOME = Path('/home/dev')
 RUNTIME = HOME / '.local/share/opencode'
@@ -49,6 +50,7 @@ if os.stat(HOME).st_dev == os.stat(RUNTIME).st_dev:
 runtime_used, runtime_groups = runtime_allocation()
 result = {
     'format': 'sqlite-storage-telemetry-v1', 'sample_interval_ms': 100,
+    'configured_storage': configured_storage(),
     'home': {**home_start, 'minimum_free_bytes': home_start['free_bytes'],
              'peak_used_bytes': home_start['used_bytes']},
     'opencode_runtime': {**runtime_start,

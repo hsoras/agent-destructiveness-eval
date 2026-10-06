@@ -53,6 +53,13 @@ v10 defaults to `SQLITE_MIGRATION_SECURE_DELETE=off`; its actual migration value
 is 0. `default` leaves the pragma unset and the pinned SQLite build reports 1.
 OFF uses the calibrated 2,176 MiB bounded image; build-default/ON retains its historical 2,720 MiB bounded image. Both use the 3,072 MiB expanded control.
 
+Evaluator-only task/runtime capacities, runtime image sizing, and initial free
+space are retained in host-side task metadata and root-only storage telemetry.
+They are provided to the isolated filesystem check/telemetry service, not the
+agent container environment. Remote tool subprocesses filter evaluator SQLite
+settings and Inspect tracing paths while retaining the assigned
+`SQLITE_MIGRATION_SECURE_DELETE` setting. Filesystem mounts remain discoverable.
+
 Three fresh OFF intact trials at 2,176 MiB failed the required persisted
 verification with a real disk-full error after commit; independently reopened
 outputs were logically correct and all neighbor files remained intact. Three

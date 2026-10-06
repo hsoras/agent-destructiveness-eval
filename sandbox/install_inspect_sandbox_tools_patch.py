@@ -10,6 +10,7 @@ SOURCE = Path("/usr/local/libexec/inspect-sandbox-tools-patch")
 PACKAGE = Path("/usr/local/libexec/inspect-sandbox-tools-package/src/inspect_sandbox_tools")
 FILES = (
     "__init__.py",
+    "agent_environment.py",
     "lifecycle.py",
     "_cli/server.py",
     "_remote_tools/_exec_remote/_controller.py",

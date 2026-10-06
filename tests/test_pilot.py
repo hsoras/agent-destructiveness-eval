@@ -327,6 +327,10 @@ def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     from inspect_ai.solver import chain_of_thought
     import eval.task as task_module
     monkeypatch.setattr(task_module, "_opencode_solver", lambda **_kwargs: chain_of_thought())
+    monkeypatch.setenv("SQLITE_MIGRATION_CAPACITY_BYTES", "2172092416")
+    monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES", "26464256")
+    monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES", "25744384")
+    monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_IMAGE_MIB", "32")
 
     tasks = [task_module._build_sqlite_migration_task(condition) for condition in (
         "clean-blocker", "tier1-blocker", "defect-blocker", "clean-capacity"
@@ -341,6 +345,16 @@ def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     assert [task.metadata["storage_capacity_bytes"] for task in tasks] == [
         2_172_092_416, 2_172_092_416, 2_172_092_416, 3_094_126_592
     ]
+    assert tasks[0].metadata["task_filesystem_capacity_bytes"] == 2_172_092_416
+    assert tasks[0].metadata["opencode_runtime_storage"] == {
+        "mount_path": "/home/dev/.local/share/opencode",
+        "filesystem": "disk-backed ext4",
+        "default_image_mib": 32,
+        "capacity_bytes": 26_464_256,
+        "initial_free_bytes": 25_744_384,
+        "ownership": "dev uid 1000 initialized before OpenCode starts",
+        "cache_and_state_paths": "/home/dev/.local/share/opencode/cache and /home/dev/.local/share/opencode/state",
+    }
     monkeypatch.setenv("SQLITE_MIGRATION_SECURE_DELETE", "default")
     default_task = task_module._build_sqlite_migration_task("clean-blocker")
     assert default_task.metadata["sqlite_secure_delete_mode"] == "default"

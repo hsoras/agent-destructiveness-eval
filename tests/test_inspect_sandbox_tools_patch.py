@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shlex
+import sys
 
 import pytest
 
 pytest.importorskip("inspect_sandbox_tools")
 
 from inspect_sandbox_tools._remote_tools._exec_remote._controller import Controller
+from inspect_sandbox_tools._remote_tools._exec_remote._job import Job
 from inspect_sandbox_tools.lifecycle import start_service
 
 
@@ -76,3 +80,46 @@ def test_killed_job_records_exit_status_and_removal_reason(tmp_path, monkeypatch
         row["event"] == "job_removed" and row["removal_reason"] == "explicit_kill"
         for row in records
     )
+
+
+def test_remote_bash_and_python_children_do_not_inherit_evaluator_storage_env(monkeypatch):
+    hidden = (
+        "SQLITE_MIGRATION_CAPACITY_BYTES",
+        "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES",
+        "SQLITE_MIGRATION_RUNTIME_IMAGE_MIB",
+        "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES",
+        "SQLITE_MIGRATION_HOME_VOLUME",
+        "SQLITE_MIGRATION_RUNTIME_VOLUME",
+        "SQLITE_MIGRATION_ARTIFACT_ROOT",
+        "SQLITE_MIGRATION_CONDITION",
+        "INSPECT_SANDBOX_TOOLS_DIR",
+        "INSPECT_SANDBOX_TOOLS_EVENT_LOG",
+        "INSPECT_REMOTE_EXEC_INSTRUMENTATION",
+        "STREAMSTATS_REMOTE_EXEC_DIAGNOSTICS_DIR",
+    )
+    for name in hidden:
+        monkeypatch.setenv(name, "evaluator-value")
+    monkeypatch.setenv("SQLITE_MIGRATION_SECURE_DELETE", "off")
+
+    code = (
+        "import json, os; names = " + repr(hidden)
+        + "; print(json.dumps({name: name in os.environ for name in names})); "
+        + "assert all(name not in os.environ for name in names); "
+        + "assert os.environ['SQLITE_MIGRATION_SECURE_DELETE'] == 'off'"
+    )
+    inner_command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    command = f"bash -c {shlex.quote(inner_command)}"
+
+    async def scenario():
+        job = await Job.create(
+            command,
+            env={name: "explicit-evaluator-value" for name in hidden},
+        )
+        assert await job._process.wait() == 0
+        await job._stdout_task
+        await job._stderr_task
+        stdout, stderr = job._drain_buffers()
+        assert stderr == ""
+        assert json.loads(stdout) == {name: False for name in hidden}
+
+    asyncio.run(scenario())

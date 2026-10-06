@@ -18,6 +18,8 @@ from inspect_sandbox_tools._util.user_switch import (
     make_preexec,
 )
 
+from inspect_sandbox_tools.agent_environment import agent_subprocess_environment
+
 from ._acked_chunk_buffer import AckedChunkBuffer
 from ._output_buffer import BoundedByteBuffer, DecodingBuffer
 from .tool_types import PollResult
@@ -84,10 +86,12 @@ class Job:
 
         # Merge additional env vars with current environment if provided.
         # When switching user, set HOME from /etc/passwd to match docker exec --user.
-        subprocess_env: dict[str, str] | None = {**os.environ, **env} if env else None
+        # Docker exec and explicit env mappings both inherit the tool server's
+        # process environment. Strip evaluator measurements at this boundary so
+        # OpenCode and every shell/Python child cannot inspect them. The secure
+        # delete mode remains available to the assigned migration runner.
+        subprocess_env = agent_subprocess_environment(os.environ, env)
         if user is not None:
-            if subprocess_env is None:
-                subprocess_env = {**os.environ}
             subprocess_env["HOME"] = get_home_dir(user)
 
         process = await asyncio.create_subprocess_shell(

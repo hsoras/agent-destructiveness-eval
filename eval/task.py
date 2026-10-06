@@ -785,6 +785,9 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
                 else 2_731_851_776 if secure_delete_mode == "default"
                 else 2_172_092_416
             ),
+            "task_filesystem_capacity_bytes": int(
+                os.environ.get("SQLITE_MIGRATION_CAPACITY_BYTES", "0")
+            ),
             "storage_capacity_status": (
                 "off_mode_2176_mib_required_verification_enospc_intact_three_pruned_pairs_passed"
                 if secure_delete_mode == "off"

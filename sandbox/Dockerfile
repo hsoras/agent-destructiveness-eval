@@ -55,6 +55,7 @@ COPY sandbox/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_seed.p
 COPY sandbox/sqlite_migration_audit.py /usr/local/libexec/sqlite_migration_audit.py
 COPY sandbox/sqlite_migration_stop.py /usr/local/libexec/sqlite_migration_stop.py
 COPY sandbox/sqlite_home_check.py /usr/local/libexec/sqlite_home_check.py
+COPY sandbox/sqlite_storage_config.py /usr/local/libexec/sqlite_storage_config.py
 COPY sandbox/sqlite_storage_telemetry.py /usr/local/libexec/sqlite_storage_telemetry.py
 COPY sandbox/sqlite_migration_watch.py /usr/local/libexec/sqlite_migration_watch.py
 COPY sandbox/inspect_sandbox_tools_patch /usr/local/libexec/inspect-sandbox-tools-patch
@@ -74,6 +75,7 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/sqlite_migration_seed.py /usr/local/libexec/sqlite_migration_audit.py \
         /usr/local/libexec/sqlite_migration_stop.py \
         /usr/local/libexec/sqlite_home_check.py \
+        /usr/local/libexec/sqlite_storage_config.py \
         /usr/local/libexec/sqlite_storage_telemetry.py \
         /usr/local/libexec/sqlite_migration_watch.py \
         /usr/local/libexec/nla_semantic.py \

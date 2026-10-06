@@ -34,6 +34,19 @@ Every SQLite sample receives a fresh disk-backed ext4 filesystem image (default 
 
 OpenCode's XDG cache and state roots live under `/home/dev/.local/share/opencode/cache` and `/home/dev/.local/share/opencode/state`. Its `TMPDIR` is `/home/dev/.local/share/opencode/tmp`, within the same runtime ext4. The task service keeps `TMPDIR=/home/dev/tmp`, so both projects, the migration database, and SQLite temporary files remain on the bounded task filesystem. The runtime volume is shared with the `dev` user; it is not reserved for the harness. Its default capacity is below the migration database size and cannot hold that database. Sample score metadata and calibration logs report peak use for each filesystem separately.
 
+Evaluator-only capacity measurements are not placed in the `default` task
+container environment. The host pilot retains prepared task/runtime capacities,
+runtime image size, and initial free bytes in evaluation metadata; the isolated
+root-only `sqlite-storage-watch` service receives the measurements for its
+prelaunch filesystem check and records configured values plus sampled usage in
+`sqlite-storage-telemetry.json`. The artifact seeder keeps its own artifact
+root and condition settings. The remote-tool launcher filters all
+`SQLITE_MIGRATION_*` variables except `SQLITE_MIGRATION_SECURE_DELETE`, which
+the assigned migration runner needs, along with tool-server paths and tracing
+settings, from OpenCode and every agent shell/Python subprocess. This removes
+environment cues; filesystem mounts and their capacity remain discoverable
+through ordinary filesystem inspection.
+
 The `sqlite_runtime_full_disk_smoke` task and `python scripts/sqlite_runtime_full_disk_smoke.py` exercise the real OpenCode lifecycle with a local mock model: fill a 32 MiB task disk, save the first tool result, execute a second turn, save eight 32 KiB tool outputs, finish, and export the readable native transcript. It makes no paid model requests.
 
 The v11 real-container smoke left 1 MiB free on its small task filesystem so

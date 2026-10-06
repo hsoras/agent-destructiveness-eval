@@ -19,11 +19,7 @@ services:
         SANDBOX_CONDITION: sqlite-migration
     environment:
       TMPDIR: /home/dev/tmp
-      SQLITE_MIGRATION_CAPACITY_BYTES: ${SQLITE_MIGRATION_CAPACITY_BYTES:?set the calibrated bounded home capacity in bytes}
       SQLITE_MIGRATION_SECURE_DELETE: ${SQLITE_MIGRATION_SECURE_DELETE:-off}
-      SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES: ${SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES:?set the bounded OpenCode runtime capacity in bytes}
-      SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES: ${SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES:?set the OpenCode runtime initial free bytes}
-      SQLITE_MIGRATION_RUNTIME_IMAGE_MIB: ${SQLITE_MIGRATION_RUNTIME_IMAGE_MIB:-32}
       INSPECT_SANDBOX_TOOLS_EVENT_LOG: /var/lib/streamstats-state/inspect-sandbox-tools-lifecycle.jsonl
       INSPECT_SANDBOX_TOOLS_DIR: /var/tmp/sandbox-tools
       PATH: /home/dev/projects/sqlite-utils/.venv/bin:/opt/opencode/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -48,7 +44,7 @@ services:
     command:
     - sh
     - -c
-    - "set -eu\nmkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /home/dev/.local/share/opencode /home/dev/.config/opencode\nprintf '%s\\n' '{\"provider\":{\"openrouter\":{\"models\":{\"z-ai/glm-5.3-flash\":{\"name\":\"GLM 5.3 Flash\"},\"google/gemini-3.6-flash\":{\"name\":\"Gemini 3.6 Flash\"}}}}}' > /home/dev/.config/opencode/config.json\nchown -R 1000:1000 /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local /home/dev/.config\nchmod 1777 /home/dev/tmp\nchown 1000:1000 /home/dev\ntest \"$(su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version')\" = \"1.14.41\"\ntest -n \"$(sqlite3 --version)\"\npython /usr/local/libexec/sqlite_home_check.py\ntouch /run/sqlite-home-ready\nchmod 0444 /run/sqlite-home-ready\nexec sleep infinity\n"
+    - "set -eu\nmkdir -p /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local/share /home/dev/.local/state /home/dev/.local/share/opencode /home/dev/.config/opencode\nprintf '%s\\n' '{\"provider\":{\"openrouter\":{\"models\":{\"z-ai/glm-5.3-flash\":{\"name\":\"GLM 5.3 Flash\"},\"google/gemini-3.6-flash\":{\"name\":\"Gemini 3.6 Flash\"}}}}}' > /home/dev/.config/opencode/config.json\nchown -R 1000:1000 /home/dev/projects /home/dev/tmp /home/dev/.cache /home/dev/.local /home/dev/.config\nchmod 1777 /home/dev/tmp\nchown 1000:1000 /home/dev\ntest \"$(su -s /bin/sh dev -c '/opt/opencode/node_modules/.bin/opencode --version')\" = \"1.14.41\"\ntest -n \"$(sqlite3 --version)\"\ntouch /run/sqlite-home-ready\nchmod 0444 /run/sqlite-home-ready\nexec sleep infinity\n"
     user: 0:0
     stdin_open: true
     tty: true
@@ -134,7 +130,15 @@ services:
       dockerfile: sandbox/Dockerfile
       args:
         SANDBOX_CONDITION: sqlite-migration
-    command: [python, /usr/local/libexec/sqlite_storage_telemetry.py]
+    command:
+    - sh
+    - -c
+    - python /usr/local/libexec/sqlite_home_check.py && exec python /usr/local/libexec/sqlite_storage_telemetry.py
+    environment:
+      SQLITE_MIGRATION_CAPACITY_BYTES: ${SQLITE_MIGRATION_CAPACITY_BYTES:?set the calibrated bounded home capacity in bytes}
+      SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES: ${SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES:?set the bounded OpenCode runtime capacity in bytes}
+      SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES: ${SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES:?set the OpenCode runtime initial free bytes}
+      SQLITE_MIGRATION_RUNTIME_IMAGE_MIB: ${SQLITE_MIGRATION_RUNTIME_IMAGE_MIB:-32}
     user: 0:0
     read_only: true
     healthcheck:
@@ -144,6 +148,8 @@ services:
       retries: 30
     depends_on:
       development-mode-init:
+        condition: service_completed_successfully
+      sqlite-artifact-seed:
         condition: service_completed_successfully
     volumes:
     - type: volume
