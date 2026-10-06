@@ -607,17 +607,32 @@ def main() -> int:
         metavar="NAME",
         help="OpenRouter quantization filter; may be repeated, e.g. fp4",
     )
-    parser.add_argument(
-        "--privacy",
-        action="store_true",
-        help="require no provider data collection and Zero Data Retention",
+    privacy = parser.add_mutually_exclusive_group()
+    privacy.add_argument(
+        "--privacy", dest="privacy", action="store_true", default=True,
+        help="require no provider data collection and Zero Data Retention (default)",
+    )
+    privacy.add_argument(
+        "--no-privacy", dest="privacy", action="store_false",
+        help="allow provider data collection on pinned routes (incompatible with --dev)",
     )
     parser.add_argument("--runs", type=int, default=1, help="independent epochs per tier")
+    parser.add_argument(
+        "--display",
+        choices=("full", "conversation", "rich", "plain", "log", "none"),
+        default="conversation",
+        help="Inspect terminal display (default: conversation; use 'full' for progress display)",
+    )
     parser.add_argument(
         "--probe",
         choices=("indirect", "direct", "all"),
         default=None,
-        help="tool-free follow-up after completion; all launches independent indirect and direct runs",
+        help="deprecated compatibility flag; awareness probes use one original trajectory and run by default",
+    )
+    parser.add_argument(
+        "--no-awareness-probes",
+        action="store_true",
+        help="disable post-run neutral/direct awareness diagnostics",
     )
     parser.add_argument(
         "--difficulty",
@@ -627,8 +642,8 @@ def main() -> int:
     parser.add_argument(
         "--scenario",
         choices=SCENARIO_CHOICES,
-        default="development container",
-        help="scenario label (default: development container)",
+        default="sqlite migration",
+        help="scenario label (default: sqlite migration)",
     )
     parser.add_argument(
         "--condition",
@@ -741,6 +756,8 @@ def main() -> int:
         args.condition = "defect-blocker"
 
     if args.dev:
+        if not args.privacy:
+            parser.error("--dev requires privacy routing; --no-privacy is incompatible")
         if any(argument.strip().startswith("strict_tools=") for argument in args.model_arg):
             parser.error("--dev uses strict_tools=false to preserve OpenCode's optional tool arguments; omit strict_tools overrides")
         if args.openrouter_provider or any(
@@ -822,6 +839,9 @@ def main() -> int:
         if any(argument.strip().startswith("provider=") for argument in args.model_arg):
             parser.error("use --privacy or --model-arg provider=..., not both")
         args.model_arg.insert(0, openrouter_privacy_arg())
+
+    if not any(argument.partition("=")[0].strip() == "strict_tools" for argument in args.model_arg):
+        args.model_arg.append("strict_tools=false")
 
     inspect_command = resolve_inspect_command(Path(__file__).resolve().parents[1])
     if inspect_command is None:
@@ -911,6 +931,8 @@ def main() -> int:
         "--turn-limit",
         str(args.turn_limit),
         "--cache=false",
+        "--display",
+        args.display,
     ])
     if args.cost_limit is not None:
         command.extend(["--cost-limit", str(args.cost_limit)])
@@ -932,6 +954,7 @@ def main() -> int:
     environment = fresh_eval_environment()
     environment.pop("STREAMSTATS_PROBE", None)
     environment.pop("STREAMSTATS_DEV_ROUTES", None)
+    environment["STREAMSTATS_AWARENESS_PROBES"] = "0" if args.no_awareness_probes else "1"
     if args.dev:
         environment["STREAMSTATS_DEV_ROUTES"] = json.dumps(dev_routes)
     # The task solver receives the same fully-qualified route that Inspect uses
@@ -958,90 +981,138 @@ def main() -> int:
             flush=True,
         )
     try:
-        probe_modes = ("indirect", "direct") if args.probe == "all" else (args.probe,)
+        if args.probe is not None:
+            print("--probe is deprecated; using the default awareness diagnostics without adding trajectories")
         exit_code = 0
         run_indices = range(args.runs) if args.scenario == "sqlite migration" else range(1)
         for run_index in run_indices:
-            for probe_mode in probe_modes:
-                run_command = command.copy()
-                run_environment = environment.copy()
-                if probe_mode is not None:
-                    run_environment["STREAMSTATS_PROBE"] = probe_mode
-                log_dir = Path(args.log_dir)
-                if args.probe == "all":
-                    log_dir /= probe_mode
-                    print(f"probe: {probe_mode}", flush=True)
-                if args.scenario == "sqlite migration" and args.runs > 1:
-                    log_dir /= f"run-{run_index + 1:03d}"
-                if log_dir != Path(args.log_dir):
-                    run_command[run_command.index("--log-dir") + 1] = str(log_dir)
+            run_command = command.copy()
+            run_environment = environment.copy()
+            log_dir = Path(args.log_dir)
+            if args.scenario == "sqlite migration" and args.runs > 1:
+                log_dir /= f"run-{run_index + 1:03d}"
+            if log_dir != Path(args.log_dir):
+                run_command[run_command.index("--log-dir") + 1] = str(log_dir)
+            logs_before = set(log_dir.rglob("*.eval")) if log_dir.exists() else set()
 
-                home_label = home_volume = None
-                runtime_label = runtime_volume = None
+            home_label = home_volume = None
+            runtime_label = runtime_volume = None
+            if args.scenario == "sqlite migration":
+                try:
+                    home_label, home_volume = prepare_sqlite_migration_home(
+                        Path(__file__).resolve().parents[1], args.condition,
+                        args.sqlite_secure_delete,
+                    )
+                    runtime_label, runtime_volume, runtime_capacity, runtime_free = (
+                        prepare_opencode_runtime_disk(
+                            Path(__file__).resolve().parents[1],
+                            args.opencode_runtime_image_mib,
+                        )
+                    )
+                except RuntimeError as exc:
+                    if runtime_label is not None:
+                        cleanup_opencode_runtime_disk(
+                            Path(__file__).resolve().parents[1], runtime_label
+                        )
+                    if home_label is not None and home_volume is not None:
+                        cleanup_sqlite_migration_home(
+                            Path(__file__).resolve().parents[1], home_label, home_volume
+                        )
+                    print(f"SQLite pilot setup failed: {exc}", file=sys.stderr)
+                    return 2
+                run_environment["SQLITE_MIGRATION_HOME_VOLUME"] = home_volume
+                run_environment["SQLITE_MIGRATION_RUNTIME_VOLUME"] = runtime_volume
+                run_environment["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] = str(runtime_capacity)
+                run_environment["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"] = str(runtime_free)
+                run_environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = str(args.opencode_runtime_image_mib)
+
+            try:
+                print("$ " + shlex.join(run_command), flush=True)
                 if args.scenario == "sqlite migration":
-                    try:
-                        home_label, home_volume = prepare_sqlite_migration_home(
-                            Path(__file__).resolve().parents[1], args.condition,
-                            args.sqlite_secure_delete,
+                    diagnostics_dir = log_dir.resolve() / "remote-exec-diagnostics"
+                    run_environment["STREAMSTATS_REMOTE_EXEC_DIAGNOSTICS_DIR"] = str(
+                        diagnostics_dir
+                    )
+                    with _DockerEventCapture(diagnostics_dir):
+                        result = subprocess.run(
+                            run_command, check=False, env=run_environment
                         )
-                        runtime_label, runtime_volume, runtime_capacity, runtime_free = (
-                            prepare_opencode_runtime_disk(
-                                Path(__file__).resolve().parents[1],
-                                args.opencode_runtime_image_mib,
+                else:
+                    result = subprocess.run(run_command, check=False, env=run_environment)
+                exit_code = exit_code or result.returncode
+            finally:
+                try:
+                    if runtime_label is not None:
+                        try:
+                            export_opencode_runtime_session(
+                                Path(__file__).resolve().parents[1], runtime_label,
+                                log_dir / "opencode-runtime-session-export.json",
                             )
-                        )
-                    except RuntimeError as exc:
-                        if runtime_label is not None:
+                        except Exception as exc:
+                            print(f"native OpenCode transcript export failed: {exc}", file=sys.stderr, flush=True)
+                        finally:
                             cleanup_opencode_runtime_disk(
                                 Path(__file__).resolve().parents[1], runtime_label
                             )
-                        if home_label is not None and home_volume is not None:
-                            cleanup_sqlite_migration_home(
-                                Path(__file__).resolve().parents[1], home_label, home_volume
-                            )
-                        print(f"SQLite pilot setup failed: {exc}", file=sys.stderr)
-                        return 2
-                    run_environment["SQLITE_MIGRATION_HOME_VOLUME"] = home_volume
-                    run_environment["SQLITE_MIGRATION_RUNTIME_VOLUME"] = runtime_volume
-                    run_environment["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] = str(runtime_capacity)
-                    run_environment["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"] = str(runtime_free)
-                    run_environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = str(args.opencode_runtime_image_mib)
-
-                try:
-                    print("$ " + shlex.join(run_command), flush=True)
-                    if args.scenario == "sqlite migration":
-                        diagnostics_dir = log_dir.resolve() / "remote-exec-diagnostics"
-                        run_environment["STREAMSTATS_REMOTE_EXEC_DIAGNOSTICS_DIR"] = str(
-                            diagnostics_dir
-                        )
-                        with _DockerEventCapture(diagnostics_dir):
-                            result = subprocess.run(
-                                run_command, check=False, env=run_environment
-                            )
-                    else:
-                        result = subprocess.run(run_command, check=False, env=run_environment)
-                    # Still run remaining independent probes/epochs after a
-                    # failed evaluation and return the first nonzero status.
-                    exit_code = exit_code or result.returncode
                 finally:
+                    if home_label is not None and home_volume is not None:
+                        cleanup_sqlite_migration_home(
+                            Path(__file__).resolve().parents[1], home_label, home_volume
+                        )
+            if not args.no_awareness_probes:
+                new_logs = sorted(
+                    path for path in (set(log_dir.rglob("*.eval")) - logs_before)
+                    if path.is_file()
+                )
+                for eval_log in new_logs:
+                    helper = Path(__file__).resolve().with_name("run_awareness_probes.py")
+                    if inspect_command[0] == "uv":
+                        python_command = [*inspect_command[:4], str(helper)]
+                    elif len(inspect_command) > 1 and inspect_command[1].endswith("inspect_cli.py"):
+                        python_command = [inspect_command[0], str(helper)]
+                    else:
+                        python_command = [sys.executable, str(helper)]
+                    probe_command = [
+                        *python_command, "--eval-log", str(eval_log),
+                        "--model", model,
+                        "--original-settings-json", json.dumps({
+                            "max_retries": args.max_retries,
+                            "timeout_seconds": args.timeout,
+                            "attempt_timeout_seconds": args.attempt_timeout,
+                            "max_tokens": args.max_tokens,
+                            "turn_limit": args.turn_limit,
+                            "cost_limit_usd": args.cost_limit,
+                        }),
+                        "--cost-budget", "0.25",
+                        "--elapsed-budget", "600",
+                    ]
+                    for model_arg in args.model_arg:
+                        probe_command.extend(["--model-arg", model_arg])
+                    if model_cost_config is not None:
+                        probe_command.extend(["--model-cost-config", str(model_cost_config)])
                     try:
-                        if runtime_label is not None:
-                            try:
-                                export_opencode_runtime_session(
-                                    Path(__file__).resolve().parents[1], runtime_label,
-                                    log_dir / "opencode-runtime-session-export.json",
-                                )
-                            except Exception as exc:
-                                print(f"native OpenCode transcript export failed: {exc}", file=sys.stderr, flush=True)
-                            finally:
-                                cleanup_opencode_runtime_disk(
-                                    Path(__file__).resolve().parents[1], runtime_label
-                                )
-                    finally:
-                        if home_label is not None and home_volume is not None:
-                            cleanup_sqlite_migration_home(
-                                Path(__file__).resolve().parents[1], home_label, home_volume
+                        probe_result = subprocess.run(
+                            probe_command, check=False, env=run_environment,
+                            capture_output=True, text=True,
+                        )
+                        if probe_result.stdout:
+                            print(probe_result.stdout, end="", flush=True)
+                        if probe_result.stderr:
+                            print(probe_result.stderr, end="", file=sys.stderr, flush=True)
+                        if probe_result.returncode:
+                            print(
+                                f"awareness diagnostics failed for {eval_log} (exit {probe_result.returncode}); original evaluation outcome is unchanged",
+                                file=sys.stderr, flush=True,
                             )
+                            print(f"awareness JSON: {eval_log.with_suffix('.awareness.json')}", flush=True)
+                            print(f"awareness report: {eval_log.with_suffix('.awareness.md')}", flush=True)
+                    except Exception as exc:
+                        print(
+                            f"awareness diagnostics failed for {eval_log}: {type(exc).__name__}: {exc}; original evaluation outcome is unchanged",
+                            file=sys.stderr, flush=True,
+                        )
+                        print(f"awareness JSON: {eval_log.with_suffix('.awareness.json')}", flush=True)
+                        print(f"awareness report: {eval_log.with_suffix('.awareness.md')}", flush=True)
         return exit_code
     finally:
         if temporary_cost_dir is not None:

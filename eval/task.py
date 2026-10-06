@@ -38,7 +38,7 @@ from eval.opencode_config import (
     runtime_metadata,
 )
 from eval.scorer import blocker_validation, repository_repaired, sqlite_migration_validation
-from eval.probes import configured_probe
+from eval.probes import configured_awareness_probes
 
 
 NO_BLOCKER_SANDBOX_CONFIG = ("docker", str(REPO_ROOT / "sandbox/compose.legacy.yaml"))
@@ -122,6 +122,7 @@ def _opencode_solver(
     model: str | None = None,
     opencode_model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    awareness_condition: str | None = None,
 ):
     """Build the supported Inspect SWE OpenCode agent.
 
@@ -156,7 +157,8 @@ def _opencode_solver(
     elif scenario == SCENARIO_SQLITE_MIGRATION:
         runtime_env.update({"TMPDIR": "/home/dev/tmp"})
     return opencode(
-        probe=configured_probe(),
+        awareness_enabled=configured_awareness_probes(),
+        awareness_condition=awareness_condition,
         attempts=1,
         model=None,
         opencode_model=opencode_model or configured_opencode_model(model),
@@ -187,7 +189,7 @@ def _runtime_metadata(*, scenario: str, model: str | None, cost_limit: float) ->
                 else "/home/dev/projects/streamstats"
             ),
             "turn_limit": TURN_LIMIT,
-            "probe": configured_probe(),
+            "awareness_probes_enabled": configured_awareness_probes(),
             "time_limit": SAMPLE_TIME_LIMIT,
             "cost_limit_usd": cost_limit,
             "inspect_ai_version": INSPECT_AI_VERSION,
@@ -750,7 +752,11 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
         raise ValueError("invalid SQLITE_MIGRATION_SECURE_DELETE mode")
     return Task(
         dataset=[sample],
-        solver=_opencode_solver(scenario=SCENARIO_SQLITE_MIGRATION, model=opencode_model),
+        solver=_opencode_solver(
+            scenario=SCENARIO_SQLITE_MIGRATION,
+            model=opencode_model,
+            awareness_condition=condition,
+        ),
         scorer=sqlite_migration_validation(condition=condition),
         sandbox=SQLITE_MIGRATION_SANDBOX_CONFIG,
         turn_limit=TURN_LIMIT,
@@ -801,6 +807,13 @@ def _build_sqlite_migration_task(condition: str, *, opencode_model: str | None =
                 else "validator_completes"
             ),
             "sample_cost_limit_usd": CALIBRATION_COST_LIMIT,
+            "awareness_probes_enabled": configured_awareness_probes(),
+            "awareness_diagnostic_budget": {
+                "max_calls_per_sample": 4,
+                "max_output_tokens_per_call": 512,
+                "cost_budget_usd": 0.25,
+                "per_call_timeout_seconds": 120,
+            },
             "isolation_contract": ISOLATION_CONTRACT,
             "reasoning_configuration": _runtime_metadata(
                 scenario=SCENARIO_SQLITE_MIGRATION,

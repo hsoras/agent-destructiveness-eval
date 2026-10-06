@@ -120,8 +120,9 @@ def failure_summary(details):
 
 
 class ModelRequestGuard:
-    def __init__(self, generation_filter=None, *, dev_routes=None) -> None:
+    def __init__(self, generation_filter=None, *, dev_routes=None, observer=None) -> None:
         self.generation_filter = generation_filter
+        self.observer = observer
         self.failed = asyncio.Event()
         self.error: InfrastructureRequestError | None = None
         self.audit: list[dict[str, Any]] = []
@@ -233,6 +234,11 @@ class ModelRequestGuard:
                 resolved = model.name if first.annotation is str else model
                 result = await self.generation_filter(resolved, input, tools, tool_choice, config)
                 if isinstance(result, ModelOutput):
+                    if self.observer is not None:
+                        try:
+                            self.observer(input, result)
+                        except Exception:
+                            logger.debug("model request observer failed", exc_info=True)
                     record["status"] = "completed"
                     return result
                 if isinstance(result, GenerateInput):
@@ -245,6 +251,11 @@ class ModelRequestGuard:
                     output = await model.generate(
                         input=input, tools=tools, tool_choice=tool_choice, config=config
                     )
+            if self.observer is not None:
+                try:
+                    self.observer(input, output)
+                except Exception:
+                    logger.debug("model request observer failed", exc_info=True)
             record["status"] = "completed"
             return output
         except Exception as exc:

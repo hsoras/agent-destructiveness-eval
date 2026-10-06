@@ -13,8 +13,8 @@ from scripts.pilot import (
 )
 
 
-@pytest.mark.parametrize("mode", [None, "indirect", "direct"])
-def test_pilot_probe_flag_reaches_host_without_inheriting_old_probe(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("disabled", [False, True])
+def test_pilot_awareness_probes_default_and_opt_out(monkeypatch, tmp_path, disabled):
     costs = tmp_path / "costs.json"
     costs.write_text("{}")
     executions = []
@@ -23,16 +23,18 @@ def test_pilot_probe_flag_reaches_host_without_inheriting_old_probe(monkeypatch,
     monkeypatch.setattr(pilot.subprocess, "run", lambda command, **kwargs:
         executions.append(kwargs) or SimpleNamespace(returncode=0))
     args = ["pilot.py", "--model", "openrouter/z-ai/glm-5.3-flash",
-        "--difficulty", "tier1", "--model-cost-config", str(costs)]
-    if mode is not None:
-        args.extend(["--probe", mode])
+        "--scenario", "development container", "--difficulty", "tier1",
+        "--model-cost-config", str(costs)]
+    if disabled:
+        args.append("--no-awareness-probes")
     monkeypatch.setattr(sys, "argv", args)
     assert pilot.main() == 0
-    assert executions[0]["env"].get("STREAMSTATS_PROBE") == mode
+    assert executions[0]["env"].get("STREAMSTATS_AWARENESS_PROBES") == ("0" if disabled else "1")
+    assert "STREAMSTATS_PROBE" not in executions[0]["env"]
 
 
-@pytest.mark.parametrize("return_codes", [(0, 0), (1, 0), (0, 2), (1, 2)])
-def test_probe_all_launches_both_independent_runs_and_preserves_failures(monkeypatch, tmp_path, return_codes):
+@pytest.mark.parametrize("return_code", [0, 1])
+def test_probe_all_does_not_duplicate_original_trajectory(monkeypatch, tmp_path, return_code):
     costs = tmp_path / "costs.json"
     costs.write_text("{}")
     executions = []
@@ -40,20 +42,74 @@ def test_probe_all_launches_both_independent_runs_and_preserves_failures(monkeyp
 
     def run(command, **kwargs):
         executions.append((command, kwargs["env"]))
-        return SimpleNamespace(returncode=return_codes[len(executions) - 1])
+        if command[0] == "inspect":
+            log_dir = Path(command[command.index("--log-dir") + 1])
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / "sample.eval").write_text("placeholder")
+            return SimpleNamespace(returncode=return_code)
+        return SimpleNamespace(returncode=0, stdout="sidecars written\n", stderr="")
 
     monkeypatch.setattr(pilot.subprocess, "run", run)
     monkeypatch.setattr(sys, "argv", ["pilot.py", "--model", "openrouter/test/model",
-        "--difficulty", "tier1", "--runs", "3", "--probe", "all",
+        "--scenario", "development container", "--difficulty", "tier1",
+        "--runs", "3", "--probe", "all",
         "--log-dir", str(tmp_path / "logs"), "--model-cost-config", str(costs)])
-    assert pilot.main() == (return_codes[0] or return_codes[1])
-    assert len(executions) == 2
-    for (command, env), mode in zip(executions, ("indirect", "direct")):
-        assert env["STREAMSTATS_PROBE"] == mode
-        assert command[command.index("--log-dir") + 1] == str(tmp_path / "logs" / mode)
-        assert command[command.index("--epochs") + 1] == "3"
-        assert "--continue" not in command
-    assert executions[0][1] is not executions[1][1]
+    assert pilot.main() == return_code
+    original_runs = [(command, env) for command, env in executions if command[0] == "inspect"]
+    diagnostic_runs = [(command, env) for command, env in executions if "run_awareness_probes.py" in " ".join(command)]
+    assert len(original_runs) == 1
+    assert len(diagnostic_runs) == 1
+    command, env = original_runs[0]
+    assert command[command.index("--epochs") + 1] == "3"
+    assert env["STREAMSTATS_AWARENESS_PROBES"] == "1"
+    assert "--continue" not in command
+    assert diagnostic_runs[0][0][diagnostic_runs[0][0].index("--eval-log") + 1].endswith("sample.eval")
+
+
+def test_diagnostic_runner_failure_does_not_change_original_result(monkeypatch, tmp_path):
+    costs = tmp_path / "costs.json"
+    costs.write_text("{}")
+    calls = []
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[0] == "inspect":
+            log_dir = Path(command[command.index("--log-dir") + 1])
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / "sample.eval").write_text("placeholder")
+            return SimpleNamespace(returncode=7)
+        return SimpleNamespace(returncode=1, stdout="", stderr="probe failed")
+
+    monkeypatch.setattr(pilot.subprocess, "run", run)
+    monkeypatch.setattr(sys, "argv", ["pilot.py", "--model", "openrouter/test/model",
+        "--scenario", "development container", "--difficulty", "tier1",
+        "--log-dir", str(tmp_path / "logs"),
+        "--model-cost-config", str(costs)])
+    assert pilot.main() == 7
+    assert len(calls) == 2
+
+
+def test_awareness_opt_out_skips_sidecar_runner(monkeypatch, tmp_path):
+    costs = tmp_path / "costs.json"
+    costs.write_text("{}")
+    calls = []
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+
+    def run(command, **kwargs):
+        calls.append(command)
+        log_dir = Path(command[command.index("--log-dir") + 1])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "sample.eval").write_text("placeholder")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pilot.subprocess, "run", run)
+    monkeypatch.setattr(sys, "argv", ["pilot.py", "--model", "openrouter/test/model",
+        "--scenario", "development container", "--difficulty", "tier1",
+        "--no-awareness-probes", "--log-dir", str(tmp_path / "logs"),
+        "--model-cost-config", str(costs)])
+    assert pilot.main() == 0
+    assert len(calls) == 1
 
 
 def test_dev_routing_and_budget_reach_inspect(monkeypatch, tmp_path):
@@ -65,7 +121,8 @@ def test_dev_routing_and_budget_reach_inspect(monkeypatch, tmp_path):
     monkeypatch.setattr(pilot.subprocess, "run", lambda command, **kwargs:
                         commands.append(command) or SimpleNamespace(returncode=0))
     monkeypatch.setattr(sys, "argv", ["pilot.py", "--dev", "--model", "z-ai/glm-5.3-flash",
-        "--difficulty", "tier1", "--quantization", "fp4", "--model-cost-config", str(costs)])
+        "--scenario", "development container", "--difficulty", "tier1",
+        "--quantization", "fp4", "--model-cost-config", str(costs)])
     assert pilot.main() == 0
     command = commands[0]
     assert command[command.index("--cost-limit") + 1] == "0.2"
@@ -75,6 +132,56 @@ def test_dev_routing_and_budget_reach_inspect(monkeypatch, tmp_path):
     assert routing == {"sort": "price", "allow_fallbacks": False,
         "data_collection": "deny", "zdr": True,
         "quantizations": ["fp4"]}
+
+
+@pytest.mark.parametrize("display,expected", [(None, "conversation"), ("full", "full")])
+def test_pilot_forwards_display_to_inspect(monkeypatch, tmp_path, display, expected):
+    costs = tmp_path / "costs.json"
+    costs.write_text("{}")
+    commands = []
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+    monkeypatch.setattr(pilot.subprocess, "run", lambda command, **kwargs:
+        commands.append(command) or SimpleNamespace(returncode=0))
+    args = ["pilot.py", "--model", "openrouter/test/model", "--scenario",
+        "development container", "--difficulty", "tier1"]
+    if display:
+        args.extend(["--display", display])
+    args.extend(["--model-cost-config", str(costs)])
+    monkeypatch.setattr(sys, "argv", args)
+    assert pilot.main() == 0
+    command = commands[0]
+    assert command[command.index("--display") + 1] == expected
+
+
+def test_pilot_defaults_to_sqlite_with_privacy_and_non_strict_tools(monkeypatch, tmp_path):
+    costs = tmp_path / "costs.json"
+    costs.write_text("{}")
+    commands = []
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+    monkeypatch.setattr(pilot, "prepare_sqlite_migration_home", lambda *args: ("home", "home-volume"))
+    monkeypatch.setattr(pilot, "prepare_opencode_runtime_disk", lambda *args: ("runtime", "runtime-volume", 32 * 1024 * 1024, 31 * 1024 * 1024))
+    monkeypatch.setattr(pilot, "export_opencode_runtime_session", lambda *args: {})
+    monkeypatch.setattr(pilot, "cleanup_opencode_runtime_disk", lambda *args: None)
+    monkeypatch.setattr(pilot, "cleanup_sqlite_migration_home", lambda *args: None)
+    monkeypatch.setattr(pilot.subprocess, "run", lambda command, **kwargs:
+        commands.append(command) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", [
+        "pilot.py", "--model", "deepseek/deepseek-v4.1-flash",
+        "--provider", "morph/fp8", "--tier", "1",
+        "--no-awareness-probes", "--model-cost-config", str(costs),
+    ])
+
+    assert pilot.main() == 0
+    command = commands[0]
+    assert "eval/task.py@sqlite_migration" in command
+    assert "condition=tier1-blocker" in command
+    assert command[command.index("--display") + 1] == "conversation"
+    model_args = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-M"]
+    parsed = {key: json.loads(value) if value.startswith("{") else value
+        for key, value in (argument.split("=", 1) for argument in model_args)}
+    assert parsed["strict_tools"] == "false"
+    assert parsed["provider"]["data_collection"] == "deny"
+    assert parsed["provider"]["zdr"] is True
 
 
 def test_runtime_session_export_resolves_repo_imports_when_launched_as_script(tmp_path, monkeypatch):
@@ -99,6 +206,7 @@ def test_runtime_session_export_resolves_repo_imports_when_launched_as_script(tm
 
 @pytest.mark.parametrize("extra", [
     ["--provider", "deepinfra/fp4"],
+    ["--no-privacy"],
     ["--model-arg", 'provider={"zdr":false}'],
     ["--cost-limit", "0.21"],
     ["--model-arg", "strict_tools=true"],
@@ -161,9 +269,11 @@ def test_pilot_forwards_hard_model_limits_without_starting_an_eval(monkeypatch, 
         "argv",
         [
             "pilot.py",
-            "--model",
-            "openrouter/z-ai/glm-5.3-flash",
-            "--difficulty",
+                "--model",
+                "openrouter/z-ai/glm-5.3-flash",
+                "--scenario",
+                "development container",
+                "--difficulty",
             "tier1",
             "--model-cost-config",
             str(costs),

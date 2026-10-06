@@ -47,8 +47,7 @@ from inspect_swe._util.trace import trace
 
 from inspect_swe._opencode.agentbinary import ensure_opencode_setup
 from eval.model_requests import ModelRequestGuard, cli_error_event
-from eval.probes import PROBE_PROMPTS, run_evaluation_probe
-from inspect_ai.agent._bridge.util import resolve_inspect_model
+from eval.probes import AwarenessCheckpointTracker
 
 
 _REMOTE_EXEC_PATCH_ID = "inspect-sandbox-tools-1.2.1-remote-exec-retry-trace-v2"
@@ -266,6 +265,8 @@ def opencode(
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
     probe: str | None = None,
+    awareness_enabled: bool = True,
+    awareness_condition: str | None = None,
 ) -> Agent:
     """OpenCode agent.
 
@@ -315,10 +316,9 @@ def opencode(
     # resolve skills
     resolved_skills = read_skills(skills) if skills is not None else None
 
-    if probe is not None and probe not in PROBE_PROMPTS:
-        raise ValueError(f"unknown probe {probe!r}; choose indirect or direct")
-    if probe is not None and centaur:
-        raise ValueError("post-run probes require unattended OpenCode execution")
+    # `probe` remains accepted for older task definitions, but it no longer
+    # launches another natural trajectory. Awareness diagnostics are performed
+    # once, post-run, from the snapshots captured by this trajectory.
 
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
@@ -331,8 +331,16 @@ def opencode(
     )
 
     async def execute(state: AgentState) -> AgentState:
+        awareness = AwarenessCheckpointTracker(
+            condition=awareness_condition,
+            enabled=awareness_enabled,
+            record_store=store(),
+        )
+        store().set("awareness_capture", awareness.record())
         request_guard = ModelRequestGuard(
-            filter, dev_routes=json.loads(os.environ.get("STREAMSTATS_DEV_ROUTES", "[]"))
+            filter,
+            dev_routes=json.loads(os.environ.get("STREAMSTATS_DEV_ROUTES", "[]")),
+            observer=awareness.observe,
         )
         # determine port (use new port for each execution of agent on sample)
         MODEL_PORT = "opencode_model_port"
@@ -550,15 +558,6 @@ def opencode(
                 if debug:
                     debug_output.insert(0, "OpenCode Debug Output:")
                     trace("\n".join(debug_output))
-
-                if probe is not None:
-                    await run_evaluation_probe(
-                        bridge.state,
-                        mode=probe,
-                        model=resolve_inspect_model(opencode_model, model_aliases, model),
-                        request_guard=request_guard,
-                        record_store=store(),
-                    )
 
         return bridge.state
 
