@@ -88,6 +88,39 @@ def resolve_inspect_command(project_root: Path) -> list[str] | None:
             return [sys.executable, launcher]
     return None
 
+
+def awareness_probe_command(inspect_command: list[str]) -> list[str]:
+    """Launch the probe module with the interpreter chosen for Inspect."""
+    if inspect_command and Path(inspect_command[0]).name == "uv":
+        # resolve_inspect_command returns: uv run --frozen python inspect_cli.py
+        if inspect_command[1:4] != ["run", "--frozen", "python"]:
+            raise ValueError(f"unsupported uv Inspect launcher: {inspect_command!r}")
+        return [*inspect_command[:4], "-m", "scripts.run_awareness_probes"]
+    if inspect_command and Path(inspect_command[0]).name.startswith("python"):
+        return [inspect_command[0], "-m", "scripts.run_awareness_probes"]
+    raise ValueError(f"cannot select the Inspect Python environment from {inspect_command!r}")
+
+
+def report_awareness_artifacts(eval_log: Path) -> bool:
+    """Print only sidecar paths that exist and identify missing artifacts."""
+    artifacts = (
+        ("awareness JSON", eval_log.with_suffix(".awareness.json")),
+        ("awareness report", eval_log.with_suffix(".awareness.md")),
+    )
+    complete = True
+    for label, path in artifacts:
+        if path.is_file():
+            print(f"{label}: {path}", flush=True)
+        else:
+            complete = False
+            print(
+                f"awareness diagnostics did not create {label}: {path}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return complete
+
+
 def fresh_eval_environment(
     base_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -1065,54 +1098,57 @@ def main() -> int:
                     if path.is_file()
                 )
                 for eval_log in new_logs:
-                    helper = Path(__file__).resolve().with_name("run_awareness_probes.py")
-                    if inspect_command[0] == "uv":
-                        python_command = [*inspect_command[:4], str(helper)]
-                    elif len(inspect_command) > 1 and inspect_command[1].endswith("inspect_cli.py"):
-                        python_command = [inspect_command[0], str(helper)]
-                    else:
-                        python_command = [sys.executable, str(helper)]
-                    probe_command = [
-                        *python_command, "--eval-log", str(eval_log),
-                        "--model", model,
-                        "--original-settings-json", json.dumps({
-                            "max_retries": args.max_retries,
-                            "timeout_seconds": args.timeout,
-                            "attempt_timeout_seconds": args.attempt_timeout,
-                            "max_tokens": args.max_tokens,
-                            "turn_limit": args.turn_limit,
-                            "cost_limit_usd": args.cost_limit,
-                        }),
-                        "--cost-budget", "0.25",
-                        "--elapsed-budget", "600",
-                    ]
-                    for model_arg in args.model_arg:
-                        probe_command.extend(["--model-arg", model_arg])
-                    if model_cost_config is not None:
-                        probe_command.extend(["--model-cost-config", str(model_cost_config)])
                     try:
+                        probe_command = [
+                            *awareness_probe_command(inspect_command),
+                            "--eval-log", str(eval_log),
+                            "--model", model,
+                            "--original-settings-json", json.dumps({
+                                "max_retries": args.max_retries,
+                                "timeout_seconds": args.timeout,
+                                "attempt_timeout_seconds": args.attempt_timeout,
+                                "max_tokens": args.max_tokens,
+                                "turn_limit": args.turn_limit,
+                                "cost_limit_usd": args.cost_limit,
+                            }),
+                            "--cost-budget", "0.25",
+                            "--elapsed-budget", "600",
+                        ]
+                        for model_arg in args.model_arg:
+                            probe_command.extend(["--model-arg", model_arg])
+                        if model_cost_config is not None:
+                            probe_command.extend(["--model-cost-config", str(model_cost_config)])
                         probe_result = subprocess.run(
-                            probe_command, check=False, env=run_environment,
-                            capture_output=True, text=True,
+                            probe_command,
+                            check=False,
+                            env=run_environment,
+                            capture_output=True,
+                            text=True,
+                            cwd=Path(__file__).resolve().parents[1],
                         )
                         if probe_result.stdout:
-                            print(probe_result.stdout, end="", flush=True)
+                            for line in probe_result.stdout.splitlines():
+                                if not line.startswith(("awareness JSON:", "awareness report:")):
+                                    print(line, flush=True)
                         if probe_result.stderr:
                             print(probe_result.stderr, end="", file=sys.stderr, flush=True)
+                        artifacts_complete = report_awareness_artifacts(eval_log)
                         if probe_result.returncode:
                             print(
                                 f"awareness diagnostics failed for {eval_log} (exit {probe_result.returncode}); original evaluation outcome is unchanged",
                                 file=sys.stderr, flush=True,
                             )
-                            print(f"awareness JSON: {eval_log.with_suffix('.awareness.json')}", flush=True)
-                            print(f"awareness report: {eval_log.with_suffix('.awareness.md')}", flush=True)
+                        elif not artifacts_complete:
+                            print(
+                                f"awareness diagnostics failed for {eval_log}: expected sidecar files are missing; original evaluation outcome is unchanged",
+                                file=sys.stderr, flush=True,
+                            )
                     except Exception as exc:
                         print(
                             f"awareness diagnostics failed for {eval_log}: {type(exc).__name__}: {exc}; original evaluation outcome is unchanged",
                             file=sys.stderr, flush=True,
                         )
-                        print(f"awareness JSON: {eval_log.with_suffix('.awareness.json')}", flush=True)
-                        print(f"awareness report: {eval_log.with_suffix('.awareness.md')}", flush=True)
+                        report_awareness_artifacts(eval_log)
         return exit_code
     finally:
         if temporary_cost_dir is not None:

@@ -14,6 +14,11 @@ import sys
 import time
 from typing import Any
 
+# Support both the pilot's module launch and direct CLI execution.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from eval.probes import (
     CHECKPOINTS,
     DIAGNOSTIC_COST_BUDGET_USD,
@@ -291,9 +296,14 @@ def main(argv: list[str] | None = None) -> int:
         model_cost_config=args.model_cost_config,
         cost_budget=args.cost_budget, elapsed_budget_seconds=args.elapsed_budget,
     )
-    print(f"awareness JSON: {json_path}")
-    print(f"awareness report: {markdown_path}")
-    return 0
+    complete = True
+    for label, path in (("awareness JSON", json_path), ("awareness report", markdown_path)):
+        if path.is_file():
+            print(f"{label}: {path}")
+        else:
+            complete = False
+            print(f"awareness diagnostics did not create {label}: {path}", file=sys.stderr)
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 import sys
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 import pytest
 from types import SimpleNamespace
@@ -38,15 +41,18 @@ def test_probe_all_does_not_duplicate_original_trajectory(monkeypatch, tmp_path,
     costs = tmp_path / "costs.json"
     costs.write_text("{}")
     executions = []
-    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: [sys.executable, "scripts/inspect_cli.py"])
 
     def run(command, **kwargs):
         executions.append((command, kwargs["env"]))
-        if command[0] == "inspect":
+        if "scripts/inspect_cli.py" in command:
             log_dir = Path(command[command.index("--log-dir") + 1])
             log_dir.mkdir(parents=True, exist_ok=True)
             (log_dir / "sample.eval").write_text("placeholder")
             return SimpleNamespace(returncode=return_code)
+        eval_log = Path(command[command.index("--eval-log") + 1])
+        eval_log.with_suffix(".awareness.json").write_text("{}")
+        eval_log.with_suffix(".awareness.md").write_text("report")
         return SimpleNamespace(returncode=0, stdout="sidecars written\n", stderr="")
 
     monkeypatch.setattr(pilot.subprocess, "run", run)
@@ -55,8 +61,8 @@ def test_probe_all_does_not_duplicate_original_trajectory(monkeypatch, tmp_path,
         "--runs", "3", "--probe", "all",
         "--log-dir", str(tmp_path / "logs"), "--model-cost-config", str(costs)])
     assert pilot.main() == return_code
-    original_runs = [(command, env) for command, env in executions if command[0] == "inspect"]
-    diagnostic_runs = [(command, env) for command, env in executions if "run_awareness_probes.py" in " ".join(command)]
+    original_runs = [(command, env) for command, env in executions if "scripts/inspect_cli.py" in command]
+    diagnostic_runs = [(command, env) for command, env in executions if "scripts.run_awareness_probes" in " ".join(command)]
     assert len(original_runs) == 1
     assert len(diagnostic_runs) == 1
     command, env = original_runs[0]
@@ -66,15 +72,15 @@ def test_probe_all_does_not_duplicate_original_trajectory(monkeypatch, tmp_path,
     assert diagnostic_runs[0][0][diagnostic_runs[0][0].index("--eval-log") + 1].endswith("sample.eval")
 
 
-def test_diagnostic_runner_failure_does_not_change_original_result(monkeypatch, tmp_path):
+def test_diagnostic_runner_failure_does_not_change_original_result(monkeypatch, tmp_path, capsys):
     costs = tmp_path / "costs.json"
     costs.write_text("{}")
     calls = []
-    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
+    monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: [sys.executable, "scripts/inspect_cli.py"])
 
     def run(command, **kwargs):
         calls.append(command)
-        if command[0] == "inspect":
+        if "scripts/inspect_cli.py" in command:
             log_dir = Path(command[command.index("--log-dir") + 1])
             log_dir.mkdir(parents=True, exist_ok=True)
             (log_dir / "sample.eval").write_text("placeholder")
@@ -88,6 +94,34 @@ def test_diagnostic_runner_failure_does_not_change_original_result(monkeypatch, 
         "--model-cost-config", str(costs)])
     assert pilot.main() == 7
     assert len(calls) == 2
+    captured = capsys.readouterr()
+    assert "awareness diagnostics failed" in captured.err
+    assert "did not create awareness JSON" in captured.err
+    assert "did not create awareness report" in captured.err
+    assert "awareness JSON:" not in captured.out
+    assert "awareness report:" not in captured.out
+
+
+@pytest.mark.parametrize("launcher", ["direct", "uv"])
+def test_awareness_helper_real_cli_help_works_in_inspect_launch_modes(tmp_path, launcher):
+    root = Path(pilot.__file__).resolve().parents[1]
+    inspect_script = str(root / "scripts" / "inspect_cli.py")
+    if launcher == "direct":
+        inspect_command = [sys.executable, inspect_script]
+    else:
+        uv = shutil.which("uv")
+        if uv is None:
+            pytest.skip("uv is not installed")
+        inspect_command = [uv, "run", "--frozen", "python", inspect_script]
+    command = [*pilot.awareness_probe_command(inspect_command), "--help"]
+    environment = os.environ.copy()
+    environment["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
+    result = subprocess.run(
+        command, cwd=root, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--eval-log" in result.stdout
+    assert "--model" in result.stdout
 
 
 def test_awareness_opt_out_skips_sidecar_runner(monkeypatch, tmp_path):
