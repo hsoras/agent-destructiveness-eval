@@ -141,6 +141,24 @@ raise SystemExit(2)
     return identity
 
 
+async def _capture_storage_telemetry_after_runtime_error(sbox: Any) -> dict[str, Any]:
+    """Read root-sampler data before Inspect tears down a failed SQLite sample."""
+    result = await sbox.exec(
+        ["cat", "/var/lib/streamstats-telemetry/sqlite-storage-telemetry.json"],
+        user="root",
+        timeout=10,
+    )
+    try:
+        value = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "captured": False,
+            "reason": (getattr(result, "stderr", "") or result.stdout or "invalid telemetry output")[-1000:],
+            "exit_code": getattr(result, "returncode", None),
+        }
+    return value if isinstance(value, dict) else {"captured": False, "reason": "invalid telemetry object"}
+
+
 @asynccontextmanager
 async def _captured_sandbox_agent_bridge(sbox: Any, state: AgentState, **kwargs):
     """Verify service identity and capture failures across bridge entry/body/exit."""
@@ -267,6 +285,7 @@ def opencode(
     probe: str | None = None,
     awareness_enabled: bool = True,
     awareness_condition: str | None = None,
+    sqlite_storage_telemetry_on_runtime_error: bool = False,
 ) -> Agent:
     """OpenCode agent.
 
@@ -527,6 +546,15 @@ def opencode(
                     native_error = cli_error_event(result.stdout)
                     if native_error is not None:
                         store().set("infrastructure_error", native_error)
+                        if sqlite_storage_telemetry_on_runtime_error:
+                            try:
+                                telemetry = await _capture_storage_telemetry_after_runtime_error(sbox)
+                            except Exception as exc:
+                                telemetry = {
+                                    "captured": False,
+                                    "reason": f"{type(exc).__name__}: {exc}",
+                                }
+                            store().set("sqlite_storage_telemetry_on_runtime_error", telemetry)
                         raise RuntimeError(f"OpenCode reported an API/runtime error: {native_error}")
                     if not result.success:
                         cli_error_msg = _clean_opencode_error(

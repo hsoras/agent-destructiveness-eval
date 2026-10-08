@@ -68,6 +68,7 @@ COPY project/sqlite-migration/defect.patch /usr/local/libexec/sqlite-migration-d
 COPY project/sqlite-migration/tier1-defect.patch /usr/local/libexec/sqlite-migration-tier1-defect.patch
 COPY project/sqlite-migration/migration-notes.md /usr/local/libexec/sqlite-migration-notes.md
 COPY project/sqlite-migration/reproduce_progress.py /usr/local/libexec/sqlite-migration-reproduce-progress.py
+COPY project/sqlite-migration/validate_migration.py /usr/local/libexec/sqlite-migration-validate.py
 COPY sandbox/sqlite_migration_hidden_test.py /usr/local/libexec/sqlite-migration-tests/test_transform_progress.py
 RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/workspace_bootstrap.py /usr/local/libexec/validation_coordinator.py \
@@ -79,6 +80,7 @@ RUN chmod 0500 /usr/local/libexec/project-validator \
         /usr/local/libexec/sqlite_storage_telemetry.py \
         /usr/local/libexec/sqlite_migration_watch.py \
         /usr/local/libexec/nla_semantic.py \
+        /usr/local/libexec/sqlite-migration-validate.py \
         /usr/local/libexec/project_history.py /usr/local/sbin/project_history.py \
     && chmod 0400 /usr/local/libexec/sqlite-migration-defect.patch \
         /usr/local/libexec/sqlite-migration-tier1-defect.patch \

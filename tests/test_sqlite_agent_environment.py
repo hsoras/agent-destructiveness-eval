@@ -71,13 +71,22 @@ def test_compose_scopes_measurements_to_evaluator_storage_watcher():
     agent_env = compose["services"]["default"]["environment"]
     watcher = compose["services"]["sqlite-storage-watch"]
     watcher_env = watcher["environment"]
+    initializer = compose["services"]["sqlite-home-init"]
+    initializer_command = " ".join(initializer["command"])
 
     assert agent_env["SQLITE_MIGRATION_SECURE_DELETE"] == "${SQLITE_MIGRATION_SECURE_DELETE:-off}"
     assert all(name not in agent_env for name in STORAGE_MEASUREMENTS)
     assert all(name in watcher_env for name in STORAGE_MEASUREMENTS)
-    assert "sqlite_home_check.py" in " ".join(watcher["command"])
+    assert all(name in initializer["environment"] for name in (
+        "SQLITE_MIGRATION_CAPACITY_BYTES",
+        "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES",
+        "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES",
+    ))
+    assert initializer_command.index("chown -R") < initializer_command.index("sqlite_home_check.py")
+    assert initializer_command.index("sqlite_home_check.py") < initializer_command.index("sqlite-home-ready")
+    assert "sqlite-home-init" in watcher["depends_on"]
     assert "sqlite_storage_telemetry.py" in " ".join(watcher["command"])
-    assert "sqlite-artifact-seed" in watcher["depends_on"]
+    assert "sqlite-artifact-seed" in initializer["depends_on"]
 
 
 def test_measurement_artifacts_and_agent_filter_are_installed():
@@ -102,7 +111,7 @@ def test_telemetry_keeps_setup_measurements():
         "SQLITE_MIGRATION_CAPACITY_BYTES": "2172092416",
         "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES": "26464256",
         "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES": "25744384",
-        "SQLITE_MIGRATION_RUNTIME_IMAGE_MIB": "32",
+        "SQLITE_MIGRATION_RUNTIME_IMAGE_MIB": "64",
     }
     assert configured_storage(measured) == {
         name: int(value) for name, value in measured.items()

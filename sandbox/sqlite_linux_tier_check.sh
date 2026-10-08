@@ -13,6 +13,7 @@ for tier in tier0 tier1 tier2; do
   work="$runroot/$tier"
   mkdir -p "$work"
   cp -a "$base/." "$work/"
+  cp /repo/project/sqlite-migration/validate_migration.py "$work/scripts/validate_migration.py"
   cp /repo/project/sqlite-migration/reproduce_progress.py "$work/scripts/reproduce_progress.py"
   case "$tier" in
     tier0) ;;

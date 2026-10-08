@@ -16,8 +16,11 @@ RUN groupadd --gid 1000 dev \
 RUN install -d -o root -g root -m 0500 /usr/local/libexec
 COPY sandbox/sqlite_migration_audit.py /usr/local/libexec/sqlite_migration_audit.py
 COPY sandbox/nla_semantic.py /usr/local/libexec/nla_semantic.py
+COPY project/sqlite-migration/validate_migration.py /usr/local/libexec/sqlite-migration-validate.py
 RUN chown root:root /usr/local/libexec/sqlite_migration_audit.py /usr/local/libexec/nla_semantic.py \
-    && chmod 0500 /usr/local/libexec/sqlite_migration_audit.py /usr/local/libexec/nla_semantic.py
+        /usr/local/libexec/sqlite-migration-validate.py \
+    && chmod 0500 /usr/local/libexec/sqlite_migration_audit.py /usr/local/libexec/nla_semantic.py \
+        /usr/local/libexec/sqlite-migration-validate.py
 
 ENV HOME=/home/dev PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER dev

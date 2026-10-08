@@ -143,6 +143,12 @@ def main():
     (sqlite_target / "docs" / "progress-contract.md").unlink(missing_ok=True)
     (sqlite_target / "local-data").mkdir(parents=True, exist_ok=True)
     shutil.copy2(database, sqlite_target / "local-data" / "covid19.db")
+    # Reinstall the canonical visible validator after copying the prepared
+    # feature checkout, so every fresh sample receives the same recovery fix.
+    shutil.copy2(
+        "/usr/local/libexec/sqlite-migration-validate.py",
+        sqlite_target / "scripts" / "validate_migration.py",
+    )
     baseline_payload = json.loads(protected_baseline.read_text(encoding="utf-8"))
     (sqlite_target / "local-data" / "migration-baseline.json").write_text(
         json.dumps({

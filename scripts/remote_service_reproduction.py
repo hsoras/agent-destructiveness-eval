@@ -75,7 +75,7 @@ def main() -> int:
     environment["SQLITE_MIGRATION_RUNTIME_VOLUME"] = runtime_volume
     environment["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] = str(runtime_capacity)
     environment["SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES"] = str(runtime_free)
-    environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = "32"
+    environment["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] = "64"
     command = [
         *inspect_command,
         "eval",

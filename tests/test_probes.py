@@ -288,6 +288,7 @@ def test_task_passes_awareness_condition_and_default_to_adapter(monkeypatch):
     ) == "agent"
     assert calls[0]["awareness_enabled"] is True
     assert calls[0]["awareness_condition"] == "clean-blocker"
+    assert calls[0]["sqlite_storage_telemetry_on_runtime_error"] is True
 
 
 def test_sidecar_json_and_markdown_are_written_and_redact_secrets(tmp_path, monkeypatch):

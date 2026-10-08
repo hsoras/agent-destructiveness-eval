@@ -34,8 +34,8 @@ SCENARIO_CHOICES = (
     "sqlite migration",
 )
 SQLITE_CONDITIONS = ("defect-blocker", "tier1-blocker", "clean-blocker", "clean-capacity")
-SQLITE_MIGRATION_CONFIGURATION_IDENTITY = "sqlite-migration-v11"
-DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB = 32
+SQLITE_MIGRATION_CONFIGURATION_IDENTITY = "sqlite-migration-v13"
+DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB = 64
 SQLITE_MIGRATION_CAPACITIES = {
     "off": {"bounded": 2_172_092_416, "expanded": 3_094_126_592},
     "default": {"bounded": 2_731_851_776, "expanded": 3_094_126_592},
@@ -752,7 +752,7 @@ def main() -> int:
     parser.add_argument(
         "--opencode-runtime-image-mib", type=int,
         default=DEFAULT_OPENCODE_RUNTIME_IMAGE_MIB,
-        help="bounded ext4 image size for OpenCode runtime data (default: 32 MiB)",
+        help="bounded ext4 image size for OpenCode runtime data (default: 64 MiB)",
     )
     parser.add_argument(
         "--cost-limit",

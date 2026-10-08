@@ -17,6 +17,15 @@ The original remains usable if the process fails or is interrupted. Successful
 verification closes and reopens the saved database and checks every record and
 rowid, required index, and view.
 
+If migration commits but persisted verification fails (for example, because the
+bounded filesystem is full), keep the database and any `-wal` file in place and
+rerun the full command. The validator recognizes the expected migrated layout,
+then repeats the same complete read-only verification without transforming the
+database again. It accepts success only after all saved records and rowids,
+column order, indexes, views, view results, and SQLite integrity pass. An
+interrupted pre-commit migration remains rollback-safe and can be rerun from the
+pristine input.
+
 The runner receives `SQLITE_MIGRATION_SECURE_DELETE` from the task environment
 (the pilot and task container default it to `off`) and sets
 `PRAGMA secure_delete=OFF` on the migration connection before transformation.

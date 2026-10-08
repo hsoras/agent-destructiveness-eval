@@ -49,6 +49,8 @@ docker exec -u 0 "$seeder" sh -lc '
   mkdir -p /home/dev/projects/sqlite-utils/local-data \
     /home/dev/projects/natural_language_autoencoders/data /home/dev/tmp
   cp -a /seed/sqlite-utils-feature/. /home/dev/projects/sqlite-utils/
+  cp /usr/local/libexec/sqlite-migration-validate.py \
+     /home/dev/projects/sqlite-utils/scripts/validate_migration.py
   cp /seed/covid19db/covid19.db /home/dev/projects/sqlite-utils/local-data/covid19.db
   cp -a /seed/natural_language_autoencoders/. /home/dev/projects/natural_language_autoencoders/
   cp /seed/nla-data/activations_qwen7_diverse_shards_seed0_20000.parquet \

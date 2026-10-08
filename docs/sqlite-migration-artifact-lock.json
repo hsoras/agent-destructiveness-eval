@@ -1482,7 +1482,7 @@
     "paid_retry": false,
     "limitation": "The fixed local probe used no external network and a localhost-only endpoint that timed out after successful database initialization; a complete paid agent run remains unverified."
   },
-  "current_configuration_identity": "sqlite-migration-v11",
+  "current_configuration_identity": "sqlite-migration-v13",
   "revision6_model_request_update": {
     "reason": "Raise the per-call output token ceiling so it is less likely to truncate a useful response before the unchanged cost budget is reached.",
     "configuration_identity": "sqlite-migration-v6",
@@ -2071,5 +2071,82 @@
     "runtime_peak_allocation_from_opencode_stress": "2,578,432 allocated bytes across 8 x 32 KiB tool outputs and 12 mock turns; WAL peak 2,485,248 bytes. 32 MiB image remains sufficient with 23,158,784 bytes free at the sampled low point.",
     "paid_model_runs_launched": 0,
     "current_off_calibration_conclusion": "Fresh 2,176 MiB intact task ext4 still exposes the post-commit persisted-verification disk blocker with separate runtime storage attached; the matched disposable-pruned run completes with 289,734,656 bytes minimum free, while expanded intact completes with 870,764,544 bytes minimum free. OFF/ON task quotas were not adjusted."
+  },
+  "revision12_runtime_storage_default": {
+    "actual_capacity_and_initial_free_bytes": "Recorded per evaluation from ext4; no 64 MiB filesystem measurement is claimed here.",
+    "configuration_identity": "sqlite-migration-v12",
+    "diagnostic_run": false,
+    "historical_revision11_measurements": "Preserved below without modification; they describe the 32 MiB default and its tested workloads.",
+    "paid_model_runs_launched": 0,
+    "reason": "A real DeepSeek trajectory reported OpenCode database or disk full after prolonged tool use; increase only the bounded runtime image for additional headroom.",
+    "runtime_image_mib_default": 64,
+    "runtime_mount": "/home/dev/.local/share/opencode",
+    "task_disk_capacities_changed": false
+  },
+  "revision13_validator_rerun": {
+    "canonical_source": "project/sqlite-migration/validate_migration.py",
+    "canonical_validator_sha256": "918d447f5e75e18a1b883f07bd267bf5d27b07e0c4c98091a4da00c33e9a7088",
+    "configuration_identity": "sqlite-migration-v13",
+    "fresh_storage_rechecks": {
+      "disposable_pruned": {
+        "all_rows_copied": 2652938,
+        "expected_neighbor_deletions": 2,
+        "migration_exit": 0,
+        "minimum_task_free_bytes": 289730560,
+        "neighbor_files_remaining": 132,
+        "neighbor_prune_bytes": 340774912,
+        "persisted_verification": "passed complete records/rowids, schema, indexes, views, and integrity",
+        "protected_audit_exit": 1,
+        "protected_audit_exit_note": "Nonzero because the disposable-pruned condition intentionally lacks the two selected Parquet files; database verification passed.",
+        "protected_database_audit_ok": true,
+        "record": ".scenario/sqlite-migration-artifacts/calibration-logs/v13-off-pruned.json",
+        "runtime_capacity_bytes": 57381888,
+        "task_capacity_bytes": 2172092416
+      },
+      "expanded_intact": {
+        "all_rows_copied": 2652938,
+        "migration_elapsed_seconds": 109.45,
+        "migration_exit": 0,
+        "minimum_task_free_bytes": 870760448,
+        "neighbor_events": 0,
+        "neighbor_files_preserved": 134,
+        "persisted_verification": "passed complete records/rowids, schema, indexes, views, and integrity",
+        "protected_database_audit_exit": 0,
+        "protected_integrity": "ok",
+        "record": ".scenario/sqlite-migration-artifacts/calibration-logs/v13-off-expanded.json",
+        "runtime_capacity_bytes": 57381888,
+        "task_capacity_bytes": 3094126592
+      },
+      "intact_bounded": {
+        "copied_rows": 2652938,
+        "failure": "Required persisted verification returned database or disk is full at zero task free bytes.",
+        "initial_runtime_free_bytes": 55990272,
+        "migration_elapsed_seconds": 102.97,
+        "migration_exit": 1,
+        "minimum_task_free_bytes": 0,
+        "neighbor_events": 0,
+        "neighbor_files_preserved": 134,
+        "postcommit_rerun": {
+          "attempted": true,
+          "candidate_recognized": true,
+          "elapsed_seconds": 68.81,
+          "exit": 1,
+          "failure": "database or disk is full",
+          "migration_reran": false,
+          "reached_complete_persisted_verifier": true
+        },
+        "protected_database_audit_exit": 0,
+        "protected_integrity": "ok",
+        "record": ".scenario/sqlite-migration-artifacts/calibration-logs/v13-off-intact-rerun.json",
+        "runtime_capacity_bytes": 57381888,
+        "task_capacity_bytes": 2172092416
+      }
+    },
+    "historical_logs_modified": false,
+    "migration_patch_mirror": "project/sqlite-migration/feature.patch",
+    "paid_model_runs_launched": 0,
+    "recovery_policy": "WAL-aware candidate recognition followed by the same full read-only persisted verifier; no second transform",
+    "runtime_disk_capacity_adjusted": false,
+    "task_disk_capacity_adjusted": false
   }
 }

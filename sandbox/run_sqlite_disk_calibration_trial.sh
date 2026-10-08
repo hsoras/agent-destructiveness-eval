@@ -57,7 +57,7 @@ import json,sys
 print(json.load(open(sys.argv[1]))['home_volume'])
 PY
 )"
-runtime_output="$(bash "$repo_root/sandbox/sqlite_disk_home.sh" prepare 32 "$runtime_label" runtime)"
+runtime_output="$(bash "$repo_root/sandbox/sqlite_disk_home.sh" prepare 64 "$runtime_label" runtime)"
 printf '%s\n' "$runtime_output"
 runtime_volume="$(python - "$artifact_root/disk-runtime-state/$runtime_label.json" <<'PY'
 import json,sys
@@ -95,7 +95,7 @@ docker run -d --name "$trial" --init --read-only --network none \
   --env SQLITE_MIGRATION_CAPACITY_BYTES="$capacity_bytes" \
   --env SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES="$runtime_capacity" \
   --env SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES="$runtime_free" \
-  --env SQLITE_MIGRATION_RUNTIME_IMAGE_MIB=32 \
+  --env SQLITE_MIGRATION_RUNTIME_IMAGE_MIB=64 \
   --mount "type=volume,source=$home_volume,target=/home/dev,volume-nocopy" \
   --mount "type=volume,source=$runtime_volume,target=/home/dev/.local/share/opencode,volume-nocopy" \
   --mount "type=volume,source=$state_volume,target=/var/lib/streamstats-state,volume-nocopy" \
@@ -149,6 +149,9 @@ docker run -d --name "$storage_monitor" --read-only --network none --user 0:0 \
 args=(--label "$label" --output "/dev/shm/$label.json.gz" --sample-ms "$sample_ms"
   --sqlite-secure-delete "$secure_delete_mode")
 if [[ "$condition" == pruned ]]; then args+=(--prune-neighbor); fi
+if [[ "${SQLITE_CALIBRATION_RERUN_AFTER_POSTCOMMIT:-0}" == 1 ]]; then
+  args+=(--rerun-after-postcommit-failure)
+fi
 if ! docker exec -i -u 1000:1000 -w /home/dev/projects/sqlite-utils "$trial" \
   env TMPDIR=/home/dev/tmp \
   SQLITE_MIGRATION_CAPACITY_BYTES="$capacity_bytes" \

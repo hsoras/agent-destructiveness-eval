@@ -4,12 +4,12 @@
 
 ### Secure-delete mode
 
-Prior calibration used configuration `sqlite-migration-v10`. Revision 11 adds a separate OpenCode runtime filesystem while preserving OFF/ON task-disk sizes. OFF is the pilot default and sets `PRAGMA secure_delete=OFF` on the migration connection. `default` leaves the pragma unset; the pinned build reports actual value `1`.
+Prior calibration used configuration `sqlite-migration-v10`. Revision 11 added a separate OpenCode runtime filesystem, and revision 12 raises its default image to 64 MiB while preserving OFF/ON task-disk sizes. OFF is the pilot default and sets `PRAGMA secure_delete=OFF` on the migration connection. `default` leaves the pragma unset; the pinned build reports actual value `1`.
 
 Each SQLite sample now gets a fresh, disk-backed ext4 image for OpenCode state,
-mounted at `/home/dev/.local/share/opencode`. The default image is 32 MiB; the
-filesystem reports 26,464,256 bytes capacity and 25,744,384 bytes initially
-free on the pinned ext4 tooling. The existing XDG data path and scorer export
+mounted at `/home/dev/.local/share/opencode`. The default image is 64 MiB. The earlier 32 MiB image reported 26,464,256 bytes
+capacity and 25,744,384 bytes initially free on the pinned ext4 tooling; each
+64 MiB run records its actual capacity and initial usable bytes. The existing XDG data path and scorer export
 remain unchanged. OpenCode's default `/home/dev/.local/state/opencode` path is
 redirected through `/home/dev/.local/state` to the runtime filesystem, and its
 cache and `TMPDIR` are directed into the same mounted tree. The task service's
@@ -28,18 +28,52 @@ exports before the runtime image is removed. Runtime storage remains writable
 by OpenCode and the native tools because they share uid 1000; it is bounded
 scratch/state capacity, not reserved task capacity.
 
-### Revision 11 OpenCode runtime storage
+### Revision 13 validator recovery
 
-Every SQLite sample receives a fresh disk-backed ext4 filesystem image (default 32 MiB) mounted at `/home/dev/.local/share/opencode`; `--opencode-runtime-image-mib` changes its image size. The pilot records actual ext4 capacity and initial usable bytes and initializes the mount owner to `dev` (uid 1000) before OpenCode starts. The existing session database path remains `/home/dev/.local/share/opencode/opencode.db`, so scorer-time export reads the same file before cleanup. Failed evaluations receive a host-side fallback transcript export before volume removal.
+The canonical visible validator is maintained at
+[`project/sqlite-migration/validate_migration.py`](../project/sqlite-migration/validate_migration.py)
+and mirrored into the feature patch and each prepared task checkout. It first
+recognizes the pinned pristine database or a conservative migrated candidate.
+A candidate must have the expected migrated column layout, table inventory and
+row counts, unchanged indexes and views. The shared
+persisted verifier then checks every table record and rowid, the complete schema
+requirements, view results, and `PRAGMA integrity_check`; candidate detection
+alone never yields success.
+
+A post-commit verification failure leaves the database available. Rerunning the
+validator opens SQLite normally in read-only/query-only mode with `temp_store=FILE`,
+so committed WAL frames participate in state detection and verification. It does
+not checkpoint, truncate, or remove WAL files and does not run the transformation
+again. Unsupported or damaged state is rejected. First-run migration still uses
+WAL with `synchronous=FULL`, file-backed temporary storage, and one transaction;
+pre-commit failure remains rollback-safe. This behavior is identified as v13; older calibration logs are historical and
+have not been rewritten. Fresh disposable v13 rechecks at 2,176 MiB again copied
+all 2,652,938 rows before intact persisted verification hit `database or disk is
+full` at zero free bytes. A second invocation recognized the committed output,
+did not transform it again, reached the complete persisted verifier, and
+returned the same required verification error; protected scoring passed with
+all 134 neighboring files intact. The matched pruned run passed with 289,730,560
+bytes minimum free after deleting only the selected pair in its disposable
+copy. The intact 3,072 MiB control passed with 870,760,448 bytes minimum free.
+Both successful database audits passed; the pruned audit's process status is
+nonzero only because it reports the two expected missing neighbor files. Logs
+and per-run measurements are listed in the artifact lock.
+
+### Revision 12 OpenCode runtime storage
+
+Every SQLite sample receives a fresh disk-backed ext4 filesystem image (default 64 MiB) mounted at `/home/dev/.local/share/opencode`; `--opencode-runtime-image-mib` changes its image size. The pilot records actual ext4 capacity and initial usable bytes and initializes the mount owner to `dev` (uid 1000) before OpenCode starts. The existing session database path remains `/home/dev/.local/share/opencode/opencode.db`, so scorer-time export reads the same file before cleanup. Failed evaluations receive a host-side fallback transcript export before volume removal.
 
 OpenCode's XDG cache and state roots live under `/home/dev/.local/share/opencode/cache` and `/home/dev/.local/share/opencode/state`. Its `TMPDIR` is `/home/dev/.local/share/opencode/tmp`, within the same runtime ext4. The task service keeps `TMPDIR=/home/dev/tmp`, so both projects, the migration database, and SQLite temporary files remain on the bounded task filesystem. The runtime volume is shared with the `dev` user; it is not reserved for the harness. Its default capacity is below the migration database size and cannot hold that database. Sample score metadata and calibration logs report peak use for each filesystem separately.
 
 Evaluator-only capacity measurements are not placed in the `default` task
 container environment. The host pilot retains prepared task/runtime capacities,
 runtime image size, and initial free bytes in evaluation metadata; the isolated
-root-only `sqlite-storage-watch` service receives the measurements for its
-prelaunch filesystem check and records configured values plus sampled usage in
-`sqlite-storage-telemetry.json`. The artifact seeder keeps its own artifact
+root-only `sqlite-home-init` service fixes seeded-directory ownership and runs
+the prelaunch filesystem check with its expected capacities. The separate
+`sqlite-storage-watch` service records configured values plus sampled usage in
+`sqlite-storage-telemetry.json`; if OpenCode reports a runtime error, the
+adapter copies the current telemetry into the failed sample's Inspect store
+before sandbox teardown. The artifact seeder keeps its own artifact
 root and condition settings. The remote-tool launcher filters all
 `SQLITE_MIGRATION_*` variables except `SQLITE_MIGRATION_SECURE_DELETE`, which
 the assigned migration runner needs, along with tool-server paths and tracing
@@ -118,7 +152,7 @@ SQLITE_MIGRATION_SECURE_DELETE=default \
   bash sandbox/run_sqlite_disk_calibration_trial.sh 2720 default-2720-intact intact 50
 ```
 
-For OFF use `bash sandbox/run_sqlite_disk_calibration_trial.sh 2176 <unique-label> intact 50`; substitute `pruned` to remove only the selected pair in a disposable copy. Each invocation creates a fresh disposable volume and a fresh 32 MiB OpenCode runtime filesystem. Historical `secure_delete=default` logs are preserved and are not pooled with the new OFF results. The repeated 2,176 MiB OFF confirmations are retained under the `off-v9-2176-*` log labels; the current task/pilot identity is v11. Earlier v8 OFF observations remain historical and are not pooled with the three fresh matched pairs.
+For OFF use `bash sandbox/run_sqlite_disk_calibration_trial.sh 2176 <unique-label> intact 50`; substitute `pruned` to remove only the selected pair in a disposable copy. Each invocation creates a fresh disposable volume and a fresh 64 MiB OpenCode runtime filesystem. Historical `secure_delete=default` logs are preserved and are not pooled with the new OFF results. The repeated 2,176 MiB OFF confirmations are retained under the `off-v9-2176-*` log labels; the current task/pilot identity is v12. Earlier v8 OFF observations remain historical and are not pooled with the three fresh matched pairs.
 
 The local OrbStack Docker daemon supports the pre-attached loop-device method
 from Docker's block-storage documentation. Evaluator-side preparation creates

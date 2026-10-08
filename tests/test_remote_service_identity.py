@@ -30,8 +30,11 @@ class _IdentitySandbox:
 
 
 class _Store:
+    def __init__(self):
+        self.values = {}
+
     def set(self, *_args, **_kwargs):
-        pass
+        self.values[_args[0]] = _args[1]
 
 
 def _identity(**overrides):
@@ -65,6 +68,27 @@ def test_identity_gate_accepts_exact_loaded_patch(monkeypatch):
     assert result["startup_id"] == "service-instance-1"
     assert len(sbox.commands) == 1
     assert sbox.commands[0][0:2] == ["python", "-c"]
+
+
+def test_storage_telemetry_can_be_captured_before_failed_sandbox_teardown():
+    telemetry = {"home": {"peak_used_bytes": 2_172_092_416}, "opencode_runtime": {"peak_allocated_bytes": 30_000_000}}
+
+    class _TelemetrySandbox:
+        def __init__(self):
+            self.calls = []
+
+        async def exec(self, command, **kwargs):
+            self.calls.append((command, kwargs))
+            return _ExecResult(json.dumps(telemetry))
+
+    sbox = _TelemetrySandbox()
+    captured = asyncio.run(adapter._capture_storage_telemetry_after_runtime_error(sbox))
+
+    assert captured == telemetry
+    assert sbox.calls == [(
+        ["cat", "/var/lib/streamstats-telemetry/sqlite-storage-telemetry.json"],
+        {"user": "root", "timeout": 10},
+    )]
 
 
 @pytest.mark.parametrize(

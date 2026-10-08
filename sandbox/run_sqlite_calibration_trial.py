@@ -22,6 +22,7 @@ parser.add_argument("--prune-neighbor", action="store_true")
 parser.add_argument("--journal-mode", choices=("wal",), default="wal")
 parser.add_argument("--sample-ms", type=int, default=50)
 parser.add_argument("--sqlite-secure-delete", choices=("off", "default"), default="off")
+parser.add_argument("--rerun-after-postcommit-failure", action="store_true")
 args = parser.parse_args()
 repo = Path("/home/dev/projects/sqlite-utils")
 project_python = repo / ".venv" / "bin" / "python"
@@ -326,6 +327,31 @@ while process.poll() is None:
 output = process.stdout.read()
 final_migration_state = snapshot("migration-finished-before-postcheck")
 elapsed = time.monotonic() - start
+rerun_record = {"attempted": False, "candidate": False, "exit_code": None, "output": ""}
+if args.rerun_after_postcommit_failure and process.returncode != 0:
+    prepared = json.loads((database.parent / "migration-baseline.json").read_text(encoding="utf-8"))
+    validator = __import__("runpy").run_path(str(repo / "scripts/validate_migration.py"))
+    try:
+        probe = validator["open_readonly"](database)
+        try:
+            rerun_record["candidate"] = validator["is_migrated_candidate"](probe, prepared["database"])
+        finally:
+            probe.close()
+    except Exception as error:
+        rerun_record["candidate_detection_error"] = f"{type(error).__name__}: {error}"
+    if rerun_record["candidate"]:
+        rerun_record["attempted"] = True
+        rerun_started = time.monotonic()
+        retry = subprocess.run(
+            [python, "scripts/validate_migration.py"], cwd=repo, env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        rerun_record.update({
+            "exit_code": retry.returncode,
+            "elapsed_seconds": round(time.monotonic() - rerun_started, 2),
+            "output": retry.stdout,
+            "did_not_transform": "migration_status=not_run" in retry.stdout,
+        })
 peak_used_bytes = max((item["used_bytes"] for item in samples), default=None)
 sampled_peak_memory_bytes = max((
     item.get("cgroup_memory", {}).get("memory.current", 0) for item in samples
@@ -409,6 +435,7 @@ record = {
     "database_matches_pinned_source": db_hash == "d09f105207a13863a089ae8fafc86d5f1c317650bf8bde8d75fef5899ac4b414",
     "original_unchanged_after_failed_migration": process.returncode != 0 and db_hash == before_migration_db_hash,
     "migration_exit": process.returncode,
+    "postcommit_verification_rerun": rerun_record,
     "migration_error_excerpt": failure_lines[-20:],
     "migration_connection_secure_delete_actual": secure_delete_actual,
     "migration_connection_settings_line": secure_delete_settings_line,
@@ -448,7 +475,7 @@ print(json.dumps({key: record[key] for key in (
     "label", "capacity_bytes", "migration_exit", "minimum_sampled_free_bytes",
     "free_before_prune_bytes", "free_after_prune_bytes", "free_released_by_prune_bytes",
     "migration_and_independent_verification_seconds", "original_unchanged_after_failed_migration",
-    "neighbor_pruned", "neighbor_missing_or_changed")}, sort_keys=True))
+    "neighbor_pruned", "neighbor_missing_or_changed", "postcommit_verification_rerun")}, sort_keys=True))
 print("--- migration diagnostics ---")
 for line in failure_lines[-20:]:
     print(line)

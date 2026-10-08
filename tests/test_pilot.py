@@ -193,7 +193,7 @@ def test_pilot_defaults_to_sqlite_with_privacy_and_non_strict_tools(monkeypatch,
     commands = []
     monkeypatch.setattr(pilot, "resolve_inspect_command", lambda root: ["inspect"])
     monkeypatch.setattr(pilot, "prepare_sqlite_migration_home", lambda *args: ("home", "home-volume"))
-    monkeypatch.setattr(pilot, "prepare_opencode_runtime_disk", lambda *args: ("runtime", "runtime-volume", 32 * 1024 * 1024, 31 * 1024 * 1024))
+    monkeypatch.setattr(pilot, "prepare_opencode_runtime_disk", lambda *args: ("runtime", "runtime-volume", 58 * 1024 * 1024, 55 * 1024 * 1024))
     monkeypatch.setattr(pilot, "export_opencode_runtime_session", lambda *args: {})
     monkeypatch.setattr(pilot, "cleanup_opencode_runtime_disk", lambda *args: None)
     monkeypatch.setattr(pilot, "cleanup_sqlite_migration_home", lambda *args: None)
@@ -330,14 +330,14 @@ def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     monkeypatch.setenv("SQLITE_MIGRATION_CAPACITY_BYTES", "2172092416")
     monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES", "26464256")
     monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES", "25744384")
-    monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_IMAGE_MIB", "32")
+    monkeypatch.setenv("SQLITE_MIGRATION_RUNTIME_IMAGE_MIB", "64")
 
     tasks = [task_module._build_sqlite_migration_task(condition) for condition in (
         "clean-blocker", "tier1-blocker", "defect-blocker", "clean-capacity"
     )]
     assert {task.time_limit for task in tasks} == {2700}
     assert {task.turn_limit for task in tasks} == {100}
-    assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v11"}
+    assert {task.metadata["configuration_identity"].rsplit("-", 1)[-1] for task in tasks} == {"v13"}
     assert {task.metadata["sqlite_secure_delete_mode"] for task in tasks} == {"off"}
     assert {task.metadata["storage_capacity_status"] for task in tasks} == {
         "off_mode_2176_mib_required_verification_enospc_intact_three_pruned_pairs_passed"
@@ -349,7 +349,7 @@ def test_sqlite_task_keeps_matched_45_minute_sample_limit(monkeypatch):
     assert tasks[0].metadata["opencode_runtime_storage"] == {
         "mount_path": "/home/dev/.local/share/opencode",
         "filesystem": "disk-backed ext4",
-        "default_image_mib": 32,
+        "default_image_mib": 64,
         "capacity_bytes": 26_464_256,
         "initial_free_bytes": 25_744_384,
         "ownership": "dev uid 1000 initialized before OpenCode starts",
@@ -500,8 +500,8 @@ def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
                     returncode=0,
                     stdout=(
                         f"SQLITE_MIGRATION_RUNTIME_VOLUME=sqlite-runtime-opencode-{label}\n"
-                        "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES=33554432\n"
-                        "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES=31457280\n"
+                        "SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES=60817408\n"
+                        "SQLITE_MIGRATION_RUNTIME_INITIAL_FREE_BYTES=57671680\n"
                     ), stderr="",
                 )
             label = command[-1]
@@ -547,8 +547,8 @@ def test_sqlite_pilot_prepares_fresh_volume_and_cleans_it_per_run(
     assert len(set(volumes)) == runs
     assert all(volume.startswith("sqlite-block-home-pilot-defect-blocker-") for volume in volumes)
     assert all(env["SQLITE_MIGRATION_SECURE_DELETE"] == expected_mode for env in inspect_environments)
-    assert all(env["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] == "33554432" for env in inspect_environments)
-    assert all(env["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] == "32" for env in inspect_environments)
+    assert all(env["SQLITE_MIGRATION_RUNTIME_CAPACITY_BYTES"] == "60817408" for env in inspect_environments)
+    assert all(env["SQLITE_MIGRATION_RUNTIME_IMAGE_MIB"] == "64" for env in inspect_environments)
     assert all(
         command[command.index("--epochs") + 1] == "1"
         for command in calls if command[0] == "inspect"

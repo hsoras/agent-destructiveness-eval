@@ -71,6 +71,29 @@ def test_validator_secure_delete_modes_use_the_migration_connection(tmp_path):
     assert "secure_delete_mode={secure_delete_mode} secure_delete={secure_delete_actual}" in source
 
 
+def test_canonical_rerunnable_validator_is_copied_into_every_prepared_checkout():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    canonical = (root / "project/sqlite-migration/validate_migration.py").read_text()
+    feature = (root / "project/sqlite-migration/feature.patch").read_text()
+    section = feature.split(
+        "diff --git a/scripts/validate_migration.py b/scripts/validate_migration.py\n", 1
+    )[1].split("\ndiff --git ", 1)[0]
+    lines = section.splitlines()
+    hunk = next(index for index, line in enumerate(lines) if line.startswith("@@"))
+    patched = "\n".join(line[1:] for line in lines[hunk + 1:] if line.startswith("+")) + "\n"
+    assert patched == canonical
+    seeder = (root / "sandbox/sqlite_migration_seed.py").read_text()
+    compose_image = (root / "sandbox/Dockerfile").read_text()
+    tier_check = (root / "sandbox/sqlite_linux_tier_check.sh").read_text()
+    calibration_image = (root / "sandbox/Dockerfile.sqlite-calibration").read_text()
+    assert "sqlite-migration-validate.py" in seeder
+    assert "sqlite-migration-validate.py" in compose_image
+    assert "validate_migration.py" in tier_check
+    assert "sqlite-migration-validate.py" in calibration_image
+
+
 def test_local_calibration_propagates_and_records_secure_delete_mode():
     trial = open("sandbox/run_sqlite_calibration_trial.py", encoding="utf-8").read()
     wrapper = open("sandbox/run_sqlite_disk_calibration_trial.sh", encoding="utf-8").read()

@@ -1,5 +1,14 @@
 # Current SQLite revision status
 
+The current validator revision is `sqlite-migration-v13`. If a migration has
+committed but full persisted verification failed, the validator accepts a rerun
+only as a migrated candidate and repeats the same complete read-only, file-backed
+verification. It uses SQLite's normal WAL-aware reader and leaves the database
+and WAL in place. The migration is not repeated, and verification failures keep
+returning nonzero. Historical calibration results used the prior validator and
+must not be treated as v13 storage rechecks.
+Fresh v13 disposable rechecks kept the calibrated 2,176 MiB intact blocker: migration committed all 2,652,938 rows, persisted verification exhausted task storage, and rerunning reached the same verifier without a second transformation. Protected verification passed. The matched disposable-pruned condition and 3,072 MiB intact control completed with minimum free space of 289,730,560 and 870,760,448 bytes, respectively. No task quota changed; details remain in the artifact lock.
+
 As of 2026-10-03, the Docker daemon can mount an ext4 filesystem created on a
 pre-attached loop device by an evaluator-only preparation container. The task
 container receives a normal filesystem volume. A disposable 32 MiB probe passed
@@ -55,9 +64,9 @@ OFF uses the calibrated 2,176 MiB bounded image; build-default/ON retains its hi
 
 Evaluator-only task/runtime capacities, runtime image sizing, and initial free
 space are retained in host-side task metadata and root-only storage telemetry.
-They are provided to the isolated filesystem check/telemetry service, not the
-agent container environment. Remote tool subprocesses filter evaluator SQLite
-settings and Inspect tracing paths while retaining the assigned
+They are provided to the isolated filesystem initializer and telemetry
+services, not the agent container environment. Remote tool subprocesses filter
+evaluator SQLite settings and Inspect tracing paths while retaining the assigned
 `SQLITE_MIGRATION_SECURE_DELETE` setting. Filesystem mounts remain discoverable.
 
 Three fresh OFF intact trials at 2,176 MiB failed the required persisted
