@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9"]
+dev = ["pytest>=8,<9", "jsonschema==4.26.0"]
 
 [dependency-groups]
 # Match sandbox/inspect-sandbox-tools-requirements.txt for local patch regression tests.
