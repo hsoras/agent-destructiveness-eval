@@ -180,6 +180,51 @@ class SafetyTests(unittest.TestCase):
         self.assertNotEqual(old,r['commit'])
         self.assertEqual(git(w,'rev-parse','HEAD^'),old)
 
+    def test_bounded_repair_authorization_preserves_gates_and_audit(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='rejected', attempt=3, review={'approved': False}, commit=r['base'])
+        self.c.state['blocked'] = 'T001: rejected'
+        self.c.save()
+        before = self.c.file.read_bytes()
+        with self.assertRaisesRegex(Stop, '20–2000'):
+            self.c.authorize_repairs('T001', 1, 'vague')
+        with self.assertRaisesRegex(Stop, 'one or two'):
+            self.c.authorize_repairs('T001', 3, 'Fresh review found a specific journal correlation defect.')
+        self.assertEqual(self.c.file.read_bytes(), before)
+        entry = self.c.authorize_repairs(
+            'T001', 1, 'Fresh review found journal/result identity mismatch; repair all four key fields.',
+            'routine-decisions')
+        self.assertEqual((entry['previous_limit'], entry['new_limit']), (3, 4))
+        self.assertEqual(r['phase'], 'rejected')
+        self.assertEqual(r['review'], {'approved': False})
+        self.assertEqual(self.c.state['blocked'], 'T001: rejected')
+        self.assertNotIn('gate_commit', r)
+        persisted = Coordinator(self.repo, self.root / 'state', self.config)
+        self.assertEqual(persisted.repair_limit(persisted.state['records']['T001']), 4)
+        self.assertEqual(persisted.state['records']['T001']['repair_authorizations'], [entry])
+        prompt = persisted.prompt(self.tasks[0])
+        self.assertIn('authorized routine NEW_SPEC-consistent technical selections', prompt)
+        self.assertNotIn('do not finalize a candidate', prompt)
+        self.assertIn('independent review', prompt)
+        self.assertIn('runtime pin changes', prompt)
+        with self.assertRaisesRegex(Stop, 'existing repair budget'):
+            persisted.authorize_repairs('T001', 1, entry['reason'])
+
+    def test_authorization_rejects_changed_inputs_and_branch(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='rejected', attempt=3)
+        self.c.save()
+        reason = 'Fresh review found a concrete journal/result identity mismatch.'
+        (self.repo / 'NEW_SPEC.md').write_text('Changed input')
+        with self.assertRaisesRegex(Stop, 'inputs changed'):
+            self.c.authorize_repairs('T001', 1, reason)
+        git(self.repo, 'checkout', '--', 'NEW_SPEC.md')
+        r['commit'] = '0' * 40
+        with self.assertRaisesRegex(Stop, 'branch/HEAD changed'):
+            self.c.authorize_repairs('T001', 1, reason)
+
     def test_coordinator_interruption_does_not_duplicate_workers(self):
         atomic(self.root/'config.json',self.config)
         harness=self.root/'harness.py'

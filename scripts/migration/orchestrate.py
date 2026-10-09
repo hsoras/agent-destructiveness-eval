@@ -20,6 +20,16 @@ HERE = Path(__file__).resolve().parent
 WORKER = 'gpt-6-luna'
 REVIEWER = 'gpt-6-sol'
 PROTECTED = ('docs/migration/', 'NEW_SPEC.md', 'scripts/migration/')
+MAX_ADDITIONAL_REPAIRS = 6
+ROUTINE_DECISION_GUIDANCE = (
+    'The user has authorized routine NEW_SPEC-consistent technical selections, including '
+    'G02/G03 candidate and release decisions, during this unattended run. Record concrete '
+    'evidence and leave commit-specific T001/T002 ratification to the coordinator after '
+    'independent review. This does not authorize runtime pin changes, upstream patches, '
+    'production deployment or database operations, destructive Git operations, merging '
+    'into main, or weakening tests, independent review, or acceptance evidence. '
+    'No provider-backed local acceptance calls are authorized by this guidance.\n'
+)
 
 class Stop(RuntimeError):
     pass
@@ -192,6 +202,48 @@ class Coordinator:
     def save(self):
         atomic(self.file, self.state)
 
+    def repair_limit(self, record):
+        return 1 + self.config['max_repairs'] + sum(
+            entry['additional_attempts'] for entry in record.get('repair_authorizations', []))
+
+    def authorize_repairs(self, task_id, additional_attempts, reason, execution_guidance=None):
+        """Record a bounded, task-specific extension without changing frozen run inputs."""
+        if not self.state or task_id not in self.state['records']:
+            raise Stop('Unknown assigned task')
+        if not isinstance(additional_attempts, int) or isinstance(additional_attempts, bool) or not 1 <= additional_attempts <= 2:
+            raise Stop('Authorize one or two additional attempts at a time')
+        if not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 2000:
+            raise Stop('Provide a concrete 20–2000 character repair reason')
+        if execution_guidance not in (None, 'routine-decisions'):
+            raise Stop('Unknown execution guidance')
+        if self.inputs(read_graph(self.repo)) != self.state['input_digest']:
+            raise Stop('Approved task/spec/plan inputs changed; no repair authorization')
+        if git(self.integration, 'rev-parse', 'HEAD') != self.state['expected_head']:
+            raise Stop('Integration HEAD changed outside coordinator')
+        clean(self.integration)
+        record = self.state['records'][task_id]
+        if record['phase'] != 'rejected' or record['attempt'] < self.repair_limit(record):
+            raise Stop('Extend only a rejected task after its existing repair budget is exhausted')
+        worktree = Path(record['worktree'])
+        if (git(worktree, 'branch', '--show-current') != record['branch'] or
+                git(worktree, 'rev-parse', 'HEAD') != (record['commit'] or record['base'])):
+            raise Stop('Worker branch/HEAD changed; inspect before authorizing repair')
+        granted = sum(entry['additional_attempts'] for entry in record.get('repair_authorizations', []))
+        if granted + additional_attempts > MAX_ADDITIONAL_REPAIRS:
+            raise Stop('Cumulative additional repair budget exceeded')
+        prior_guidance = self.state.get('execution_guidance')
+        if prior_guidance and execution_guidance and prior_guidance != execution_guidance:
+            raise Stop('Existing execution guidance cannot be replaced')
+        entry = dict(time=time.time(), task=task_id, previous_limit=self.repair_limit(record),
+                     additional_attempts=additional_attempts, new_limit=self.repair_limit(record) + additional_attempts,
+                     attempt_at_authorization=record['attempt'], reason=reason.strip(),
+                     execution_guidance=execution_guidance)
+        record.setdefault('repair_authorizations', []).append(entry)
+        if execution_guidance:
+            self.state['execution_guidance'] = execution_guidance
+        self.save()
+        return entry
+
     @property
     def integration(self):
         return Path(self.state['integration'])
@@ -253,6 +305,10 @@ class Coordinator:
             if rel != 'AGENTS.md' and any(s.startswith(str(p.parent.relative_to(self.repo))) for s in scopes):
                 instructions.append(f'{rel}:\n{p.read_text()}')
         spec = (self.repo / 'docs/migration/NEW_SPEC.md').read_text()
+        decision_guidance = (ROUTINE_DECISION_GUIDANCE if self.state and
+                             self.state.get('execution_guidance') == 'routine-decisions' else
+                             'G02/G03 permit candidate research and evidence gathering; do not finalize a candidate, release contract, authority or quota without separate user approval. '
+                             'If these approvals are needed, report the gate and stop; later explicit user approvals may be supplied in targeted repair instructions.\n')
         # Full authoritative spec avoids dropping subsection requirements/all-section audit.
         return (f'Implement only task {task["id"]} in this worktree. Write ownership: {json.dumps(scopes)}.\n'
                 'Do not merge, rebase, switch branches, push, edit Git metadata, or update migration planning/status/spec files. '
@@ -262,8 +318,7 @@ class Coordinator:
                 'Only supplied coding task is authorized; do not launch other agents or tasks.\n'
                 'User decision limits: G01 permits supported-hook feasibility investigation only; no runtime pin changes or upstream patches without separate approval. '
                 'D02 permits a neutral minimal artifact API only if it satisfies the spec. D03 permits symmetric MVP exclusion of the spec-optional features. '
-                'G02/G03 permit candidate research and evidence gathering; do not finalize a candidate, release contract, authority or quota without separate user approval. '
-                'If these approvals are needed, report the gate and stop; later explicit user approvals may be supplied in targeted repair instructions.\n'
+                + decision_guidance +
                 f'Excluded ownership: {json.dumps(self.config.get("exclusions", {}).get(task["id"], []))}\nRepair findings (if any): {repair}\nRepository instructions:\n' + '\n'.join(instructions) +
                 '\nTask file, requirements, acceptance and validation:\n' + task['text'] +
                 '\nAuthoritative spec (including relevant sections cited above):\n' + spec +
@@ -649,7 +704,7 @@ class Coordinator:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['configure', 'status', 'run', 'resume', 'repair', 'retry-checks', 'approve-gate', 'reconcile', 'smoke'])
+    p.add_argument('command', choices=['configure', 'status', 'run', 'resume', 'repair', 'authorize-repairs', 'retry-checks', 'approve-gate', 'reconcile', 'smoke'])
     p.add_argument('--repo', type=Path, default=Path.cwd())
     p.add_argument('--state-dir', type=Path)
     p.add_argument('--config', type=Path, default=HERE / 'config.json')
@@ -657,6 +712,9 @@ def main():
     p.add_argument('--task')
     p.add_argument('--confirmed-stopped', action='store_true', help='For uncertain launch only: operator has checked that no runner or child remains')
     p.add_argument('--findings', help='Targeted repair instructions; required for repair')
+    p.add_argument('--additional-attempts', type=int, help='One or two bounded attempts for an exhausted rejected task')
+    p.add_argument('--reason', help='Concrete evidence supporting the additional repair budget')
+    p.add_argument('--execution-guidance', choices=['routine-decisions'], help='Persist the user\'s standing routine-decision authorization in worker prompts')
     args = p.parse_args()
     repo = args.repo.resolve()
     if args.command == 'configure':
@@ -695,7 +753,10 @@ def main():
         else:
             if not c.state:
                 raise Stop('No run to recover')
-            if args.command == 'retry-checks':
+            if args.command == 'authorize-repairs':
+                entry = c.authorize_repairs(args.task, args.additional_attempts, args.reason, args.execution_guidance)
+                print(f'Authorized {entry["additional_attempts"]} additional {args.task} attempt(s); limit {entry["new_limit"]}. State: {c.file}')
+            elif args.command == 'retry-checks':
                 clean(c.integration)
                 # A failed merge or uncertainty cannot be cleared by claiming tests passed.
                 if any(r['phase'] in ('merge_pending', 'worker_running', 'review_running') for r in c.state['records'].values()):
@@ -728,7 +789,7 @@ def main():
                         raise Stop('Gate requires independent approval first')
                     r['gate_commit'] = r['commit']
                 else:
-                    if not args.findings or r['attempt'] >= 1 + config['max_repairs']:
+                    if not args.findings or r['attempt'] >= c.repair_limit(r):
                         raise Stop('Supply targeted findings; bounded repair limit applies')
                     if r['phase'] in ('merged', 'merge_pending', 'integration_testing', 'status_pending'):
                         raise Stop('Already integrated or uncertain merge; manual owner-scoped fix/revert required')

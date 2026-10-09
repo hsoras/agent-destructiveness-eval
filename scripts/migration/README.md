@@ -37,6 +37,8 @@ python3 scripts/migration/orchestrate.py resume --approved-execution
 
 For rejected or incomplete unmerged work, supply concrete findings. Repairs reuse the worktree and preserve earlier commits, with at most two repair attempts. Every repair reruns verification and receives a fresh independent review; gate approvals do not carry to a changed commit.
 
+When an exhausted, rejected task has new review evidence, the supervisor may record one or two additional attempts at a time with `authorize-repairs --task T001 --additional-attempts 1 --reason 'Concrete new finding and repair hypothesis' --approved-execution`. The coordinator appends the reason and new limit to the run state under the lock, with a cumulative ceiling of six additional attempts. It changes neither the frozen run configuration nor task/spec input digests, review requirements, or commit-specific gates. If the user's standing unattended authorization applies, add `--execution-guidance routine-decisions` to that command; future worker prompts then permit routine G02/G03 decisions while retaining the pinned runtime, safety and verification boundaries. After authorization, use the ordinary `repair --task T001 --findings 'Exact targeted instruction' --approved-execution` and `resume --approved-execution` sequence.
+
 ```sh
 python3 scripts/migration/orchestrate.py repair --task T003 \
   --findings 'Implement the missing AC2 transaction rollback and add the regression case.' \
