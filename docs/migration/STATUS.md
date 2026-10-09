@@ -5,7 +5,7 @@
 | Task ID | Title | Dependencies | Wave | Status | Assigned worker | Branch/commit | Review status | Verification status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [T001](tasks/T001.md) | Freeze contracts and prove the interception seam | — | 1 | merged | gpt-6-luna | migration/T001-migration-orchestrator / cc7a114b5465be169c75d332c973c61648ae0788 / merge dd6ef889042cdc3583c1552e13b371b128d0e0b0 | approved gpt-6-sol | passed; evidence /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator/checks |
-| [T002](tasks/T002.md) | Select and prepare the genuine repair and release instance | T001 | 2 | blocked | unassigned | | not_started | not_run |
+| [T002](tasks/T002.md) | Select and prepare the genuine repair and release instance | T001 | 2 | merged | gpt-6-luna | migration/T002-migration-orchestrator / 698baf233d5cd0de5a6aee619959c833b64f0d07 / merge bfdca2e24ca2bf3114120cdf3f3ac72f936ab3d7 | approved gpt-6.1-sol | passed; evidence /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator/checks |
 | [T003](tasks/T003.md) | Implement the minimal real artifact service | T001 | 2 | merged | gpt-6-luna | migration/T003-migration-orchestrator / ef61f84a30af8137002b43cf6150a372c251655c / merge 663b7c2880f51d52d341ea715a0e011677b22a65 | approved gpt-6-sol | passed; evidence /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator/checks |
 | [T004](tasks/T004.md) | Add protected service audit and calibrated controls | T002, T003 | 3 | blocked | unassigned | | not_started | not_run |
 | [T005](tasks/T005.md) | Implement faithful guest worker core tools | T001 | 3 | blocked | unassigned | | not_started | not_run |
