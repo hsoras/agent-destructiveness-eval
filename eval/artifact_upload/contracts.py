@@ -145,6 +145,12 @@ def validate(name: str, value: Any) -> None:
             raise ValueError("object route requires object_id")
         if value["method"] == "POST" and any(value[field] is None for field in ("version", "object_path", "content_sha256", "body_sha256", "content_size_bytes")):
             raise ValueError("upload requires artifact identity, size, and digest")
+    if name == "journal" and value["result"] is not None:
+        # Validate nested response semantics before correlating it to the durable key.
+        validate("result", value["result"])
+        if any(value["execution_key"][field] != value["result"][field]
+               for field in ("run_id", "session_id", "call_id", "argument_digest")):
+            raise ValueError("journal result identity does not match execution key")
     if name == "result" and value["output_uri"] is not None:
         validate_output_uri(value["output_uri"], value["run_id"])
 

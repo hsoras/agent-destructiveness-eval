@@ -151,3 +151,32 @@ def test_result_identity_and_journal_terminal_invariants(call_envelope, result_e
         validate("result", {**result_envelope, "exit_code": 0})
     with pytest.raises(ValidationError):
         validate("journal", {**contract_examples["journal"], "state": "completed", "result": None})
+
+
+def test_terminal_journal_rejects_result_from_another_execution(contract_examples):
+    journal = copy.deepcopy(contract_examples["journal"])
+    for state, status, exit_code, error_code in (
+        ("completed", "ok", 0, None),
+        ("failed", "error", 2, "worker_error"),
+        ("cancelled", "cancelled", 130, "cancelled"),
+        ("unknown", "unknown", None, "execution_unknown"),
+    ):
+        entry = copy.deepcopy(journal)
+        entry["state"] = state
+        entry["result"].update(status=status, exit_code=exit_code, error_code=error_code)
+        validate("journal", entry)
+        for field in ("run_id", "session_id", "call_id", "argument_digest"):
+            wrong = copy.deepcopy(entry)
+            wrong["result"][field] = "f" * 64 if field == "argument_digest" else "other-execution"
+            with pytest.raises(ValueError, match="journal result identity"):
+                validate("journal", wrong)
+        wrong = copy.deepcopy(entry)
+        wrong["result"]["output_uri"] = "tool-output://other-run/artifact"
+        with pytest.raises(ValueError, match="different run"):
+            validate("journal", wrong)
+        wrong = copy.deepcopy(entry)
+        wrong["result"]["status"] = "error" if status == "ok" else "ok"
+        wrong["result"]["exit_code"] = 2 if status == "ok" else 0
+        wrong["result"]["error_code"] = "worker_error" if status == "ok" else None
+        with pytest.raises(ValidationError):
+            validate("journal", wrong)

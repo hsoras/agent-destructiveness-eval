@@ -18,21 +18,21 @@ No runtime pin, upstream source, or legacy configuration was changed. Only the i
 
 ## Local prerequisites and commands
 
-The source repository `.venv` supplies Python, pytest and `jsonschema==4.26.0`. T001 declares that already-locked package in the dev extra; no existing package version changed. `uv lock --offline --no-upgrade` and `uv lock --check --offline` pass using the prepared local cache. The existing `.python-version` warning is unchanged.
+The prepared source repository environment has Python and `jsonschema==4.26.0`; this worktree's `.venv` currently lacks pytest, so its focused pytest command cannot run until the declared dev environment is synchronized. T001 declares pytest and jsonschema in the dev extra; no existing package version changed. Earlier lock checks used the prepared local cache. The existing `.python-version` warning is unchanged.
 
 OpenCode custom tools require actual Zod schemas. The runtime canary uses its supported helper `@opencode-ai/plugin@1.14.41`, `@opencode-ai/sdk@1.14.41`, and `zod@4.1.8`. A prepared offline seed, including the package lock and installed dependencies, is retained at source `.scenario/migration-readiness/opencode-canary-plugin-1.14.41/`. This was copied from Sol High's retained successful isolated runtime config, whose package manifest/lock pin the same release. It does not modify upstream or tracked runtime dependencies. The test verifies these versions, copies the seed into a fresh isolated config and forces npm offline with an unreachable registry. Missing/changed prerequisites or localhost denial fail explicitly; they are never skipped or accepted as proof. To prepare on another machine, install that exact pinned helper into an ignored seed using its retained lock (`npm ci --ignore-scripts`), then set `OPENCODE_CANARY_PLUGIN_SEED` to the directory. Preparation may need package-registry access; the actual test uses only its mock provider.
 
 Run from the T001 worktree:
 
 ```sh
-/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -m pytest -q tests/artifact_upload/test_contracts.py
+.venv/bin/python -m pytest -q tests/artifact_upload/test_contracts.py
 npm --prefix runtime/artifact_upload_host run typecheck
 npm --prefix runtime/artifact_upload_host test
 ```
 
 The npm runner uses `node --import tsx --test`, avoiding the tsx CLI IPC socket. Defaults identify the existing source checkout and pinned Darwin binary; `ARTIFACT_MIGRATION_SOURCE` can identify an equivalent prepared source checkout, `ARTIFACT_MIGRATION_PYTHON` its interpreter for the TypeScript bridge, and `OPENCODE_CANARY_PLUGIN_SEED` the prepared helper. The binary digest/platform gate remains strict. The coordinator uses its configured source interpreter. Host canary sockets need permitted local execution, as did the pre-execution environment checks.
 
-Latest supervisor checks: **10 Python contract tests passed**, TypeScript typecheck passed, **4 npm tests passed with no skips**, and lock check/regeneration passed. A fresh independent review and commit-specific user ratification are still required. These engineering mock replies are not behavioral or appearance validation results.
+Independent review approved AC1/AC3 on candidate `25260a176e2026ff415cc8f6d4a25f0fbd685870` but rejected AC2 for missing nested journal/result identity correlation. The preserved uncommitted AC2 fix now validates nested result semantics, correlates all four execution-key fields, and tests cross-run output rejection and mismatched terminal states. In this worktree, `npm run typecheck` passes. The focused pytest command cannot start because the source `.venv/bin/python` has no pytest module. `npm test` reports 3 of 4 tests passing; the pinned-runtime mock-provider canary is blocked when its localhost server bind is denied by the managed sandbox (`PermissionError: [Errno 1] Operation not permitted`). A prior permitted run's retained evidence is documented above, but this run does not count as a fresh canary pass. These engineering mock replies are not behavioral or appearance validation results.
 
 ## Versioned wire surface
 
