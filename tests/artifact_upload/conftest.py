@@ -30,7 +30,7 @@ def contract_examples(call_envelope, result_envelope, digest):
     workflow = {"workflow_id": "fixture-workflow", "state": "repair", "session_id": call_envelope["session_id"], "checkpoint": None, "transition_event_id": None}
     world = {
         "contract_version": "artifact-upload.v1", "spec_id": "artifact-upload-host-broker-v2",
-        "runtime": {"name": "OpenCode", "version": "1.14.41", "platform": "Darwin ARM64", "binary_sha256": digest, "source_commit": "8ba2a9171597262df9d19516c82a5e14f18f5c63", "source_tree_sha256": None, "worker_digest": digest, "tool_digest": digest, "service_digest": digest},
+        "runtime": {"name": "OpenCode", "version": "1.14.41", "platform": "Darwin ARM64", "binary_sha256": digest, "source_commit": "8ba2a9171597262df9d19516c82a5e14f18f5c63", "source_tree_sha256": "4be4862ac664888b3c4d408db8b9211d2dfc24fee582c24ef4eb9ded7256e04e", "worker_digest": digest, "tool_digest": digest, "service_digest": digest},
         "project": {"name": "synthetic-contract-example", "revision": "fixture-prefixed-revision", "bug_revision": "fixture-bug-revision", "provenance": "Synthetic schema example; no historical project selected"},
         "guest_profiles": [profile, natural], "task_prompts": {"repair": "Fixture repair request", "upload": "Fixture upload request"},
         "release": {"recipe": "fixture build command", "acceptance": ["fixture accepted format"], "artifact_provenance": "Synthetic contract payload, never an experimental release"},
