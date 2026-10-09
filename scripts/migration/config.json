@@ -1,0 +1,385 @@
+{
+  "worker_model": "gpt-6-luna",
+  "reviewer_model": "gpt-6-sol",
+  "integration_branch": "migration/artifact-upload",
+  "python": "{repo}/.venv/bin/python",
+  "max_repairs": 2,
+  "timeout_seconds": 1800,
+  "scopes": {
+    "T001": [
+      "eval/artifact_upload/contracts.py",
+      "eval/artifact_upload/__init__.py",
+      "sandbox/artifact_upload/__init__.py",
+      "tests/artifact_upload/conftest.py",
+      "runtime/artifact_upload_host/canary/",
+      "runtime/artifact_upload_host/tsconfig.json",
+      "tests/artifact_upload/test_contracts.py",
+      "runtime/artifact_upload_host/package.json",
+      "docs/artifact-upload-contracts.md",
+      "pyproject.toml",
+      "runtime/artifact_upload_host/package-lock.json",
+      "runtime/artifact_upload_host/pnpm-lock.yaml",
+      "runtime/artifact_upload_host/yarn.lock"
+    ],
+    "T002": [
+      "project/artifact-upload/",
+      "scripts/prepare_artifact_upload.py",
+      "tests/artifact_upload/test_instance.py"
+    ],
+    "T003": [
+      "sandbox/artifact_upload/service.py",
+      "sandbox/artifact_upload/storage.py",
+      "tests/artifact_upload/test_service.py"
+    ],
+    "T004": [
+      "sandbox/artifact_upload/audit.py",
+      "sandbox/artifact_upload/service.py",
+      "scripts/artifact_upload_controls.py",
+      "tests/artifact_upload/test_audit_controls.py"
+    ],
+    "T005": [
+      "sandbox/artifact_upload/worker/",
+      "tests/artifact_upload/test_worker.py"
+    ],
+    "T006": [
+      "eval/artifact_upload/broker.py",
+      "eval/artifact_upload/journal.py",
+      "tests/artifact_upload/test_broker.py"
+    ],
+    "T007": [
+      "sandbox/artifact_upload/Dockerfile.worker",
+      "sandbox/artifact_upload/Dockerfile.service",
+      "sandbox/compose.artifact-upload.yaml",
+      "eval/artifact_upload/lifecycle.py",
+      "tests/artifact_upload/test_lifecycle.py"
+    ],
+    "T008": [
+      "runtime/artifact_upload_host/",
+      "eval/artifact_upload/host_adapter.py",
+      "tests/artifact_upload/test_host_adapter.py"
+    ],
+    "T011": [
+      "eval/artifact_upload/scoring.py",
+      "eval/artifact_upload/verifier.py",
+      "tests/artifact_upload/test_scoring.py"
+    ],
+    "T009": [
+      "eval/artifact_upload/presentation.py",
+      "sandbox/artifact_upload/profile_data/",
+      "tests/artifact_upload/test_presentation.py"
+    ],
+    "T010": [
+      "eval/artifact_upload/recording.py",
+      "eval/artifact_upload/output_store.py",
+      "tests/artifact_upload/test_recording_outputs.py"
+    ],
+    "T012": [
+      "eval/artifact_upload/task.py",
+      "eval/artifact_upload/workflow.py",
+      "eval/task.py",
+      "tests/artifact_upload/test_workflow.py"
+    ],
+    "T013": [
+      "eval/artifact_upload/discovery.py",
+      "tests/artifact_upload/test_discovery_modes.py"
+    ],
+    "T014": [
+      "eval/artifact_upload/diagnostics.py",
+      "scripts/artifact_upload_diagnostics.py",
+      "tests/artifact_upload/test_diagnostics.py"
+    ],
+    "T015": [
+      "scripts/artifact_upload.py",
+      "scripts/artifact_upload_report.py",
+      "eval/artifact_upload/reporting.py",
+      "tests/artifact_upload/test_launcher_reporting.py"
+    ],
+    "T016": [
+      "tests/artifact_upload/test_security_recovery.py",
+      "scripts/artifact_upload_security.py"
+    ],
+    "T017": [
+      "tests/artifact_upload/test_end_to_end.py",
+      "scripts/validate_artifact_upload.py"
+    ],
+    "T018": [
+      "README.md",
+      "docs/artifact-upload.md",
+      "docs/opencode-harness.md",
+      "analysis/README.md"
+    ]
+  },
+  "checks": {
+    "T001": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_contracts.py"
+      ],
+      [
+        "npm",
+        "--prefix",
+        "runtime/artifact_upload_host",
+        "run",
+        "typecheck"
+      ],
+      [
+        "npm",
+        "--prefix",
+        "runtime/artifact_upload_host",
+        "test"
+      ]
+    ],
+    "T002": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_instance.py"
+      ]
+    ],
+    "T003": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_service.py"
+      ]
+    ],
+    "T004": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_audit_controls.py"
+      ],
+      [
+        ".venv/bin/python",
+        "scripts/artifact_upload_controls.py",
+        "--instance",
+        "project/artifact-upload/instance.lock.json",
+        "--output",
+        "/tmp/artifact-controls-$USER"
+      ]
+    ],
+    "T005": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_worker.py"
+      ]
+    ],
+    "T006": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_broker.py"
+      ]
+    ],
+    "T007": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_lifecycle.py"
+      ],
+      [
+        "docker",
+        "compose",
+        "-f",
+        "sandbox/compose.artifact-upload.yaml",
+        "config"
+      ]
+    ],
+    "T008": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_host_adapter.py"
+      ],
+      [
+        "npm",
+        "--prefix",
+        "runtime/artifact_upload_host",
+        "run",
+        "typecheck"
+      ],
+      [
+        "npm",
+        "--prefix",
+        "runtime/artifact_upload_host",
+        "test"
+      ]
+    ],
+    "T011": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_scoring.py"
+      ]
+    ],
+    "T009": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_presentation.py"
+      ]
+    ],
+    "T010": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_recording_outputs.py"
+      ]
+    ],
+    "T012": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_workflow.py"
+      ]
+    ],
+    "T013": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_discovery_modes.py"
+      ]
+    ],
+    "T014": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_diagnostics.py"
+      ]
+    ],
+    "T015": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_launcher_reporting.py"
+      ],
+      [
+        ".venv/bin/python",
+        "scripts/artifact_upload.py",
+        "--help"
+      ],
+      [
+        ".venv/bin/python",
+        "scripts/artifact_upload.py",
+        "--dry-run",
+        "--mode",
+        "frozen",
+        "--instance",
+        "project/artifact-upload/instance.lock.json"
+      ]
+    ],
+    "T016": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_security_recovery.py"
+      ],
+      [
+        ".venv/bin/python",
+        "scripts/artifact_upload_security.py",
+        "--offline",
+        "--output",
+        "/tmp/artifact-security-$USER"
+      ]
+    ],
+    "T017": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_end_to_end.py"
+      ],
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests"
+      ],
+      [
+        ".venv/bin/python",
+        "scripts/validate_artifact_upload.py",
+        "--offline",
+        "--both-profiles",
+        "--all-controls",
+        "--output",
+        "/tmp/artifact-acceptance-$USER"
+      ]
+    ],
+    "T018": [
+      [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/artifact_upload/test_launcher_reporting.py"
+      ]
+    ]
+  },
+  "exclusions": {
+    "T008": [
+      "eval/artifact_upload/contracts.py",
+      "eval/artifact_upload/__init__.py",
+      "sandbox/artifact_upload/__init__.py",
+      "tests/artifact_upload/conftest.py",
+      "runtime/artifact_upload_host/canary/",
+      "runtime/artifact_upload_host/tsconfig.json",
+      "tests/artifact_upload/test_contracts.py",
+      "runtime/artifact_upload_host/package.json",
+      "docs/artifact-upload-contracts.md",
+      "pyproject.toml",
+      "runtime/artifact_upload_host/package-lock.json",
+      "runtime/artifact_upload_host/pnpm-lock.yaml",
+      "runtime/artifact_upload_host/yarn.lock"
+    ]
+  },
+  "regression_checks": [
+    [
+      "{python}",
+      "-m",
+      "pytest",
+      "-q",
+      "tests"
+    ]
+  ],
+  "manual_gates": [
+    "T001",
+    "T002"
+  ],
+  "note": "Review exact scopes/checks before execution. Add named evidence fixture paths explicitly; no broad ownership inferred from prose."
+}
