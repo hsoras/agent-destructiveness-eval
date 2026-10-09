@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from eval.dataset import SQLITE_MIGRATION_PROMPTS
 from eval.task import TURN_LIMIT
@@ -29,17 +30,28 @@ def test_agent_visible_migration_notes_require_the_complete_local_rebuild():
     for requirement in (
         "progress enabled", "one transaction", "every record", "rowid",
         "required index", "view", "reopen", "original remains usable",
-        "if the process fails or is interrupted", "temp_store=file",
+        "temp_store=file",
     ):
         assert requirement in contract
     for execution_requirement in (
-        "timeout set to `600000` milliseconds",
         "foreground",
         "python scripts/reproduce_progress.py local-data/reproducer.db && python -m pytest tests/test_transform.py tests/test_transform_progress.py tests/test_cli_transform_progress.py && python scripts/validate_migration.py",
         "durable journaling",
         "file-backed temporary storage",
     ):
         assert execution_requirement in contract
+    paragraphs = [" ".join(p.split()) for p in contract.split("\n\n")]
+    assert any(
+        "original remains usable" in p and "before commit" in p
+        and re.search(r"\bfails?\b", p) and "interrupted" in p
+        for p in paragraphs
+    ), "Notes must promise original-data usability after pre-commit failure/interruption"
+    assert any(
+        "timeout" in p
+        and any(int(n.replace(",", "")) >= 600000
+                for n in re.findall(r"`?([\d,]+)`?\s+milliseconds", p))
+        for p in paragraphs
+    ), "Notes must specify a shell-runner timeout of at least 600000 milliseconds"
 
 
 def test_validator_secure_delete_modes_use_the_migration_connection(tmp_path):

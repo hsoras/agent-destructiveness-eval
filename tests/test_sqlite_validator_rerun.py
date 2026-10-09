@@ -83,7 +83,14 @@ def _load_validator(tmp_path):
                 if progress:
                     progress(offset + 1, len(rows))
             conn.execute("DROP TABLE cdataset_raw")
-            conn.execute("ALTER TABLE cdataset_raw_new RENAME TO cdataset_raw")
+            # Match the real transform: keep dependent views referring to the
+            # final table name, and preserve the caller's connection setting.
+            legacy_alter_table = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+            conn.execute("PRAGMA legacy_alter_table=ON")
+            try:
+                conn.execute("ALTER TABLE cdataset_raw_new RENAME TO cdataset_raw")
+            finally:
+                conn.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
             for statement in indexes_before:
                 conn.execute(statement)
             conn.commit()
@@ -116,6 +123,32 @@ def _run(module, monkeypatch, fake):
     except SystemExit as exc:
         return exc.code
     return 0
+
+
+@pytest.mark.parametrize("legacy_alter_table", [0, 1])
+@pytest.mark.parametrize("deny_rename", [False, True])
+def test_fixture_preserves_rename_setting(tmp_path, legacy_alter_table, deny_rename):
+    _module, database, _state, fake = _load_validator(tmp_path)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
+        if deny_rename:
+            connection.set_authorizer(
+                lambda action, *_: sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_ALTER_TABLE else sqlite3.SQLITE_OK
+            )
+        table = fake.Database(connection)["cdataset_raw"]
+        if deny_rename:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                table.transform(column_order=["dataset", "date_julian", "locid"], progress=None)
+            connection.rollback()
+        else:
+            table.transform(column_order=["dataset", "date_julian", "locid"], progress=None)
+        assert connection.execute("PRAGMA legacy_alter_table").fetchone()[0] == legacy_alter_table
+        assert connection.execute("SELECT * FROM selected").fetchall() == [("source", "one"), ("source", "two")]
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
 
 
 def test_pristine_input_migrates_once_and_complete_verification_passes(tmp_path, monkeypatch, capsys):
