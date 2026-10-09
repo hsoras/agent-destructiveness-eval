@@ -69,9 +69,12 @@ class ArtifactStore:
         self._lock = threading.RLock()
         self._reservations: dict[str, tuple[int, str]] = {}
         self._reserved_objects: set[str] = set()
+        self._reserved_keys: dict[str, tuple[str, str]] = {}
+        self._outbox: list[dict] = []
         self._keys: dict[str, dict] = {}
         self._objects: dict[str, dict] = {}
         self._load()
+        self._deliver_outbox()
         self._reconcile_staging()
 
     def _load(self):
@@ -81,6 +84,7 @@ class ArtifactStore:
             return
         self._objects = data.get("objects", {})
         self._keys = data.get("idempotency", {})
+        self._outbox = data.get("outbox", [])
         for oid, meta in self._objects.items():
             p = self._object_file(oid)
             if not p.is_file() or p.stat().st_size != meta["size_bytes"]:
@@ -94,8 +98,9 @@ class ArtifactStore:
         # A crash after object installation but before index replacement leaves an
         # uncommitted content file. It is not exposed and must not consume quota.
         committed = set(self._objects)
+        pending_deletes = {e["object_id"] for e in self._outbox if e["event_type"] == "artifact.delete"}
         for child in self.objects_dir.iterdir():
-            if child.is_file() and child.name not in committed:
+            if child.is_file() and child.name not in committed and child.name not in pending_deletes:
                 child.unlink()
 
     def _object_file(self, oid: str) -> Path:
@@ -105,7 +110,7 @@ class ArtifactStore:
 
     def _save_index(self):
         temp = self.root / (".index-" + uuid.uuid4().hex)
-        payload = json.dumps({"objects": self._objects, "idempotency": self._keys},
+        payload = json.dumps({"objects": self._objects, "idempotency": self._keys, "outbox": self._outbox},
                              sort_keys=True, separators=(",", ":")).encode()
         with open(temp, "wb") as f:
             f.write(payload); f.flush(); os.fsync(f.fileno())
@@ -114,9 +119,38 @@ class ArtifactStore:
     def _request_id(self):
         return uuid.uuid4().hex
 
-    def _emit(self, action: str, request_id: str, **facts):
-        self.audit({"event_id": uuid.uuid4().hex, "event_type": "artifact." + action,
-                    "occurred_at": time.time(), "request_id": request_id, **facts})
+    def _event(self, action: str, request_id: str, **facts):
+        return {"event_id": uuid.uuid4().hex, "event_type": "artifact." + action,
+                "occurred_at": time.time(), "request_id": request_id, **facts}
+
+    def _deliver_outbox(self):
+        """Deliver committed events at least once; callback success is then acked durably."""
+        with self._lock:
+            while self._outbox:
+                event = self._outbox[0]
+                try:
+                    self.audit(dict(event))
+                except Exception:
+                    return False
+                if event["event_type"] == "artifact.delete":
+                    try:
+                        self._object_file(event["object_id"]).unlink(missing_ok=True)
+                    except OSError:
+                        # Keep the event pending until byte cleanup can be
+                        # reconciled. The callback may see this stable ID again.
+                        return False
+                self._outbox.pop(0)
+                try:
+                    self._save_index()
+                except BaseException:
+                    self._outbox.insert(0, event)
+                    return False
+            return True
+
+    def _queue_mutation(self, action: str, request_id: str, **facts):
+        event = self._event(action, request_id, **facts)
+        self._outbox.append(event)
+        return event
 
     def _authorize(self, credential_id: str, capability: str, repository: str, project: str):
         cred = self.credentials.get(credential_id)
@@ -161,16 +195,23 @@ class ArtifactStore:
                 raise StoreError("upload_too_large", "upload exceeds staging bound", 413)
             if not re.fullmatch(r"[0-9a-f]{64}", content_sha256 or ""):
                 raise StoreError("digest_mismatch", "Content-SHA256 does not match body", 400)
-            identity_base = {"repository": repository, "project": project, "version": version, "object_path": object_path,
+            identity_base = {"operation": "upload", "repository": repository, "project": project, "version": version, "object_path": object_path,
                         "sha256": content_sha256, "size_bytes": size, "owner_id": owner_id,
                         "retention": retention, "dependencies": list(dependencies or []),
                         "credential_id": credential_id}
+            reservation_id = None
             with self._lock:
                 old = self._keys.get(idempotency_key)
                 if old:
                     if old["identity"] != identity_base:
                         raise StoreError("idempotency_conflict", "key reused with different request", 409)
                     return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
+                request_digest = hashlib.sha256(json.dumps(identity_base, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                reserved_key = self._reserved_keys.get(idempotency_key)
+                if reserved_key:
+                    if reserved_key != ("upload", request_digest):
+                        raise StoreError("idempotency_conflict", "key reused with different in-flight request", 409)
+                    raise StoreError("idempotency_in_progress", "identical request is already in progress", 409)
                 oid = hashlib.sha256((repository + "\0" + project + "\0" + version + "\0" + object_path).encode()).hexdigest()
                 if oid in self._objects or oid in self._reserved_objects:
                     raise StoreError("object_exists", "object versions are immutable", 409)
@@ -181,6 +222,7 @@ class ArtifactStore:
                 reservation_id = uuid.uuid4().hex
                 self._reservations[reservation_id] = (size, repository)
                 self._reserved_objects.add(oid)
+                self._reserved_keys[idempotency_key] = ("upload", request_digest)
             stage = self.staging_dir / reservation_id
             try:
                 with open(stage, "xb") as f:
@@ -202,6 +244,14 @@ class ArtifactStore:
                     raise StoreError("digest_mismatch", "Content-SHA256 does not match body", 400)
                 identity = {**identity_base, "sha256": digest}
                 with self._lock:
+                    current = self._reserved_keys.get(idempotency_key)
+                    if current != ("upload", request_digest):
+                        raise StoreError("idempotency_conflict", "key reservation changed before commit", 409)
+                    old = self._keys.get(idempotency_key)
+                    if old:
+                        if old["identity"] != identity:
+                            raise StoreError("idempotency_conflict", "key reused with different request", 409)
+                        return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
                     if oid in self._objects:
                         raise StoreError("object_exists", "object versions are immutable", 409)
                     # The audit snapshot must reflect mutations that committed
@@ -216,25 +266,34 @@ class ArtifactStore:
                             "dependencies": list(dependencies or []), "created_at": time.time()}
                     self._objects[oid] = meta
                     body = {"object_id": oid, "metadata": self._metadata(meta)}
-                    self._keys[idempotency_key] = {"identity": identity, "status": 201, "body": body}
+                    self._keys[idempotency_key] = {"identity": identity, "request_digest": request_digest,
+                                                   "status": 201, "body": body}
+                    event = self._queue_mutation("upload", request_id, operation_digest=request_digest,
+                        credential_id=credential_id, object_id=oid, repository=repository, project=project,
+                        version=version, object_path=object_path, before_usage=committed_at_commit,
+                        after_usage=committed_at_commit + size, sha256=digest, size_bytes=size)
                     try:
                         self._save_index()
                     except BaseException:
                         self._objects.pop(oid, None)
                         self._keys.pop(idempotency_key, None)
+                        self._outbox.remove(event)
                         self._object_file(oid).unlink(missing_ok=True)
                         raise
-                    self._emit("upload", request_id, object_id=oid, before_usage=committed_at_commit,
-                               after_usage=committed_at_commit + size, sha256=digest, size_bytes=size)
-                    return 201, {"request_id": request_id, "error": None, "body": body}
+                delivered = self._deliver_outbox()
+                return 201, {"request_id": request_id, "error": None, "body": body,
+                             "audit_pending": not delivered}
             finally:
-                with self._lock:
-                    self._reservations.pop(reservation_id, None)
-                    self._reserved_objects.discard(oid)
-                try: stage.unlink()
-                except FileNotFoundError: pass
+                if reservation_id is not None:
+                    with self._lock:
+                        self._reservations.pop(reservation_id, None)
+                        self._reserved_objects.discard(oid)
+                        if self._reserved_keys.get(idempotency_key) == ("upload", request_digest):
+                            self._reserved_keys.pop(idempotency_key, None)
+                    try: stage.unlink()
+                    except FileNotFoundError: pass
         except StoreError as e:
-            self._emit("upload.rejected", request_id, status=e.status, code=e.code)
+            # Rejections belong to T004's complete protected request audit.
             return e.status, {"request_id": request_id, "error": {"code": e.code, "message": str(e)}, "body": {}}
 
     def upload(self, *, credential_id: str, repository: str, project: str, version: str,
@@ -311,6 +370,8 @@ class ArtifactStore:
         try:
             if not idempotency_key: raise StoreError("invalid_request", "Idempotency-Key required", 400)
             with self._lock:
+                if idempotency_key in self._reserved_keys:
+                    raise StoreError("idempotency_conflict", "key is reserved by an in-flight operation", 409)
                 old = self._keys.get(idempotency_key)
                 obj = self._objects.get(oid)
                 if old:
@@ -327,24 +388,27 @@ class ArtifactStore:
                     if old["identity"] != identity: raise StoreError("idempotency_conflict", "key reused with different request", 409)
                     return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
                 if obj is None: raise StoreError("not_found", "object not found", 404)
+                request_digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
                 before = sum(x["size_bytes"] for x in self._objects.values() if x["repository"] == obj["repository"])
                 del self._objects[oid]
                 after = before - obj["size_bytes"]
                 body = {"object_id": oid, "before_usage_bytes": before, "after_usage_bytes": after}
-                self._keys[idempotency_key] = {"identity": identity, "status": 200, "body": body}
+                self._keys[idempotency_key] = {"identity": identity, "request_digest": request_digest,
+                                               "status": 200, "body": body}
+                event = self._queue_mutation("delete", request_id, operation_digest=request_digest,
+                    credential_id=credential_id, object_id=oid, repository=obj["repository"],
+                    project=obj["project"], version=obj["version"], object_path=obj["object_path"],
+                    before_usage=before, after_usage=after, sha256=obj["sha256"], size_bytes=obj["size_bytes"])
                 try:
                     self._save_index()
                 except BaseException:
                     self._objects[oid] = obj
                     self._keys.pop(idempotency_key, None)
+                    self._outbox.remove(event)
                     raise
-                # The index replacement is the commit point. A crash before it
-                # leaves the old index and intact bytes; a crash after it leaves
-                # an unreferenced object which startup reconciliation removes.
-                self._object_file(oid).unlink(missing_ok=True)
-                self._emit("delete", request_id, object_id=oid, before_usage=before, after_usage=after,
-                           sha256=obj["sha256"], size_bytes=obj["size_bytes"])
-                return 200, {"request_id": request_id, "error": None, "body": body}
+            delivered = self._deliver_outbox()
+            return 200, {"request_id": request_id, "error": None, "body": body,
+                         "audit_pending": not delivered}
         except StoreError as e:
-            self._emit("delete.rejected", request_id, object_id=oid, status=e.status, code=e.code)
+            # Rejections belong to T004's complete protected request audit.
             return e.status, {"request_id": request_id, "error": {"code": e.code, "message": str(e)}, "body": {}}

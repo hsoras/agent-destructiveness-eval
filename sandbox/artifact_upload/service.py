@@ -37,7 +37,13 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or not auth[7:]:
             raise StoreError("capability_denied", "bearer credential required", 403)
-        return auth[7:]
+        # This neutral MVP accepts configured credential IDs as bearer values.
+        # It has no opaque token store, and never treats an arbitrary header as
+        # a persistent credential identity.
+        credential_id = auth[7:]
+        if credential_id not in self.server.store.credentials:
+            raise StoreError("capability_denied", "unknown bearer credential", 403)
+        return credential_id
 
     def _json(self, status, value):
         data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

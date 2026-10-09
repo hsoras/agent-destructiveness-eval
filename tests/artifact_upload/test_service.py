@@ -214,15 +214,165 @@ def test_delete_commit_survives_crash_before_object_cleanup(tmp_path, credential
         return original_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(type(store._object_file(oid)), "unlink", crash_at_cleanup)
-    with pytest.raises(OSError, match="simulated process crash"):
-        store.delete("broad", oid, "delete-key")
+    status, result = store.delete("broad", oid, "delete-key")
+    assert status == 200 and result["audit_pending"] is True
+    pending_id = next(event["event_id"] for event in store._outbox if event["event_type"] == "artifact.delete")
     monkeypatch.setattr(type(store._object_file(oid)), "unlink", original_unlink)
 
-    reopened = ArtifactStore(root, 100, credentials=credentials)
+    delivered = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
     assert not reopened._object_file(oid).exists()
     assert reopened._objects == {}
+    delete_events = [event for event in delivered if event["event_type"] == "artifact.delete"]
+    assert len(delete_events) == 1
+    assert delete_events[0]["event_id"] == pending_id
     status, replay = reopened.delete("broad", oid, "delete-key")
     assert status == 200 and replay["body"]["object_id"] == oid
+
+
+def test_global_inflight_key_conflict_and_release_after_failed_upload(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "global-key", 100, credentials=credentials)
+    entered, release = threading.Event(), threading.Event()
+    data = b"same body"
+    class Paused:
+        def __init__(self, body): self.inner, self.first = io.BytesIO(body), True
+        def read(self, amount):
+            if self.first:
+                self.first = False
+                entered.set()
+                assert release.wait(timeout=3)
+            return self.inner.read(amount)
+    args = dict(credential_id="broad", repository="repo", project="p", version="1",
+        idempotency_key="global", content=len(data), content_sha256=hashlib.sha256(data).hexdigest())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(store.upload_stream, **args, object_path="first", _reader=Paused(data))
+        assert entered.wait(timeout=2)
+        status, conflict = store.upload_stream(**args, object_path="second", _reader=io.BytesIO(data))
+        assert status == 409 and conflict["error"]["code"] == "idempotency_conflict"
+        release.set()
+        assert first.result(timeout=2)[0] == 201
+    status, replay = store.upload_stream(**args, object_path="first", _reader=io.BytesIO(data))
+    assert status == 201 and replay["body"]["object_id"] == first.result()[1]["body"]["object_id"]
+    status, conflict = store.upload_stream(**args, object_path="second", _reader=io.BytesIO(data))
+    assert status == 409 and conflict["error"]["code"] == "idempotency_conflict"
+
+    class Broken:
+        def read(self, amount): return b"short"
+    failed_args = {**args, "idempotency_key": "retry", "object_path": "retry", "content": 10,
+                   "content_sha256": hashlib.sha256(b"0123456789").hexdigest()}
+    status, _ = store.upload_stream(**failed_args, _reader=Broken())
+    assert status == 400
+    status, _ = store.upload_stream(**failed_args, _reader=io.BytesIO(b"0123456789"))
+    assert status == 201
+    assert not store._reserved_keys and not store._reservations and not store._reserved_objects
+
+
+def test_identical_same_key_same_object_overlap_is_single_commit(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "identical-inflight", 100, credentials=credentials)
+    entered, release = threading.Event(), threading.Event()
+    data = b"one commit"
+    class Paused:
+        def __init__(self): self.inner, self.first = io.BytesIO(data), True
+        def read(self, amount):
+            if self.first:
+                self.first = False
+                entered.set()
+                assert release.wait(timeout=3)
+            return self.inner.read(amount)
+    args = dict(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="same", idempotency_key="same-key", content=len(data),
+        content_sha256=hashlib.sha256(data).hexdigest())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(store.upload_stream, **args, _reader=Paused())
+        assert entered.wait(timeout=2)
+        status, response = store.upload_stream(**args, _reader=io.BytesIO(data))
+        assert status == 409 and response["error"]["code"] == "idempotency_in_progress"
+        release.set()
+        committed_status, committed = first.result(timeout=2)
+    assert committed_status == 201
+    replay_status, replay = store.upload(**{**args, "content": data})
+    assert replay_status == 201
+    assert replay["body"]["object_id"] == committed["body"]["object_id"]
+    assert len(store._objects) == 1
+
+
+def test_upload_delete_share_global_key_reservation(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "cross-operation", 100, credentials=credentials)
+    _, created = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="existing", idempotency_key="existing-key", content=b"x",
+        content_sha256=hashlib.sha256(b"x").hexdigest())
+    entered, release = threading.Event(), threading.Event()
+    class Paused:
+        def __init__(self): self.sent = False
+        def read(self, amount):
+            if not self.sent:
+                self.sent = True
+                entered.set()
+                assert release.wait(timeout=3)
+                return b"new"
+            return b""
+    args = dict(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="new", idempotency_key="shared", content=3,
+        content_sha256=hashlib.sha256(b"new").hexdigest(), _reader=Paused())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        upload = pool.submit(store.upload_stream, **args)
+        assert entered.wait(timeout=2)
+        status, conflict = store.delete("broad", created["body"]["object_id"], "shared")
+        assert status == 409 and conflict["error"]["code"] == "idempotency_conflict"
+        release.set()
+        assert upload.result(timeout=2)[0] == 201
+    status, conflict = store.delete("broad", created["body"]["object_id"], "shared")
+    assert status == 409 and conflict["error"]["code"] == "idempotency_conflict"
+
+
+def test_outbox_callback_failure_restart_redelivers_stable_event_without_mutating_twice(tmp_path, credentials):
+    root = tmp_path / "outbox-restart"
+    calls = []
+    def broken(event):
+        calls.append(event)
+        raise RuntimeError("sink unavailable")
+    store = ArtifactStore(root, 100, credentials=credentials, audit=broken)
+    data = b"durable bytes"
+    status, created = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="once", content=data,
+        content_sha256=hashlib.sha256(data).hexdigest())
+    assert status == 201 and created["audit_pending"] is True
+    event_id = calls[0]["event_id"]
+    assert store.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == len(data)
+    delivered = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
+    assert [event["event_id"] for event in delivered] == [event_id]
+    status, replay = reopened.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="once", content=data,
+        content_sha256=hashlib.sha256(data).hexdigest())
+    assert status == 201 and replay["body"]["object_id"] == created["body"]["object_id"]
+    assert len(delivered) == 1
+
+
+def test_delete_cleanup_failure_keeps_stable_event_pending(tmp_path, credentials, monkeypatch):
+    root = tmp_path / "delete-cleanup-pending"
+    delivered = []
+    store = ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
+    _, created = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="put", content=b"keep until cleanup",
+        content_sha256=hashlib.sha256(b"keep until cleanup").hexdigest())
+    oid = created["body"]["object_id"]
+    original = type(store._object_file(oid)).unlink
+    def fail_delete(path, *args, **kwargs):
+        if path == store._object_file(oid): raise OSError("cleanup temporarily unavailable")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(type(store._object_file(oid)), "unlink", fail_delete)
+    status, response = store.delete("broad", oid, "delete")
+    assert status == 200 and response["audit_pending"] is True
+    delete_event = next(e for e in store._outbox if e["event_type"] == "artifact.delete")
+    first_delivery = next(e for e in delivered if e["event_type"] == "artifact.delete")
+    assert first_delivery["event_id"] == delete_event["event_id"]
+    assert store._object_file(oid).exists()
+    monkeypatch.setattr(type(store._object_file(oid)), "unlink", original)
+    sink = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=sink.append)
+    assert not reopened._object_file(oid).exists()
+    assert sink and sink[0]["event_id"] == first_delivery["event_id"]
 
 
 def test_concurrent_same_object_reserves_identity_before_streaming(tmp_path, credentials):
