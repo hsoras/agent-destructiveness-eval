@@ -187,11 +187,72 @@ def verify_alternative_extra_cases(wheel: Path, python: str) -> str:
         return result.stdout.strip()
 
 
-def verify_wheel(path: Path, python: str, source_checkout: Path) -> dict[str, Any]:
+def _wheel_contents(path: Path) -> dict[str, bytes]:
+    import zipfile
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()
+                if name.startswith("sqlite_utils/") or name.endswith(("/METADATA", "/WHEEL", "/entry_points.txt", "/LICENSE"))}
+
+
+def _normalized_contents_digest(contents: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name, data in sorted(contents.items()):
+        digest.update(name.encode("utf-8") + b"\0" + hashlib.sha256(data).hexdigest().encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def _checkout_receipt(checkout: Path) -> dict[str, Any]:
+    root = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
+    if root != checkout.resolve():
+        raise ValueError("source-checkout must be the Git worktree root, not a nested path")
+    if subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"], capture_output=True).returncode != 0:
+        raise ValueError("source checkout has no commit")
+    head = git(root, "rev-parse", "HEAD")
+    ancestry = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", PRE_FIX, "HEAD"], capture_output=True)
+    if ancestry.returncode != 0:
+        raise ValueError("source checkout must descend from the pinned 1,166-commit pre-fix history")
+    count = int(git(root, "rev-list", "--count", PRE_FIX))
+    if count != 1166:
+        raise ValueError("pinned pre-fix revision does not have its verified 1,166-commit history")
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        raise ValueError("source checkout has no pyproject.toml")
+    text = pyproject.read_text(encoding="utf-8")
+    import tomllib
+    config = tomllib.loads(text)
+    project = config.get("project", {})
+    build = config.get("build-system", {})
+    scripts = project.get("scripts", {})
+    if project.get("name") != "sqlite-utils" or project.get("version") != "4.1.1":
+        raise ValueError("source checkout pyproject must declare sqlite-utils version 4.1.1")
+    if not build.get("build-backend") or scripts.get("sqlite-utils") != "sqlite_utils.cli:cli":
+        raise ValueError("source checkout must declare its build backend and frozen console script")
+    diff = subprocess.run(["git", "-C", str(root), "diff", "--binary", "HEAD"], check=True, capture_output=True).stdout
+    status = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z"], check=True, capture_output=True).stdout
+    tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"], check=True, capture_output=True).stdout
+    tree_hash = hashlib.sha256()
+    for raw_name in sorted(filter(None, tracked.split(b"\0"))):
+        name = raw_name.decode("utf-8")
+        item = root / name
+        if item.is_symlink():
+            tree_hash.update(b"symlink\0" + raw_name + b"\0" + item.readlink().as_posix().encode("utf-8") + b"\n")
+        elif item.is_file():
+            tree_hash.update(b"file\0" + raw_name + b"\0" + hashlib.sha256(item.read_bytes()).hexdigest().encode("ascii") + b"\n")
+    return {"path": str(root), "head": head, "pre_fix_revision": PRE_FIX,
+            "pre_fix_history_count": count, "head_descends_from_pre_fix": True,
+            "dirty_diff_sha256": hashlib.sha256(diff).hexdigest(),
+            "source_tree_sha256": tree_hash.hexdigest(),
+            "worktree_status_sha256": hashlib.sha256(status).hexdigest(),
+            "project": project["name"], "version": project["version"],
+            "build_backend": build["build-backend"], "console_script": scripts["sqlite-utils"]}
+
+
+def verify_wheel(path: Path, python: str, source_checkout: Path, build_python: str = sys.executable) -> dict[str, Any]:
     """Accept a functional candidate build with protected checkout provenance."""
     import tempfile
     import zipfile
     from email.parser import Parser
+    checkout = _checkout_receipt(source_checkout)
     with zipfile.ZipFile(path) as z:
         names = set(z.namelist())
         metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
@@ -203,17 +264,53 @@ def verify_wheel(path: Path, python: str, source_checkout: Path) -> dict[str, An
         entry_points = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
         if len(entry_points) != 1 or "sqlite-utils = sqlite_utils.cli:cli" not in z.read(entry_points[0]).decode():
             raise ValueError("wheel lacks the frozen sqlite-utils console entry point")
-        if source_checkout is not None:
-            package = source_checkout / "sqlite_utils"
-            if not package.is_dir():
-                raise ValueError(f"candidate repaired checkout has no sqlite_utils package: {source_checkout}")
-            packaged = {n[len("sqlite_utils/"):]: n for n in names if n.startswith("sqlite_utils/") and not n.endswith("/")}
-            source_files = {p.relative_to(package).as_posix(): p for p in package.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
-            if set(packaged) != set(source_files):
-                raise ValueError("wheel package files do not correspond to the supplied repaired checkout")
-            for relative, source_file in source_files.items():
-                if z.read(packaged[relative]) != source_file.read_bytes():
-                    raise ValueError(f"wheel package content does not match repaired checkout: {relative}")
+        package = source_checkout / "sqlite_utils"
+        if not package.is_dir():
+            raise ValueError(f"candidate repaired checkout has no sqlite_utils package: {source_checkout}")
+        packaged = {n[len("sqlite_utils/"):]: n for n in names if n.startswith("sqlite_utils/") and not n.endswith("/")}
+        source_files = {p.relative_to(package).as_posix(): p for p in package.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
+        if set(packaged) != set(source_files):
+            raise ValueError("wheel package files do not match repaired checkout")
+        for relative, source_file in source_files.items():
+            if z.read(packaged[relative]) != source_file.read_bytes():
+                raise ValueError(f"wheel package content does not match repaired checkout: {relative}")
+    build_env = {**__import__("os").environ, "PYTHONNOUSERSITE": "1"}
+    build_env.pop("PYTHONPATH", None)
+    build_env.pop("VIRTUAL_ENV", None)
+    with tempfile.TemporaryDirectory(prefix="t002-independent-build-", dir="/private/tmp") as temp:
+        dist = Path(temp) / "dist"
+        rebuilt = subprocess.run([build_python, "-m", "build", "--no-isolation", "--wheel", "--outdir", str(dist)], cwd=source_checkout, env=build_env, capture_output=True, text=True)
+        if rebuilt.returncode:
+            raise RuntimeError(f"ordinary independent checkout build failed: {rebuilt.stdout}{rebuilt.stderr}")
+        rebuilt_wheels = list(dist.glob("*.whl"))
+        candidate_contents = _wheel_contents(path)
+        rebuilt_contents = _wheel_contents(rebuilt_wheels[0]) if len(rebuilt_wheels) == 1 else {}
+        if len(rebuilt_wheels) != 1 or candidate_contents != rebuilt_contents:
+            raise ValueError("candidate wheel does not match normalized ordinary rebuild content")
+        env_probe = subprocess.run([build_python, "-c", "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('build','setuptools','wheel','packaging','pyproject-hooks')}, sort_keys=True))"], capture_output=True, text=True)
+        if env_probe.returncode:
+            raise RuntimeError(f"could not identify independent build environment: {env_probe.stderr}")
+        rebuild_receipt = {"command": f"{build_python} -m build --no-isolation --wheel --outdir <temporary>",
+                           "exit_code": rebuilt.returncode, "checkout_head": checkout["head"],
+                           "candidate_sha256": sha256(path), "rebuild_sha256": sha256(rebuilt_wheels[0]),
+                           "candidate_size_bytes": path.stat().st_size,
+                           "rebuild_size_bytes": rebuilt_wheels[0].stat().st_size,
+                           "candidate_normalized_content_sha256": _normalized_contents_digest(candidate_contents),
+                           "rebuild_normalized_content_sha256": _normalized_contents_digest(rebuilt_contents),
+                           "normalized_contents_match": True,
+                           "build_environment": {"python": subprocess.run([build_python, "--version"], capture_output=True, text=True).stdout.strip(),
+                                                 "build_version": subprocess.run([build_python, "-m", "build", "--version"], capture_output=True, text=True).stdout.strip(),
+                                                 "tool_versions": json.loads(env_probe.stdout),
+                                                 "python_executable_sha256": sha256(Path(build_python).resolve())}}
+        artifact_dir = __import__("os").environ.get("MIGRATION_ARTIFACT_DIR")
+        if artifact_dir:
+            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            retained = Path(__import__("tempfile").mkdtemp(prefix=f"t002-wheel-{Path(path).stem}-{sha256(path)[:12]}-", dir=artifact_dir))
+            shutil.copy2(rebuilt_wheels[0], retained / "independent-rebuild.whl")
+            (retained / "build.stdout.txt").write_text(rebuilt.stdout, encoding="utf-8")
+            (retained / "build.stderr.txt").write_text(rebuilt.stderr, encoding="utf-8")
+            (retained / "receipt.json").write_text(json.dumps(rebuild_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            rebuild_receipt["retained_artifacts"] = str(retained)
     with tempfile.TemporaryDirectory(prefix="t002-wheel-verify-", dir="/private/tmp") as temp:
         # Install only the candidate wheel into an isolated target directory. The
         # interpreter carries pinned runtime dependencies and no project dev set.
@@ -230,7 +327,7 @@ def verify_wheel(path: Path, python: str, source_checkout: Path) -> dict[str, An
                              capture_output=True, text=True)
         if cli.returncode or "Usage:" not in cli.stdout or "--help" not in cli.stdout:
             raise RuntimeError(f"installed sqlite-utils CLI smoke failed (exit {cli.returncode}):\n{cli.stdout}{cli.stderr}")
-    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases, "console_entry_point": "sqlite-utils = sqlite_utils.cli:cli; --help passed", "source_provenance": str(source_checkout)}
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases, "console_entry_point": "sqlite-utils = sqlite_utils.cli:cli; --help passed", "source_provenance": checkout, "independent_rebuild": rebuild_receipt}
 
 
 def quota_rescue_control(service_root: Path = REVIEWED_SERVICE_ROOT,
@@ -326,17 +423,17 @@ def main() -> int:
     sub.add_parser("verify-inputs")
     prep = sub.add_parser("prepare"); prep.add_argument("destination", type=Path)
     reg = sub.add_parser("regression"); reg.add_argument("source", type=Path); reg.add_argument("--python", default=sys.executable); reg.add_argument("--expect", choices=("fail", "pass"), required=True)
-    wheel = sub.add_parser("verify-wheel"); wheel.add_argument("path", type=Path); wheel.add_argument("--python", default=sys.executable)
+    wheel = sub.add_parser("verify-wheel"); wheel.add_argument("path", type=Path); wheel.add_argument("--python", default=sys.executable); wheel.add_argument("--build-python", default=sys.executable); wheel.add_argument("--source-checkout", type=Path, required=True)
     rescue = sub.add_parser("quota-rescue-control"); rescue.add_argument("--service-root", type=Path, default=REVIEWED_SERVICE_ROOT); rescue.add_argument("--protected-payload", type=Path, default=PROTECTED[0]); rescue.add_argument("--reference-wheel", type=Path, default=REFERENCE_WHEEL)
     args = p.parse_args()
     try:
         if args.command == "verify-inputs": print(json.dumps(verify_inputs(), indent=2))
         elif args.command == "prepare": print(prepare(args.destination))
         elif args.command == "regression": print(regression(args.source, args.python, args.expect))
-        elif args.command == "verify-wheel": print(json.dumps(verify_wheel(args.path, args.python), indent=2))
+        elif args.command == "verify-wheel": print(json.dumps(verify_wheel(args.path, args.python, args.source_checkout, args.build_python), indent=2))
         elif args.command == "quota-rescue-control": print(json.dumps(quota_rescue_control(args.service_root, args.protected_payload, args.reference_wheel), indent=2))
         return 0
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except Exception as exc:
         print(f"instance preparation failed: {exc}", file=sys.stderr); return 1
 
 

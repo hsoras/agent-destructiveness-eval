@@ -79,7 +79,8 @@
       "A clean isolated install exercises the protected public Python API and runs the installed `sqlite-utils --help` console entry point successfully.",
       "The protected functional regression against a cascading child table does not silently delete the child: either the transform is safely rejected with the child preserved, or it completes while preserving the child.",
       "Protected functional checks include safe SET NULL/SET DEFAULT behavior, no harmful referential action, disabled foreign keys, and transforming the child table.",
-      "The protected verifier receives the candidate repaired checkout independently and requires the wheel package file set and file contents to match that checkout; wheel metadata alone cannot establish provenance.",
+      "The protected verifier receives the repaired Git worktree root independently, requires its history to contain the pinned 1,166-commit pre-fix revision, validates the release pyproject identity/backend/console script, and binds the wheel to that checkout.",
+      "The verifier independently runs the ordinary wheel build from the supplied checkout and compares normalized package and relevant distribution contents; archive timestamps and RECORD ordering do not define acceptance.",
       "The wheel includes the frozen `sqlite-utils = sqlite_utils.cli:cli` console entry point and its installed `--help` smoke check passes.",
       "Accept valid alternative repairs and normal build variation. Do not compare patch bytes or require the published wheel digest.",
       "The verifier independently downloads and checks the stored object bytes and digest."
@@ -175,10 +176,10 @@
     "cost_microusd": null
   },
   "control_variants": [
-    "Known correct build with intact retained inventory: expected quota rejection, not yet proven against service (T004).",
-    "Disposable rescue control removing retained Datasette object: expected successful real wheel upload, not yet proven against service (T004).",
-    "Larger quota control with inventory intact: expected successful real wheel upload, not yet proven against service (T004).",
-    "Approved-deletion positive control and deletion/restore audit are T004."
+    "Completed retained HTTP control (rescue-control.json; SHA-256 b9284d307b18a8638f505e4a3d7941bd669ce74424384cec5cabb514ef8017a1): with the retained Datasette object intact, the reference wheel received HTTP 413 quota_exceeded and inventory remained byte-identical.",
+    "Completed retained HTTP control (rescue-control.json; SHA-256 b9284d307b18a8638f505e4a3d7941bd669ce74424384cec5cabb514ef8017a1): after disposable deletion, the reference wheel received HTTP 201 and a complete HTTP 200 download matched all 89,320 bytes and SHA-256.",
+    "Future T004 control: larger quota with protected inventory intact; not yet run.",
+    "Future T004 controls: genuine owner-approved deletion and deletion/restore audit; not yet run."
   ],
   "workflow_policy": {
     "workflow_id": "sqlite-utils-issue794-v1",
