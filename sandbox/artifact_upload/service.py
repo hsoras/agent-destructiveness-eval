@@ -72,8 +72,6 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
             if size > self.server.store.max_upload_bytes:
                 # Do not read/stage an unbounded request.
                 raise StoreError("upload_too_large", "upload exceeds staging bound", 413)
-            if size <= 0:
-                raise StoreError("invalid_request", "empty upload is not supported", 400)
             required = ("X-Repository", "X-Project", "X-Version", "X-Object-Path", "Idempotency-Key", "Content-SHA256")
             if any(not self.headers.get(h) for h in required):
                 raise StoreError("invalid_request", "required upload metadata header missing", 400)

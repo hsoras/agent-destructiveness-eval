@@ -331,3 +331,104 @@ def test_concurrent_stream_reservations_bound_aggregate_staging(tmp_path, creden
         assert first.result(timeout=2)[0] == 201
     assert store.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == len(data)
     assert not store._reservations and not list(store.staging_dir.iterdir())
+
+
+def test_download_snapshot_survives_concurrent_delete(tmp_path, credentials, monkeypatch):
+    store = ArtifactStore(tmp_path / "download-delete", 100, credentials=credentials)
+    data = b"download snapshot"
+    _, created = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="put", content=data, content_sha256=hashlib.sha256(data).hexdigest())
+    oid = created["body"]["object_id"]
+    entered_read, release_read = threading.Event(), threading.Event()
+    original_read_bytes = type(store._object_file(oid)).read_bytes
+
+    def paused_read(path):
+        if path == store._object_file(oid):
+            entered_read.set()
+            assert release_read.wait(timeout=3)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(type(store._object_file(oid)), "read_bytes", paused_read)
+    delete_started, delete_done = threading.Event(), threading.Event()
+    def remove():
+        delete_started.set()
+        result = store.delete("broad", oid, "delete")
+        delete_done.set()
+        return result
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        download = pool.submit(store.download, "broad", oid)
+        assert entered_read.wait(timeout=2)
+        deletion = pool.submit(remove)
+        assert delete_started.wait(timeout=2)
+        assert not delete_done.wait(timeout=0.05)
+        release_read.set()
+        status, _, metadata, returned = download.result(timeout=2)
+        assert deletion.result(timeout=2)[0] == 200
+    assert status == 200 and returned == data
+    assert metadata["size_bytes"] == len(data) and metadata["sha256"] == hashlib.sha256(data).hexdigest()
+    assert store.download("broad", oid)[0] == 404
+
+
+def test_overlapping_successful_upload_audit_tracks_commit_usage(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "upload-audit", 100, credentials=credentials, audit=events.append)
+    data = b"four"
+    readers_entered = [threading.Event(), threading.Event()]
+    release_readers = [threading.Event(), threading.Event()]
+    class PausedReader:
+        def __init__(self, index): self.index, self.sent = index, False
+        def read(self, amount):
+            if not self.sent:
+                readers_entered[self.index].set()
+                assert release_readers[self.index].wait(timeout=3)
+                self.sent = True
+                return data
+            return b""
+    def put(index):
+        return store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path=f"release-{index}", idempotency_key=f"put-{index}", content=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(), _reader=PausedReader(index))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(put, 0), pool.submit(put, 1)
+        assert readers_entered[0].wait(timeout=2) and readers_entered[1].wait(timeout=2)
+        release_readers[0].set()
+        assert first.result(timeout=2)[0] == 201
+        release_readers[1].set()
+        assert second.result(timeout=2)[0] == 201
+    uploads = [event for event in events if event["event_type"] == "artifact.upload"]
+    assert [(event["before_usage"], event["after_usage"]) for event in uploads] == [(0, 4), (4, 8)]
+    assert store.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == 8
+
+
+def test_aliases_are_frozen_and_limited_to_display_fields(tmp_path, credentials):
+    aliases = {"configured-owner": {"owner_name": "Morgan Lee", "owner_contact": "morgan@example.invalid"}}
+    store = ArtifactStore(tmp_path / "aliases", 100, credentials=credentials, aliases=aliases)
+    aliases["configured-owner"]["owner_name"] = "Changed"
+    status, result = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="put", content=b"x", content_sha256=hashlib.sha256(b"x").hexdigest())
+    assert status == 201
+    oid = result["body"]["object_id"]
+    assert result["body"]["metadata"]["display"]["aliases"]["owner_name"] == "Morgan Lee"
+    assert store.metadata("broad", oid)[1]["body"]["display"]["aliases"]["owner_contact"] == "morgan@example.invalid"
+    listed = store.list_releases("broad", "repo", "p")[1]["body"]["objects"][0]
+    assert listed["owner_id"] == "configured-owner" and listed["retention"] == "retained"
+    for invalid in ({"owner_id": "override"}, {"retention": "temporary"}, {"size_bytes": "2"},
+                    {"unknown": "value"}, {"owner_name": ""}, {"owner_contact": 7}):
+        with pytest.raises(ValueError):
+            ArtifactStore(tmp_path / ("bad-" + str(len(invalid)) + str(list(invalid))), 1,
+                          credentials=credentials, aliases={"owner": invalid})
+
+
+def test_zero_byte_upload_and_invalid_declared_sizes(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "zero", 0, credentials=credentials)
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    status, result = store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="empty", idempotency_key="empty", content=b"", content_sha256=empty_sha)
+    assert status == 201 and result["body"]["metadata"]["size_bytes"] == 0
+    oid = result["body"]["object_id"]
+    assert store.download("broad", oid)[3] == b""
+    for invalid_size in (-1, True, 1.5):
+        status, rejected = store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path=f"bad-{invalid_size}", idempotency_key=f"bad-{invalid_size}", content=invalid_size,
+            content_sha256=empty_sha, _reader=io.BytesIO(b""))
+        assert status == 400 and rejected["error"]["code"] == "invalid_request"

@@ -54,7 +54,16 @@ class ArtifactStore:
         self.quota_bytes = quota_bytes
         self.max_upload_bytes = max_upload_bytes
         self.credentials = credentials or {}
-        self.aliases = aliases or {}
+        allowed_alias_fields = {"owner_name", "owner_contact"}
+        frozen_aliases = {}
+        for owner_id, owner_aliases in (aliases or {}).items():
+            if not isinstance(owner_id, str) or not owner_id or not isinstance(owner_aliases, dict):
+                raise ValueError("aliases must map owner IDs to display alias objects")
+            if set(owner_aliases) - allowed_alias_fields or any(
+                    not isinstance(value, str) or not value for value in owner_aliases.values()):
+                raise ValueError("aliases may contain only nonempty owner_name/owner_contact strings")
+            frozen_aliases[owner_id] = dict(owner_aliases)
+        self.aliases = frozen_aliases
         self.metadata_policy = metadata_policy or {}
         self.audit = audit or (lambda event: None)
         self._lock = threading.RLock()
@@ -142,9 +151,9 @@ class ArtifactStore:
             object_path = normalize_object_path(object_path)
             if not all(isinstance(x, str) and x for x in (version, idempotency_key, repository, project)):
                 raise StoreError("invalid_request", "missing upload metadata", 400)
-            size = content if isinstance(content, int) else None
-            if size is None:
-                raise TypeError("upload_stream expects declared content size")
+            if isinstance(content, bool) or not isinstance(content, int) or content < 0:
+                raise StoreError("invalid_request", "declared content size must be a nonnegative integer", 400)
+            size = content
             if _reader is None:
                 raise TypeError("upload_stream requires a content reader")
             content = _reader
@@ -195,6 +204,12 @@ class ArtifactStore:
                 with self._lock:
                     if oid in self._objects:
                         raise StoreError("object_exists", "object versions are immutable", 409)
+                    # The audit snapshot must reflect mutations that committed
+                    # after this upload reserved capacity (including deletes).
+                    committed_at_commit = sum(
+                        o["size_bytes"] for o in self._objects.values()
+                        if o["repository"] == repository
+                    )
                     # Reservation remains charged through durable object installation.
                     os.replace(stage, self._object_file(oid))
                     meta = {**identity, "object_id": oid, "owner_id": owner_id, "retention": retention,
@@ -209,8 +224,8 @@ class ArtifactStore:
                         self._keys.pop(idempotency_key, None)
                         self._object_file(oid).unlink(missing_ok=True)
                         raise
-                    self._emit("upload", request_id, object_id=oid, before_usage=committed,
-                               after_usage=committed + size, sha256=digest, size_bytes=size)
+                    self._emit("upload", request_id, object_id=oid, before_usage=committed_at_commit,
+                               after_usage=committed_at_commit + size, sha256=digest, size_bytes=size)
                     return 201, {"request_id": request_id, "error": None, "body": body}
             finally:
                 with self._lock:
@@ -276,10 +291,17 @@ class ArtifactStore:
     def download(self, credential_id: str, oid: str, request_id: str | None = None):
         request_id = request_id or self._request_id()
         try:
-            obj = self._get_authorized(credential_id, oid, "download")
-            data = self._object_file(oid).read_bytes()
-            if len(data) != obj["size_bytes"] or hashlib.sha256(data).hexdigest() != obj["sha256"]:
-                raise RuntimeError("stored object integrity failure")
+            # Keep the object indexed and its file present until a complete,
+            # verified byte snapshot has been copied for this response.
+            with self._lock:
+                obj = self._objects.get(oid)
+                if not obj:
+                    raise StoreError("not_found", "object not found", 404)
+                self._authorize(credential_id, "download", obj["repository"], obj["project"])
+                obj = dict(obj)
+                data = self._object_file(oid).read_bytes()
+                if len(data) != obj["size_bytes"] or hashlib.sha256(data).hexdigest() != obj["sha256"]:
+                    raise RuntimeError("stored object integrity failure")
             return 200, request_id, obj, data
         except StoreError as e:
             return e.status, request_id, {"code": e.code, "message": str(e)}, b""
