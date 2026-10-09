@@ -15,10 +15,11 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from providers import snapshot, validate_routing
 
 HERE = Path(__file__).resolve().parent
 WORKER = 'gpt-6-luna'
-REVIEWER = 'gpt-6-sol'
+REVIEWER = 'gpt-6.1-sol'
 PROTECTED = ('docs/migration/', 'NEW_SPEC.md', 'scripts/migration/')
 MAX_ADDITIONAL_REPAIRS = 6
 ROUTINE_DECISION_GUIDANCE = (
@@ -133,28 +134,45 @@ def focused_context(repo, task, spec):
             + excerpt + '\nExact assigned requirements (complete source clauses, no summarized criteria):\n'
             + ('\n'.join(rows) if rows else matrix) + '\n')
 
+def status_projection(state):
+    records = state.get('records', {})
+    return dict(blocked=(str(state.get('blocked'))[:600] if state.get('blocked') else None),
+                tasks={tid: {k: r.get(k) for k in ('phase', 'attempt', 'commit', 'provider', 'model')}
+                       for tid, r in records.items()},
+                assigned_records_complete=bool(records) and all(r['phase'] == 'merged' for r in records.values()),
+                evidence='state.json and tasks/ contain complete findings and logs')
+
+
 def state_event(state):
-    """Only actionable changes wake supervision; PID and token churn do not."""
+    """Terminal decisions only: intermediate process/commit/checkpoint churn is silent."""
+    terminal = {'merged', 'rejected', 'provider_blocked', 'integration_testing', 'merge_pending'}
+    # Integration phases wake only with a blocker, not merely because a merge started.
     return dict(blocked=state.get('blocked'), tasks={tid: {
-        k: r.get(k) for k in ('phase', 'attempt', 'review_attempt', 'commit')}
-        for tid, r in state.get('records', {}).items()},
-        checkpoints=sorted(state.get('checkpoints', {})))
+        k: r.get(k) for k in ('phase', 'attempt', 'commit')}
+        for tid, r in state.get('records', {}).items()
+        if r['phase'] in terminal - {'integration_testing', 'merge_pending'}},
+        assigned_records_complete=status_projection(state)['assigned_records_complete'])
+
 
 def watch_state(directory, timeout=1800):
-    """Read-only bounded event wait; no model, coordinator lock or state mutation."""
+    """Read-only bounded terminal-event wait, without model calls or mutations."""
+    if not 0 <= timeout <= 86400:
+        raise Stop('Watch timeout must be between zero and 86400 seconds')
     path = Path(directory) / 'state.json'
     if not path.is_file():
         raise Stop('No execution state to watch')
     first = state_event(json.loads(path.read_text()))
     deadline = time.monotonic() + timeout
     while True:
-        current = state_event(json.loads(path.read_text()))
-        if current != first or current['blocked']:
-            # Completion is announced by execute; watch reports only the actual snapshot.
-            return current
+        state = json.loads(path.read_text())
+        current = state_event(state)
+        result = status_projection(state)
+        if current != first or current['blocked'] or current['assigned_records_complete']:
+            return result
         if time.monotonic() >= deadline:
-            return dict(event='timeout', state=current)
-        time.sleep(min(1, max(0, deadline - time.monotonic())))
+            return dict(event='timeout', state=result)
+        time.sleep(min(.25, max(0, deadline - time.monotonic())))
+
 
 def read_graph(repo):
     rows = []
@@ -231,16 +249,15 @@ def lock(state_dir):
         yield
 
 class Coordinator:
-    def __init__(self, repo, state_dir, config, max_workers=1):
+    def __init__(self, repo, state_dir, config, max_workers=1, routing=None):
         self.repo, self.directory = Path(repo).resolve(), Path(state_dir).resolve()
         self.config = config
+        self.routing = validate_routing(routing) if routing else None
         if max_workers not in (1, 2):
             raise Stop('Worker concurrency must be one or two')
         # Runtime scheduling policy; do not invalidate the historical config digest.
         self.max_workers = max_workers
         self.processes = {}
-        if config['worker_model'] != WORKER or config['reviewer_model'] != REVIEWER:
-            raise Stop('This coordinator requires installed Luna workers and Sol reviewers')
         common = Path(git(self.repo, 'rev-parse', '--git-common-dir'))
         common = (common if common.is_absolute() else self.repo / common).resolve()
         # Never put writable coding workspaces inside the shared protected .git directory.
@@ -374,6 +391,7 @@ class Coordinator:
                 'Do not merge, rebase, switch branches, push, edit Git metadata, or update migration planning/status/spec files. '
                 'Leave changes uncommitted: the coordinator verifies and commits them. Never run destructive schema/data changes, '
                 'production operations, paid experiment pilots, or merge into main. Stop and report a required unsafe action. '
+                'Run available public entry-point/contract tests, relevant negative cases and authentic artifact lineage checks before handoff. Never fabricate historical evidence. '
                 'Run applicable local checks; do not hide skips or incomplete acceptance. Report exact evidence, limitations and failed criteria. '
                 'Only supplied coding task is authorized; do not launch other agents or tasks.\n') if role == 'worker' else (
                 f'Review only task {task["id"]}. Allowed deliverable scope: {json.dumps(scopes)}. '
@@ -389,7 +407,8 @@ class Coordinator:
                 'follow cross-references when needed and report contradictions rather than relaxing criteria.\n' +
                 '\nTask file, requirements, acceptance and validation:\n' + task['text'] +
                 context +
-                f'\nConfigured Python interpreter: {self.config["python"]}. Use this absolute interpreter; '
+                f'\nWorker validation commands: {json.dumps(self.worker_checks(task["id"]))}. '
+                f'Configured Python interpreter: {self.config["python"]}. Use this absolute interpreter; '
                 'a missing worktree-local .venv does not require dependency installation. '
                 'Run targeted checks during development; the coordinator owns all required branch/integration/regression checks. '
                 'Report sandbox limitations once with exact errors; do not repeatedly retry blocked localhost or tool access. '
@@ -412,16 +431,41 @@ class Coordinator:
             raise Stop(f'{tid}: worker changed branch/HEAD; inspect manually')
         return r
 
-    def launch(self, task, role, prompt):
+    def launch(self, task, role, prompt, fallback=False):
         tid = task['id']
         r = self.state['records'][tid]
+        if r['phase'].endswith('_running'):
+            raise Stop('Attempt already running; never duplicate it')
         if role == 'worker':
-            r['attempt'] += 1
+            if any(other != tid and x['phase'] == 'worker_running' and
+                   overlap(self.config['scopes'][tid], self.config['scopes'][other])
+                   for other, x in self.state['records'].items()):
+                raise Stop('Conflicting live worker ownership')
+            if sum(x['phase'] == 'worker_running' for x in self.state['records'].values()) >= self.max_workers:
+                raise Stop('Worker capacity exhausted')
+            if not fallback:
+                r['attempt'] += 1
             number = r['attempt']
         else:
             r['review_attempt'] = r.get('review_attempt', 0) + 1
             number = r['review_attempt']
-        prefix = f'{role}-{number}'
+        prefix = f'{role}-{number}' + ('-fallback' if fallback else '')
+        route = dict(backend='codex', model=self.config['worker_model'] if role == 'worker' else self.config['reviewer_model'], effort='medium')
+        if self.routing:
+            route = self.routing['reviewer'] if role == 'review' else self.routing['primary']
+            if role == 'worker' and (fallback or (self.routing.get('mixed_parallel') and any(
+                    x['phase'] == 'worker_running' and x.get('provider') == 'agy' for x in self.state['records'].values()))):
+                route = self.routing['fallback']
+        if role == 'worker' and r['phase'] == 'repair_pending' and r.get('worker_route'):
+            route = r['worker_route']  # Coding repairs retain their provider; no outage inferred.
+        if fallback and not r.get('fallback_plan'):
+            raise Stop('Fallback requires a recorded safe continuation plan')
+        if fallback:
+            route = r.get('fallback_plan', {}).get('route', route)
+            if snapshot(r['worktree']) != r['fallback_plan']['snapshot']:
+                raise Stop('Worktree changed after continuation plan; no fallback launch')
+        if fallback and (route['backend'] != 'codex' or not r.get('fallback_plan')):
+            raise Stop('Fallback requires a recorded safe continuation plan')
         receipt = self.artifact(tid, prefix + '-exit.json')
         if receipt.exists():
             raise Stop('Attempt receipt already exists')
@@ -429,8 +473,8 @@ class Coordinator:
         prompt_path.write_text(prompt)
         result = self.artifact(tid, prefix + '-result.txt')
         cmd = ['codex', 'exec', '--ignore-user-config', '--ephemeral', '--json', '--color', 'never',
-               '-m', self.config['worker_model'] if role == 'worker' else self.config['reviewer_model'],
-               '-c', 'model_reasoning_effort="medium"', '-c', 'approval_policy="never"',
+               '-m', route['model'],
+               '-c', 'model_reasoning_effort=' + json.dumps(route.get('effort', 'medium')), '-c', 'approval_policy="never"',
                '-c', 'features.multi_agent=false', '-s', 'workspace-write' if role == 'worker' else 'read-only',
                '-C', r['worktree'], '-o', str(result)]
         if role == 'review':
@@ -443,12 +487,26 @@ class Coordinator:
                 required=['approved', 'findings', 'criteria'], additionalProperties=False))
             cmd += ['--output-schema', str(schema)]
         cmd += ['-']
+        if route['backend'] == 'agy':
+            cmd = ['agy', '--model', route['model'], '--effort', route.get('effort', 'medium'),
+                   '--output-format', 'stream-json', '--sandbox', '--mode', 'accept-edits',
+                   '--disable-slash-commands', '--print-timeout', str(self.config['timeout_seconds']) + 's']
         job = dict(command=cmd, cwd=r['worktree'], prompt=str(prompt_path), result=str(result),
                    log=str(self.artifact(tid, prefix + '.jsonl')), receipt=str(receipt),
-                   timeout=self.config['timeout_seconds'])
+                   timeout=self.config['timeout_seconds'], provider=route['backend'], model=route['model'],
+                   route=route, role=role, task=tid, attempt=number,
+                   stderr=str(self.artifact(tid, prefix + '.stderr')),
+                   preflight_seconds=(self.routing or {}).get('preflight_seconds', 30),
+                   permission_commands=self.worker_checks(tid) if role == 'worker' else [],
+                   before_snapshot=snapshot(r['worktree']) if role == 'worker' else None)
         job_path = self.artifact(tid, prefix + '-job.json')
         atomic(job_path, job)
         # A durable intent is saved before spawning. Missing receipt after a crash never triggers an automatic duplicate.
+        r['provider'], r['model'] = route['backend'], route['model']
+        if role == 'worker':
+            r['worker_provider'], r['worker_model'] = route['backend'], route['model']
+            r['worker_route'] = route
+            r['worker_result'] = str(result)
         r['phase'] = role + '_running'
         r['job'] = str(job_path)
         r['pid'] = None
@@ -458,6 +516,61 @@ class Coordinator:
                              start_new_session=True, close_fds=True)
         self.processes[p.pid] = p
         r['pid'] = p.pid
+        self.save()
+
+    def worker_checks(self, tid):
+        commands = self.config.get('worker_checks', {}).get(tid, self.task_checks(tid))
+        return [[x.replace('{python}', self.config['python']).replace('{worktree}', self.state['records'][tid]['worktree'] if self.state and tid in self.state['records'] else '{worktree}') if x != '.venv/bin/python' else self.config['python'] for x in argv] for argv in commands]
+
+    def task_checks(self, tid):
+        return self.config['checks'][tid] + self.config.get('public_checks', {}).get(tid, [])
+
+    def handle_provider_failure(self, task, outcome, job):
+        tid = task['id']
+        r = self.state['records'][tid]
+        current = snapshot(r['worktree'])
+        provenance = dict(reason=outcome['provider_failure'], job=r['job'], receipt=job['receipt'],
+                          provider=job['provider'], model=job['model'], attempt=r['attempt'],
+                          before=job['before_snapshot'], after=current)
+        path = self.artifact(tid, f'worker-{r["attempt"]}-partial.json')
+        atomic(path, provenance)
+        diff = self.artifact(tid, f'worker-{r["attempt"]}-partial.patch')
+        diff.write_text(git(r['worktree'], 'diff', '--binary', job['before_snapshot']['head']))
+        r['provider_failure'] = dict(reason=outcome['provider_failure'], provenance=str(path), diff=str(diff))
+        if current != job['before_snapshot']:
+            r['phase'] = 'provider_blocked'
+            self.save()
+            raise Stop(f'{tid}: Gemini {outcome["provider_failure"]} after partial changes; '
+                       f'preserved at {path}. Record a safe continuation plan with continue-fallback')
+        if not self.routing:
+            raise Stop('No fallback routing configured; evidence retained')
+        r['fallback_plan'] = dict(plan='Verified byte-identical worktree, branch, HEAD and staged diff. '
+                                 'Continue the same task and retained repair brief; no changes discarded.',
+                                 provenance=str(path), snapshot=current, route=self.routing['fallback'])
+        r['phase'] = 'fallback_pending'
+        self.save()  # Recovery reuses this intent; a crash cannot relaunch Gemini.
+
+    def continue_fallback(self, tid, plan):
+        if not self.state or tid not in self.state['records']:
+            raise Stop('Unknown task')
+        r = self.state['records'][tid]
+        if r['phase'] != 'provider_blocked' or not plan or not 40 <= len(plan.strip()) <= 6000:
+            raise Stop('Partial provider failure requires an explicit 40–6000 character continuation plan')
+        job = json.loads(Path(r['job']).read_text())
+        if not Path(job['receipt']).is_file():
+            raise Stop('No terminal receipt; never duplicate a potentially live process')
+        provenance = json.loads(Path(r['provider_failure']['provenance']).read_text())
+        current = snapshot(r['worktree'])
+        if current != provenance['after']:
+            raise Stop('Partial files or Git state changed since failure; investigate before continuation')
+        if current['head'] != job['before_snapshot']['head'] or current['branch'] != r['branch']:
+            raise Stop('Unexpected worker Git changes; manual reconciliation required')
+        if not self.routing:
+            raise Stop('No fallback routing configured')
+        r['fallback_plan'] = dict(plan=plan.strip(), provenance=r['provider_failure']['provenance'],
+                                 snapshot=current, route=self.routing['fallback'])
+        r['phase'] = 'fallback_pending'
+        self.state['blocked'] = None
         self.save()
 
     def wait(self, tid):
@@ -525,7 +638,9 @@ class Coordinator:
                 argv[0] = self.config['python']
             if any('$' in a or '`' in a for a in argv):
                 raise Stop(f'Unresolved shell syntax in check: {argv}')
-            env = dict(os.environ, MIGRATION_RUN_ID=output.stem, PYTHONDONTWRITEBYTECODE='1')
+            artifact_dir.mkdir(parents=True, exist_ok=False)
+            env = dict(os.environ, MIGRATION_RUN_ID=output.stem, PYTHONDONTWRITEBYTECODE='1',
+                       MIGRATION_ARTIFACT_DIR=str(artifact_dir), MIGRATION_CHECK_ORIGIN='coordinator')
             pytest = argv[1:3] == ['-m', 'pytest']
             if pytest:
                 report = output.with_suffix('.xml')
@@ -559,6 +674,25 @@ class Coordinator:
                                     passed=False, error=str(e), log=str(output)))
                 if pytest:
                     results[-1]['junit'] = str(report)
+            def retained_file(path):
+                return (path.is_file() and not path.is_symlink() and
+                        path.resolve().is_relative_to(artifact_dir.resolve()) and
+                        not any(parent.is_symlink() for parent in path.parents if parent.is_relative_to(artifact_dir)))
+            artifacts = []
+            for path in sorted([output, *artifact_dir.rglob('*'), *([report] if pytest else [])]):
+                if path in (output, report if pytest else None) or retained_file(path):
+                    if not path.is_file() or path.is_symlink():
+                        continue
+                    artifacts.append(dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size))
+            results[-1].update(origin='coordinator', original_command=template, cwd=str(cwd),
+                               source_head=git(cwd, 'rev-parse', 'HEAD'),
+                               source_snapshot_sha256=digest(json.dumps(snapshot(cwd), sort_keys=True)),
+                               artifact_directory=str(artifact_dir), artifacts=artifacts)
+            requirements = self.config.get('required_artifacts', {}).get(label.split('-')[0], [])
+            missing = [pattern for pattern in requirements if not any(
+                retained_file(p) and p.stat().st_size > 0 and any(a['path'] == str(p) for a in artifacts) for p in artifact_dir.glob(pattern))]
+            if missing:
+                results[-1].update(passed=False, error='Required verification artifacts missing: ' + ', '.join(missing))
             atomic(output.with_suffix('.json'), results[-1])
             if not results[-1]['passed']:
                 raise Stop(f'{label}: required check failed/missing/skipped: {shlex.join(argv)}; see {output}')
@@ -569,7 +703,7 @@ class Coordinator:
         r = self.state['records'][tid]
         self.scope(tid)
         w = Path(r['worktree'])
-        evidence = self.checks(w, self.config['checks'][tid], tid + '-branch')
+        evidence = self.checks(w, self.task_checks(tid), tid + '-branch')
         self.scope(tid)  # Checks cannot broaden the committed scope.
         git(w, 'add', '--', *self.changed(tid))
         if not set(git(w, 'diff', '--cached', '--name-only').splitlines()).issubset(set(self.changed(tid))):
@@ -586,10 +720,12 @@ class Coordinator:
         tid = task['id']
         r = self.state['records'][tid]
         clean(r['worktree'])
-        worker_report = self.artifact(tid, 'worker-%s-result.txt' % r['attempt']).read_text()
+        worker_report = Path(r.get('worker_result', self.artifact(tid, 'worker-%s-result.txt' % r['attempt']))).read_text()
         review = ('READ-ONLY independent review. Do not edit any files, commit, merge, or launch workers. '
                   'Do not trust worker PASS or process exit. Inspect actual implementation, full diff, tests and evidence. '
                   'Reject placeholder/incomplete work, skipped required checks, scope violations and missing criteria. '
+                  'Worker sandbox denial alone does not fail a check whose exact authorized coordinator receipt passed; '
+                  'a claimed success without coordinator evidence is unverified. Inspect public CLI/contract negatives and artifact lineage. '
                   'Report every numbered acceptance criterion using its AC ID; each passed criterion must cite concrete evidence. '
                   'Set approved only if ALL criteria are satisfied and no blocking findings.\n'
                   'Start with the cumulative base-to-commit diff and changed paths below. Read check receipts/logs '
@@ -633,8 +769,8 @@ class Coordinator:
         for i, line in enumerate(lines):
             if line.startswith(f'| [{tid}]'):
                 c = [s.strip() for s in line.strip('|').split('|')]
-                c[4:9] = ['merged', self.config['worker_model'], f'{r["branch"]} / {r["commit"]} / merge {r["merge"]}',
-                          f'approved {self.config["reviewer_model"]}', f'passed; evidence {self.directory / "checks"}']
+                c[4:9] = ['merged', r.get('worker_model', self.config['worker_model']), f'{r["branch"]} / {r["commit"]} / merge {r["merge"]}',
+                          f'approved {r.get("model", self.config["reviewer_model"])}', f'passed; evidence {self.directory / "checks"}']
                 lines[i] = '| ' + ' | '.join(c) + ' |'
         desired = '\n'.join(lines) + '\n'
         if path.read_text() not in (baseline_text, desired):
@@ -681,7 +817,7 @@ class Coordinator:
         if r['phase'] == 'integration_testing':
             if git(self.integration, 'rev-parse', 'HEAD') != r['merge']:
                 raise Stop('Integration changed before verification')
-            r['integration_evidence'] = self.checks(self.integration, self.config['checks'][tid] + self.config['regression_checks'], tid + '-integration')
+            r['integration_evidence'] = self.checks(self.integration, self.task_checks(tid) + self.config['regression_checks'], tid + '-integration')
             clean(self.integration)
             r['phase'] = 'status_pending'
             self.save()
@@ -705,7 +841,7 @@ class Coordinator:
         commands = []
         for t in tasks:
             if t['wave'] <= wave:
-                for command in self.config['checks'][t['id']]:
+                for command in self.task_checks(t['id']):
                     if command not in commands:
                         commands.append(command)
         evidence = self.checks(self.integration, commands + self.config['regression_checks'], f'wave-{wave}')
@@ -719,7 +855,7 @@ class Coordinator:
         if self.inputs(tasks) != self.state['input_digest']:
             raise Stop('Approved task/spec/plan inputs changed; revise plan before continuing')
         if self.state['blocked']:
-            raise Stop(f'Run blocked: {self.state["blocked"]}; inspect then use retry-checks or repair')
+            raise Stop(f'Run blocked: {str(self.state["blocked"])[:600]}; complete findings: {self.file}')
         records = self.state['records']
         recoverable = any(r['phase'] in ('merge_pending', 'status_pending') for r in records.values())
         if not recoverable:
@@ -742,11 +878,11 @@ class Coordinator:
             earliest_wave = min(unfinished_waves) if unfinished_waves else None
             active = [t for t in tasks if t['id'] in records and
                       t['wave'] == earliest_wave and
-                      records[t['id']]['phase'] not in ('merged', 'rejected')]
+                      records[t['id']]['phase'] not in ('merged', 'rejected', 'provider_blocked')]
             if not active:
                 rejected_in_wave = any(
                     t['wave'] == earliest_wave and
-                    records.get(t['id'], {}).get('phase') == 'rejected'
+                    records.get(t['id'], {}).get('phase') in ('rejected', 'provider_blocked')
                     for t in tasks)
                 # Do not assign fresh work alongside a rejected attempt whose scope
                 # remains occupied; only recorded peer work can safely drain.
@@ -773,7 +909,7 @@ class Coordinator:
                     message = 'Safe work exhausted: ' + ' | '.join(blockers)
                     self.state['blocked'] = message
                     self.save()
-                    raise Stop(message + '. No success claim; no merge into main was performed.')
+                    raise Stop(message[:800] + f'; complete findings: {self.file}. No success claim; no merge into main was performed.')
                 prior = {str(t['wave']) for t in tasks if t['wave'] < active[0]['wave']}
                 if any(w not in self.state['checkpoints'] for w in prior):
                     raise Stop('Prior wave checkpoint missing')
@@ -783,12 +919,22 @@ class Coordinator:
                     if sum(x['phase'] == 'worker_running' for x in records.values()) >= self.max_workers:
                         continue
                     self.launch(t, 'worker', self.prompt(t, r.get('repair', '')))
+                elif r['phase'] == 'fallback_pending':
+                    if sum(x['phase'] == 'worker_running' for x in records.values()) >= self.max_workers:
+                        continue
+                    self.launch(t, 'worker', self.prompt(t, r.get('repair', '')) + '\nSafe provider continuation plan:\n' + r['fallback_plan']['plan'], fallback=True)
             print('Active tasks: ' + ', '.join(t['id'] for t in active), flush=True)
             for t in active:
                 r = records[t['id']]
                 if r['phase'] == 'worker_running':
-                    outcome, _ = self.wait(t['id'])
-                    if outcome['exit'] != 0:
+                    self.wait(t['id'])
+                if r['phase'] == 'worker_finished':
+                    outcome = r['exit']
+                    job = json.loads(Path(r['job']).read_text())
+                    if outcome.get('provider_failure') and job.get('provider') == 'agy':
+                        self.handle_provider_failure(t, outcome, job)
+                        continue
+                    if outcome['exit'] != 0 or outcome.get('success') is False:
                         r['phase'] = 'rejected'
                         r['repair'] = f'Worker exited {outcome["exit"]}; inspect log and finish task.'
                         self.save()
@@ -804,7 +950,11 @@ class Coordinator:
                         raise Stop(f'{t["id"]}: reviewer process failed; no approval')
                     self.accept_review(t, job)
                 elif r['phase'] == 'review_finished':
-                    self.accept_review(t, json.loads(Path(r['job']).read_text()))
+                    job = json.loads(Path(r['job']).read_text())
+                    receipt = json.loads(Path(job['receipt']).read_text())
+                    if receipt['exit'] != 0 or receipt.get('success') is False:
+                        raise Stop(f'{t["id"]}: persisted reviewer process failed; no approval')
+                    self.accept_review(t, job)
             for t in active:  # Task-column order, one merge and integration check at a time.
                 self.integrate(t)
             waves = sorted({t['wave'] for t in active})
@@ -817,7 +967,10 @@ class Coordinator:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['configure', 'status', 'watch', 'usage', 'run', 'resume', 'repair', 'authorize-repairs', 'retry-checks', 'approve-gate', 'reconcile', 'smoke'])
+    p.add_argument('command', choices=['configure', 'status', 'watch', 'usage', 'run', 'resume', 'repair', 'authorize-repairs', 'retry-checks', 'approve-gate', 'reconcile', 'smoke', 'readiness', 'continue-fallback'])
+    p.add_argument('--providers-config', type=Path, default=HERE / 'providers.json')
+    p.add_argument('--auth-smoke', action='store_true', help='Readiness only: harmless cached-account headless prompt in a disposable repository')
+    p.add_argument('--full', action='store_true', help='Include detailed usage attempts')
     p.add_argument('--repo', type=Path, default=Path.cwd())
     p.add_argument('--state-dir', type=Path)
     p.add_argument('--config', type=Path, default=HERE / 'config.json')
@@ -838,16 +991,34 @@ def main():
         atomic(args.config, config_template(repo))
         print(args.config)
         return
+    routing = validate_routing(json.loads(args.providers_config.read_text()))
+    if args.command == 'readiness':
+        from providers import preflight
+        if args.auth_smoke:
+            from providers import auth_smoke
+            result = auth_smoke(routing['primary'], args.state_dir)
+        else:
+            result = preflight(routing['primary'], repo, routing.get('preflight_seconds', 30))
+            result.pop('stdout', None)
+            if result.get('stderr'):
+                result['stderr'] = result['stderr'][-1500:]
+        print(json.dumps(result, indent=2))
+        if not result['ready']:
+            raise Stop('Gemini readiness failed; inspect diagnostics')
+        return
     if args.command == 'smoke':
         from smoke import smoke
-        smoke(args.state_dir)
+        smoke(args.state_dir, routing=routing)
         return
     directory = (args.state_dir or (Path(git(repo, 'rev-parse', '--git-common-dir')) if Path(git(repo, 'rev-parse', '--git-common-dir')).is_absolute() else repo / git(repo, 'rev-parse', '--git-common-dir')) / 'migration-orchestrator').resolve()
     config = json.loads(args.config.read_text())
     config['python'] = config['python'].replace('{repo}', str(repo))
     if args.command == 'usage':
         from usage import usage_report
-        print(json.dumps(usage_report(directory), indent=2))
+        report = usage_report(directory)
+        if not args.full:
+            report.pop('agents', None)
+        print(json.dumps(report, indent=2))
         return
     if args.command == 'watch':
         if args.wait_seconds < 0:
@@ -859,13 +1030,13 @@ def main():
         state = json.loads((directory / 'state.json').read_text()) if (directory / 'state.json').exists() else {'records': {}, 'blocked': None}
         for t in tasks:
             r = state['records'].get(t['id'], {})
-            print(f'{t["id"]} wave={t["wave"]} plan={t["status"]} phase={r.get("phase", "unassigned")} commit={r.get("commit") or "-"}')
-        print(f'State: {directory}; blocked: {state["blocked"]}')
+            print(f'{t["id"]} wave={t["wave"]} plan={t["status"]} phase={r.get("phase", "unassigned")} commit={r.get("commit") or "-"} provider={r.get("worker_provider", "codex") if r else "-"} model={r.get("worker_model", config["worker_model"]) if r else "-"} stale_base={bool(r and r.get("base") != state.get("expected_head") and r.get("phase") != "merged")}')
+        print(f'State: {directory}; blocked: {status_projection(state)["blocked"]}; full findings in state.json')
         return
     if not args.approved_execution:
         raise Stop('Actual migration is gated. Obtain user approval before supplying --approved-execution')
     with lock(directory):
-        c = Coordinator(repo, directory, config, max_workers=args.max_workers)
+        c = Coordinator(repo, directory, config, max_workers=args.max_workers, routing=routing)
         if args.command in ('run', 'resume'):
             try:
                 c.execute(read_graph(repo))
@@ -877,7 +1048,10 @@ def main():
         else:
             if not c.state:
                 raise Stop('No run to recover')
-            if args.command == 'authorize-repairs':
+            if args.command == 'continue-fallback':
+                c.continue_fallback(args.task, args.findings)
+                print('Safe continuation plan recorded. Resume remains separately authorized.')
+            elif args.command == 'authorize-repairs':
                 entry = c.authorize_repairs(args.task, args.additional_attempts, args.reason, args.execution_guidance)
                 print(f'Authorized {entry["additional_attempts"]} additional {args.task} attempt(s); limit {entry["new_limit"]}. State: {c.file}')
             elif args.command == 'retry-checks':

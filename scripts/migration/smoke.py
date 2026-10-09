@@ -1,5 +1,6 @@
 """Real Codex smoke in an isolated, disposable documentation-only repository."""
 import json
+import shlex
 from pathlib import Path
 import sys
 import tempfile
@@ -53,15 +54,45 @@ def fixture(root):
     return repo, config
 
 
-def smoke(directory=None):
+class DocumentationCoordinator(Coordinator):
+    def prompt(self, task, repair='', role='worker'):
+        if role != 'worker':
+            return super().prompt(task, repair, role)
+        return ('Documentation-only smoke in an isolated Git worktree. Only this task is authorized. '
+                'Use file tools directly to create the one assigned document. Do not investigate the environment, '
+                'list directories through the terminal, or execute Python. The only terminal validation command '
+                'needed is the supplied git diff --no-index --exit-code command; execute it after editing with '
+                f'the run_command Cwd parameter set to {Path("/tmp").resolve()}, outside the Git checkout, so no shared metadata is needed. The coordinator independently checks exact bytes. '
+                'Do not stage, commit, merge, push, change branches, edit other files, use network, or delegate. '
+                'Leave changes uncommitted and report command results and any denials.\n'
+                + task['text'] + '\nExact permitted validation command: ' + ' '.join(self.worker_checks(task['id'])[0]) + '\nRetained repair instructions: ' + repair)
+
+
+def smoke(directory=None, routing=None):
     root = Path(directory).resolve() if directory else Path(tempfile.mkdtemp(prefix='migration-smoke-'))
     if directory:
         root.mkdir(parents=True, exist_ok=False)
     print(f'Smoke artifacts retained at {root}', flush=True)
     repo, config = fixture(root)
+    if routing:
+        config['reviewer_model'] = routing['reviewer']['model']
+        if routing['primary']['backend'] == 'agy':
+            config['worker_checks'] = {}
+            for tid in config['scopes']:
+                filename = config['scopes'][tid][0]
+                expected = filename.replace('.md', '.expected.md')
+                word = 'alpha' if tid == 'T001' else 'beta'
+                (repo / expected).write_text(f'# Smoke {word}\n\nThis is the {word} orchestration smoke document.\n')
+                config['worker_checks'][tid] = [['git', 'diff', '--no-index', '--exit-code', '{worktree}/' + expected, '{worktree}/' + filename]]
+                config['checks'][tid].append(['git', 'diff', '--no-index', '--exit-code', expected, filename])
+            for brief in (repo / 'docs/migration/tasks').glob('*.md'):
+                tid = brief.stem
+                brief.write_text(brief.read_text() + '\nBefore handoff execute exactly ' + ' '.join(config['worker_checks'][tid][0]) + ' and report its result. No other terminal command is needed; coordinator validates exact content.\n')
+            git(repo, 'add', '.')
+            git(repo, 'commit', '-m', 'require permitted worker validation')
     atomic(root / 'config.json', config)
     with lock(root / 'state'):
-        c = Coordinator(repo, root / 'state', config, max_workers=2)
+        c = DocumentationCoordinator(repo, root / 'state', config, max_workers=2, routing=routing)
         try:
             c.execute(read_graph(repo))
             # Resume a completed run and prove no duplicate attempts/commits.
@@ -76,11 +107,24 @@ def smoke(directory=None):
                 assert r['attempt'] == 1
                 assert r['review']['approved']
                 assert all(p.startswith('docs/') for p in c.changed(tid))
+                if r.get('worker_provider') == 'agy':
+                    events = [json.loads(line) for line in c.artifact(tid, 'worker-1.jsonl').read_text().splitlines()]
+                    command = c.worker_checks(tid)[0]
+                    tool = [e.get('step_update', {}) for e in events if e.get('event') == 'step_update']
+                    assert any(s.get('state') == 'DONE' and s.get('tool_name') == 'run_command' and
+                               shlex.split(s.get('tool_info', {}).get('parameters', {}).get('CommandLine', '')) == command and
+                               not s.get('tool_info', {}).get('error') and
+                               'fatal:' not in s.get('tool_info', {}).get('output', '').lower()
+                               for s in tool), 'No verified permitted Gemini validation tool execution'
+                    assert not receipts[-1].get('sandbox_tool_diagnostics'), 'Worker sandbox validation failed'
             assert max(x['started'] for x in receipts) < min(x['finished'] for x in receipts), 'Workers did not overlap'
             assert git(repo, 'branch', '--show-current') == 'smoke-base'
             assert git(repo, 'rev-parse', 'HEAD') == state['baseline']
-            atomic(root / 'report.json', dict(passed=True, concurrent=True, resumed_without_duplicates=True, state=str(c.file)))
-            print('PASS: concurrent Luna docs workers, independent Sol reviews, exact-content checks, sequential merges, integration checks, verified STATUS, idempotent resume.', flush=True)
+            atomic(root / 'report.json', dict(passed=True, concurrent=True, resumed_without_duplicates=True,
+                                            providers=[r.get('worker_provider', 'codex') for r in state['records'].values()],
+                                            gemini_completed=any(r.get('worker_provider') == 'agy' for r in state['records'].values()),
+                                            state=str(c.file)))
+            print('PASS: concurrent subscription docs workers, independent Sol reviews, exact-content checks, sequential merges, integration checks, verified STATUS, idempotent resume.', flush=True)
         except Exception as e:
             if c.state:
                 c.state['blocked'] = str(e)

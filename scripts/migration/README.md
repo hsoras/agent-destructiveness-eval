@@ -1,6 +1,6 @@
 # Migration coordinator
 
-Orchestration infrastructure. Historical preflight reports describe the pre-start state; persisted execution state is authoritative for current progress. Requires Python 3.11+, Git, and the installed authenticated Codex CLI (tested with 0.162.0). No API keys or Python packages are needed for orchestration. Actual migration checks separately require the project's development environment, pinned runtime and Docker where specified.
+Orchestration infrastructure. Historical preflight reports describe the pre-start state; persisted execution state is authoritative for current progress. Requires Python 3.11+, Git, and the installed authenticated Codex and Antigravity (`agy`) CLIs (tested with 0.162.0). No API keys or Python packages are needed for orchestration. Actual migration checks separately require the project's development environment, pinned runtime and Docker where specified.
 
 Run from the repository root:
 
@@ -18,7 +18,7 @@ python3 scripts/migration/orchestrate.py run --approved-execution
 python3 scripts/migration/orchestrate.py resume --approved-execution
 ```
 
-The smoke test runs **real** concurrent `gpt-6-luna` workers at medium effort, then independent read-only `gpt-6-sol` reviews at medium effort. It checks exact document content and ownership, commits the changes itself, merges sequentially, checks integration, updates only the temporary status file, and resumes a completed run to prove idempotence. It asserts overlapping worker execution and preserves the original temporary baseline. All temporary repositories, worktrees and evidence are retained; their path is printed. `--state-dir /absolute/new/path` chooses the smoke artifact root (must not already exist). Smoke never uses the application's task graph or integration branch. Codex model calls use the existing account and its usage allowance.
+The smoke test runs **real** concurrent Gemini 3.8 Flash Medium and GPT-6 Luna Medium workers, then independent read-only GPT-6.1 Sol Medium reviews. An eligible Gemini infrastructure failure can instead continue on Luna under the same gates. It checks exact document content and ownership, commits the changes itself, merges sequentially, checks integration, updates only the temporary status file, and resumes a completed run to prove idempotence. It asserts overlapping worker execution and preserves the original temporary baseline. All temporary repositories, worktrees and evidence are retained; their path is printed. `--state-dir /absolute/new/path` chooses the smoke artifact root (must not already exist). Smoke never uses the application's task graph or integration branch. Codex model calls use the existing account and its usage allowance.
 
 Before actual execution, review and commit `scripts/migration/` together with all approved planning inputs into the agreed baseline. Existing task-named branches outside recorded state (such as `agent/T001`) make initial execution stop for ownership reconciliation; they are never deleted or imported as completed work automatically. The coordinator requires a clean source checkout and starts the dedicated `migration/artifact-upload` branch from its recorded local HEAD. It never fetches, pushes, switches the user's checkout, or merges into main. The default run directory is `<git-common-dir>/migration-orchestrator`, with logs and receipts beneath it. The default integration and worker worktrees live in the persistent sibling directory `../.<repository-name>-migration-worktrees/`, outside the shared protected `.git` directory. An external `--state-dir` keeps worktrees beneath that directory instead. Keep that directory: `state.json`, logs, exit receipts, prompts, reviews, check logs and Git worktrees are the recovery record. `--state-dir` and `--config` must be supplied consistently on every command when using non-default locations.
 
@@ -85,3 +85,162 @@ Reviewers receive cumulative diff instructions, exact changed paths, coordinator
 Repairs retain a history of findings and prior reviews. Repeating an identical plan or extension reason is rejected; supply new evidence and a consolidated hypothesis. A failed reviewer output gets at most one explicit, reasoned retry per unchanged commit through `retry-checks`. Code repairs retain the existing frozen budget and cumulative extension ceiling. These checks cannot determine whether differently worded evidence is genuinely new; Boss must assess that. Do not use extra workers as a substitute for resolving task-scope ambiguity.
 
 See [OPTIMIZATION.md](OPTIMIZATION.md) for the measured audit, validation and remaining resumption blockers.
+
+
+## Subscription provider routing (infrastructure update, migration remains paused)
+
+`providers.json` is a runtime policy separate from the frozen migration `config.json`.
+Pass `--providers-config /absolute/policy.json` consistently. Existing state/config/input
+hashes remain enforced; no existing record is rewritten to adopt routing. Every new
+job persists its provider, model, effort, argv, permissions preflight, and before-worktree
+snapshot. Historical jobs keep their original commands. Boss stays GPT-6.1 Sol Medium;
+reviewers default to GPT-6.1 Sol Medium. Sol High is reserved for a justified, bounded
+investigation. Fast modes are not enabled.
+
+The default primary is `agy --model gemini-3.8-flash-medium --effort medium`, fallback
+is `codex exec -m gpt-6-luna` with medium reasoning. CLI execution uses the account's
+cached subscription login. No API keys, Vertex projects, API clients, purchases, or
+account/settings changes are made by these scripts. If login expires, authenticate
+interactively with `agy` outside orchestration; the readiness command never logs in
+or changes credentials. Account entitlement/remaining allowance is unavailable to
+the orchestrator; it does not independently certify billing-plan identity.
+
+```sh
+# Model/executable check (read-only; requires agy's local listener to be permitted).
+python3 scripts/migration/orchestrate.py readiness
+# Model plus harmless headless authentication check; new disposable repo, retained logs.
+python3 scripts/migration/orchestrate.py readiness --auth-smoke
+# Mixed-provider documentation-only smoke; never uses the application's graph or state.
+python3 scripts/migration/orchestrate.py smoke
+# Compact task status and provider/model/role/task usage aggregates.
+python3 scripts/migration/orchestrate.py status
+python3 scripts/migration/orchestrate.py usage
+# Detailed per-attempt records and original logs on disk.
+python3 scripts/migration/orchestrate.py usage --full
+# Wait through intermediate phases until a terminal decision/completion or bounded timeout.
+python3 scripts/migration/orchestrate.py watch --wait-seconds 1800
+```
+
+Use `--state-dir /absolute/new/path` for readiness/smoke artifact retention (path must
+not exist). To inspect smoke usage, supply its `/state` subdirectory to `usage`.
+The real CLI needs to create its own localhost listener and CLI logs; an outer sandbox
+that prohibits those must authorize the **disposable smoke or read-only readiness**,
+while keeping `agy --sandbox` on for agent terminal commands.
+
+### Permissions and failure handling
+
+Gemini runs in the same isolated task worktree with `-p`, explicit model/effort,
+`--output-format stream-json`, `--sandbox`, `--mode accept-edits`, and
+`--disable-slash-commands`. It never uses permission-bypass flags. Existing CLI
+settings are inherited. Before implementation, the runner conservatively checks
+literal command-prefix grants for the task's worker validation commands against
+`~/.gemini/antigravity-cli/settings.json`. Missing/uncertain grants, Ask/Deny rules,
+or unrestricted command/file grants make Gemini unavailable. Regex grants are
+conservatively treated as unverified, so use narrow literal prefixes for required
+commands. Do not add `command(*)` or `unsandboxed(*)`. Review your existing grants:
+this adapter does not replace global permissions or forcibly remove existing rules.
+The documentation smoke uses `git diff --no-index --exit-code <expected-document> <document>` from the temporary fixture root outside the Git checkout under the already allowed `command(git diff)`;
+actual Python/pytest checks may need separate narrow rules before Gemini can run.
+
+For new configurations, `worker_checks` can name focused developer commands;
+otherwise required branch/public checks supply the permission preflight. Coordinator
+validation remains mandatory regardless of worker checks or worker sandbox errors.
+The permission preflight is conservative, not an emulator of every agy permission
+syntax. New CLI syntax/schema changes can stop Gemini safely. Unexpected tool
+failures or missing terminal results do not become provider outages by inference.
+
+stdout JSONL, stderr, final response, terminal status, errors, denied actions,
+usage, exit receipt, runner/child PIDs, and preflight output are retained under
+`tasks/<task>/`. A denial can accompany `SUCCESS` and exit 0; it still blocks a
+successful handoff. Authentication, quota, model, initialization, provider, and
+permission errors may trigger fallback. Acceptance failures, incorrect/incomplete
+implementation, unknown tool errors, and review rejection use the existing repair
+process, without automatic provider switching.
+
+Fallback is sequential, once per coding attempt, with a separate `worker-N-fallback`
+job/receipt. All tracked and untracked files (including ignored artifacts), modes,
+symlinks, staged diff, HEAD and branch are compared before handover. An unchanged
+worktree gets a persisted continuation plan automatically. Changed bytes/Git state
+are preserved with before/after manifests and a binary patch; the task stops in
+`provider_blocked`. No reset, checkout, cleanup, rebase, or overwrite is performed.
+The supervisor must inspect provenance and establish exact remaining work:
+
+```sh
+# ONLY after separate migration authorization and inspection of retained partial files:
+python3 scripts/migration/orchestrate.py continue-fallback --task Txxx \
+  --findings 'Exact retained changes, safe continuation strategy, remaining work and validation.' \
+  --approved-execution
+python3 scripts/migration/orchestrate.py resume --approved-execution
+```
+
+The continuation snapshot must still match at launch. Unexpected worker branch/HEAD
+changes require manual reconciliation. An interruption with uncertain launch stays
+blocked; it never duplicates a process. Both providers failing leaves receipts/files
+and stops without claiming completion. Fallback preserves repair budgets, coordinator
+commits, independent complete-criterion review, manual ratification, scope checks,
+integration regressions and baseline exceptions.
+
+One worker is the default. `--max-workers 2` permits up to two disjoint ready tasks;
+with `mixed_parallel` true, a second coding task uses Luna while Gemini is active.
+Recorded same-task attempts cannot overlap. Ownership/dependency/wave rules remain
+unchanged, and fresh tasks do not launch around occupied rejected work.
+
+### Verification interface and retained evidence
+
+Each coordinator check gets `MIGRATION_ARTIFACT_DIR`, `MIGRATION_RUN_ID`, and
+`MIGRATION_CHECK_ORIGIN=coordinator`. Tests/tools must save raw results into that
+directory **before temporary fixtures are torn down**. `{output}` resolves there.
+stdout/stderr, exit code, original command, executed argv, JUnit when applicable,
+origin, working directory, source HEAD, source snapshot digest, and non-symlink
+artifact paths/lengths/SHA-256 are recorded automatically in the check receipt.
+Deleted internal test artifacts cannot be reconstructed; the test must adopt this
+interface. Hashes prove recorded bytes/provenance, not authenticity of a historical
+upstream release. Review must still verify authentic source/checkout lineage.
+
+`public_checks: {"Txxx": [["{python}", "public_cli.py", "--help"], ...]}` adds
+mandatory entry-point/contract checks before review, at integration and wave gates.
+Include meaningful invalid inputs, valid alternative lineage, and forged-lineage
+negatives; `--help` alone is insufficient. `required_artifacts: {"Txxx": ["control.json"]}`
+requires nonempty retained artifacts on each task-labelled check. These declarations
+belong in an approved **new** run configuration, not silently in existing frozen state.
+Existing T002 must implement its public-contract/lineage tests and save control evidence
+in its separately authorized repair; this infrastructure change neither fixes application
+code nor waives any T002 criterion. Reviewers must reconcile worker sandbox denials
+against exact coordinator receipts and cannot invent a coordinator pass.
+
+`status` and `watch` project bounded fields/findings rather than dumping the full
+state/logs. `watch` uses monotonic deadlines and deterministic file polling, without
+LLM calls, writes or coordinator locks. Worker starts/completions, commits, review
+starts and checkpoints alone do not wake Boss; merged tasks, rejection, blockers,
+integration failure and all-recorded-task completion do. Full findings stay in state.json.
+
+Branch freshness is displayed as `stale_base`. No automatic refresh/rebase is added:
+merging a new baseline into old task branches would require separating ownership
+from inherited peer changes, invalidating old review/evidence and recovering conflicts
+without losing accepted source provenance. Preserve old commits and use verified
+cross-task evidence with exact revisions until a separately reviewed refresh design
+exists. Sequential integration checks still validate each candidate on the current head.
+
+Token reports group by provider, model, role, task and attempt. Google terminal
+cumulative usage is counted once, without adding per-step usage again. Missing counters
+and subscription allowance remain unknown. Google input/cache inclusion semantics are
+not assumed, so an uncached-input estimate is emitted only for Codex. No cross-provider
+cost or allowance equivalence is inferred. Boss/investigator sessions outside these
+receipts remain unmeasured.
+
+### Resuming the paused migration (separate authorization required)
+
+T001 and T003 are integrated; T002 candidate `56b8bfa7d7754b1709c15eb483bca973e402e4e7`
+remains rejected at attempt 5. The unassigned final brief is
+`/private/tmp/migration-t002-final-release-repair.md`. Infrastructure verification does
+not clear that rejection or the user's pause. After separate user authorization,
+inspect the retained brief and budget, then record the exact targeted repair:
+
+```sh
+python3 scripts/migration/orchestrate.py repair --task T002 \
+  --findings 'Read /private/tmp/migration-t002-final-release-repair.md in full. Preserve the rejected candidate and authentic evidence; implement only this consolidated brief and all required public CLI, negative lineage and retained-control tests.' \
+  --approved-execution
+python3 scripts/migration/orchestrate.py resume --max-workers 2 --approved-execution
+```
+
+These commands are documentation only and were not executed for this infrastructure task.

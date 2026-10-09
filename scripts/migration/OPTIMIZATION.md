@@ -68,3 +68,24 @@ Baseline: 33 orchestration tests passed in 43.679 seconds before changes. Expand
 The approved baseline exception remains byte-identical in config and documentation. Tests reject changed signatures or scanned sources, additional failures, collection errors, skips and abnormal exits. No application acceptance suite or real smoke was run because this task is infrastructure-only.
 
 Final validation: **41 tests passed in 65.595 seconds** using `.venv/bin/python -m unittest discover -s scripts/migration -p 'test_*.py' -v`; `py_compile` and `git diff --check` passed. Read-only `status`, `usage`, `watch` and existing-state Coordinator construction passed without resuming execution. All **291 persisted files** under `.git/migration-orchestrator/` are byte-identical to the pre-edit hash manifest. Migration refs, integration/worker worktrees and worker checkout statuses are unchanged; frozen config/spec/task/plan digests still match. The read-only existing-lock probe confirms no coordinator currently holds the lock. Final local evidence is retained in `/tmp/migration-optimization-final-tests.log`, `/tmp/migration-optimization-usage.json`, `/tmp/migration-optimization-watch.json` and `/tmp/migration-optimization-preservation.json`. Infrastructure changes are committed separately on the existing source branch, without updating the migration integration branch. Infrastructure readiness does not clear the recorded migration blocker. Resumption remains blocked on consolidated T002/T003 recovery decisions, exact reviewed repair budgets and unchanged quality gates; this audit has not authorized or performed it.
+
+
+## Gemini infrastructure follow-up (2026-10-09)
+
+Current authoritative state supersedes the historical counts above: T001 and T003
+are integrated; T002 is rejected at attempt 5. Migration remains explicitly paused.
+The provider adapter prefers Gemini 3.8 Flash Medium through cached-account `agy`,
+with sequential Luna Medium fallback for verified infrastructure errors. Runtime
+routing is separate from frozen config. Partial changes stop for an explicit continuation
+plan; coding/test/review defects remain evidence-based repairs on the current provider.
+Mixed disjoint tasks may use one Gemini and one Luna; the default remains serial.
+Terminal-event waits suppress intermediate phase churn. Checks persist raw artifact
+provenance/hashes, and public contract checks can be made mandatory in new configs.
+
+Real probes exposed permission-denied `SUCCESS`/exit-0 behavior and retained it as
+regression evidence. A compact documentation-only worker prompt avoids production
+migration decision boilerplate and unnecessary environment discovery. No global account
+or permission settings were changed. Branch refresh remains a documented limitation;
+current stale branches are preserved. See `GEMINI_RESULTS.md` for measured verification
+results, limitations and retained artifact paths. No allowance savings or cross-provider
+cost equivalence is claimed.
