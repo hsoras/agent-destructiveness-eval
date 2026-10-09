@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -289,10 +290,12 @@ class Coordinator:
             raise Stop('Approved task/spec/plan inputs changed; no repair authorization')
         if git(self.integration, 'rev-parse', 'HEAD') != self.state['expected_head']:
             raise Stop('Integration HEAD changed outside coordinator')
+        if git(self.integration, 'branch', '--show-current') != self.state['branch']:
+            raise Stop('Integration branch changed outside coordinator')
         clean(self.integration)
         record = self.state['records'][task_id]
-        if record['phase'] != 'rejected' or record['attempt'] < self.repair_limit(record):
-            raise Stop('Extend only a rejected task after its existing repair budget is exhausted')
+        if record['attempt'] < self.repair_limit(record):
+            raise Stop('Extend only a task after its existing repair budget is exhausted')
         worktree = Path(record['worktree'])
         if (git(worktree, 'branch', '--show-current') != record['branch'] or
                 git(worktree, 'rev-parse', 'HEAD') != (record['commit'] or record['base'])):
@@ -302,6 +305,11 @@ class Coordinator:
             raise Stop('Cumulative additional repair budget exceeded')
         if any(e['reason'].strip() == reason.strip() for e in record.get('repair_authorizations', [])):
             raise Stop('Repeated repair reason; consolidate findings and provide new evidence')
+        evidence = None
+        if record['phase'] == 'worker_finished':
+            evidence = self._terminal_check_repair_evidence(task_id, record)
+        elif record['phase'] != 'rejected':
+            raise Stop('Extend only a rejected task or a terminal branch-check failure after budget exhaustion')
         prior_guidance = self.state.get('execution_guidance')
         if prior_guidance and execution_guidance and prior_guidance != execution_guidance:
             raise Stop('Existing execution guidance cannot be replaced')
@@ -309,11 +317,218 @@ class Coordinator:
                      additional_attempts=additional_attempts, new_limit=self.repair_limit(record) + additional_attempts,
                      attempt_at_authorization=record['attempt'], reason=reason.strip(),
                      execution_guidance=execution_guidance)
+        if evidence:
+            entry['terminal_check_repair'] = evidence
         record.setdefault('repair_authorizations', []).append(entry)
         if execution_guidance:
             self.state['execution_guidance'] = execution_guidance
         self.save()
         return entry
+
+    def _terminal_check_repair_evidence(self, task_id, record):
+        """Verify the narrow retained evidence path for a worker stopped at branch checks."""
+        if record.get('commit') or record.get('review') or record.get('gate_commit'):
+            raise Stop('Terminal branch-check repair requires an uncommitted, unreviewed worker')
+        if record.get('phase') != 'worker_finished':
+            raise Stop('Not a terminal worker result')
+        tasks_root = self.directory / 'tasks'
+        task_root = tasks_root / task_id
+        if tasks_root.is_symlink() or task_root.is_symlink():
+            raise Stop('Symlink in retained task evidence directory')
+        task_dir = task_root.resolve()
+        if not task_dir.is_relative_to(tasks_root.resolve()):
+            raise Stop('Task evidence directory escapes coordinator state')
+        def retained(raw, base=task_dir):
+            if not isinstance(raw, str) or not raw:
+                raise Stop('Missing retained terminal evidence path')
+            p = Path(raw)
+            if not p.is_absolute():
+                p = base / p
+            if p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(task_dir):
+                raise Stop('Terminal evidence escapes its retained task directory')
+            if any(parent.is_symlink() for parent in p.parents if parent != task_dir.parent):
+                raise Stop('Symlink in retained evidence path')
+            return p.resolve()
+        job_path = retained(record.get('job'))
+        expected_job_name = f'worker-{record["attempt"]}-job.json'
+        if job_path.name != expected_job_name or job_path != (task_dir / expected_job_name).resolve():
+            raise Stop('Worker job is not the exact current attempt')
+        job_mtime = job_path.stat().st_mtime
+        if not math.isfinite(job_mtime) or job_mtime <= 0:
+            raise Stop('Current worker job launch time is malformed')
+        try:
+            job = json.loads(job_path.read_text())
+        except (OSError, ValueError) as e:
+            raise Stop('Malformed current worker job') from e
+        if not isinstance(job, dict):
+            raise Stop('Malformed current worker job')
+        if (job.get('task') != task_id or job.get('role') != 'worker' or not isinstance(job.get('cwd'), str) or
+                not isinstance(job.get('attempt'), int) or isinstance(job.get('attempt'), bool) or job.get('attempt') != record['attempt'] or
+                Path(job.get('cwd', '')).resolve() != Path(record['worktree']).resolve()):
+            raise Stop('Current worker job identity mismatch')
+        receipt_path = retained(job.get('receipt'))
+        expected_receipt_name = f'worker-{record["attempt"]}-exit.json'
+        if receipt_path.name != expected_receipt_name or receipt_path != (task_dir / expected_receipt_name).resolve():
+            raise Stop('Worker terminal receipt is not the exact current attempt')
+        expected_log_path = (task_dir / f'worker-{record["attempt"]}.jsonl').resolve()
+        expected_result_path = (task_dir / f'worker-{record["attempt"]}-result.txt').resolve()
+        if job.get('log') is None or retained(job['log']) != expected_log_path:
+            raise Stop('Current worker job log identity mismatch')
+        if job.get('result') is None or retained(job['result']) != expected_result_path:
+            raise Stop('Current worker job result identity mismatch')
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, ValueError) as e:
+            raise Stop('Malformed worker terminal receipt') from e
+        if not isinstance(receipt, dict):
+            raise Stop('Malformed worker terminal receipt')
+        started, finished = receipt.get('started'), receipt.get('finished')
+        receipt_attempt = receipt.get('attempt')
+        if (receipt.get('task') != task_id or receipt.get('role') != 'worker' or
+                not isinstance(receipt_attempt, int) or isinstance(receipt_attempt, bool) or receipt_attempt != record['attempt'] or
+                not isinstance(started, (int, float)) or isinstance(started, bool) or
+                not isinstance(finished, (int, float)) or isinstance(finished, bool) or
+                not (math.isfinite(started) and math.isfinite(finished) and 0 < started <= finished) or
+                receipt.get('provider') != job.get('provider') or receipt.get('model') != job.get('model') or
+                not isinstance(receipt.get('exit'), int) or isinstance(receipt.get('exit'), bool) or receipt.get('exit') != 0 or
+                record.get('exit') != receipt or receipt.get('error') or
+                receipt.get('success') is False or receipt.get('provider_failure') or receipt.get('parse_error') or
+                receipt.get('timeout') or receipt.get('launch_error')):
+            raise Stop('Worker terminal receipt is unsuccessful, malformed or mismatched')
+        if job.get('provider') == 'agy' and (receipt.get('success') is not True or receipt.get('terminal_status') != 'SUCCESS'):
+            raise Stop('Provider terminal result does not prove successful completion')
+        for key in ('log', 'result'):
+            if receipt.get(key) != job.get(key):
+                raise Stop('Worker terminal receipt log/result identity mismatch')
+            retained(receipt[key])
+        if retained(receipt['log']) != expected_log_path or retained(receipt['result']) != expected_result_path:
+            raise Stop('Worker terminal receipt log/result identity mismatch')
+        # All known target process identities must be demonstrably gone. Unknown or denied probes fail closed.
+        identities = [(Path(str(job_path) + '.pid.json'), 'pid'),
+                      (Path(str(job_path) + '.child.json'), 'pid')]
+        if any(not path.is_file() or path.is_symlink() for path, _ in identities):
+            raise Stop('Missing current runner/child PID receipt')
+        recorded_pid = record.get('pid')
+        if not isinstance(recorded_pid, int) or isinstance(recorded_pid, bool) or recorded_pid <= 0:
+            raise Stop('Uncertain current worker launch identity')
+        prev_started = None
+        for index, (path, field) in enumerate(identities):
+            if path.exists() or path.is_symlink():
+                p = retained(str(path))
+                try:
+                    meta = json.loads(p.read_text())
+                except (OSError, ValueError) as e:
+                    raise Stop('Malformed target process identity') from e
+                if not isinstance(meta, dict):
+                    raise Stop('Malformed target process identity')
+                pid = meta.get(field)
+                if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                    raise Stop('Malformed target process identity')
+                proc_started = meta.get('started')
+                if (not isinstance(proc_started, (int, float)) or isinstance(proc_started, bool) or
+                        not math.isfinite(proc_started)):
+                    raise Stop('Target process started metadata is malformed or out of order')
+                # job.py writes runner metadata before it captures receipt.started;
+                # it writes child metadata after that capture and before finished.
+                in_launch_interval = (job_mtime <= proc_started <= started if index == 0
+                                      else started <= proc_started <= finished)
+                if (not in_launch_interval or
+                        (prev_started is not None and proc_started < prev_started)):
+                    raise Stop('Target process started metadata is malformed or out of order')
+                prev_started = proc_started
+                if path == identities[0][0] and record.get('pid') != pid:
+                    raise Stop('Recorded runner PID does not match its retained PID receipt')
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    raise Stop('Target process liveness is uncertain')
+                else:
+                    raise Stop('Target runner or child process is still alive')
+        try:
+            os.kill(recorded_pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            raise Stop('Target launch process liveness is uncertain')
+        else:
+            raise Stop('Target launch process is still alive')
+        checks_root = self.directory / 'checks' / f'{task_id}-branch'
+        checks_dir = checks_root.resolve()
+        if ((self.directory / 'checks').is_symlink() or checks_root.is_symlink() or
+                not checks_dir.is_dir() or not checks_dir.is_relative_to(self.directory)):
+            raise Stop('Missing retained branch-check evidence')
+        matches = []
+        for path in checks_dir.glob('*.json'):
+            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(checks_dir):
+                continue
+            try:
+                check = json.loads(path.read_text())
+            except (ValueError, OSError):
+                continue
+            if not isinstance(check, dict):
+                continue
+            log = check.get('log')
+            command = check.get('command')
+            if isinstance(log, str) and isinstance(command, list) and all(isinstance(x, str) for x in command) and self.state.get('blocked') == (
+                    f"{task_id}-branch: required check failed/missing/skipped: " +
+                    shlex.join(command) + f"; see {log}"):
+                matches.append((path.resolve(), check))
+        if len(matches) != 1:
+            raise Stop('Blocker does not identify exactly one retained failed branch check')
+        check_path, check = matches[0]
+        if (check.get('origin') != 'coordinator' or check.get('passed') is not False or
+                not isinstance(check.get('exit'), int) or isinstance(check.get('exit'), bool) or check['exit'] != 2 or
+                check.get('error') or check.get('cwd') != str(Path(record['worktree']).resolve()) or
+                check.get('source_head') != git(record['worktree'], 'rev-parse', 'HEAD') or
+                check.get('source_snapshot_sha256') != digest(json.dumps(snapshot(record['worktree']), sort_keys=True))):
+            raise Stop('Failed-check receipt does not match the current coordinator snapshot')
+        expected = self.task_checks(task_id)
+        if check.get('original_command') not in expected:
+            raise Stop('Failed-check command is not a frozen required task check')
+        stem = check_path.stem
+        template = check['original_command']
+        argv = [x.replace('{python}', self.config['python']).replace('$USER', stem).replace('{output}', str(check_path.parent / stem)) for x in template]
+        if argv and argv[0] == '.venv/bin/python':
+            argv[0] = self.config['python']
+        if argv[1:3] == ['-m', 'pytest']:
+            argv += ['-o', 'junit_family=xunit2', '--junitxml=' + str(check_path.with_suffix('.xml'))]
+        if check.get('command') != argv:
+            raise Stop('Failed-check executed command does not match its frozen template')
+        def retained_check(raw):
+            p = Path(raw)
+            lexical_root = self.directory / 'checks' / f'{task_id}-branch'
+            lexical = p.absolute()
+            if (p.is_symlink() or not lexical.is_relative_to(lexical_root.absolute()) or
+                    not p.is_file() or not p.resolve().is_relative_to(checks_dir)):
+                raise Stop('Failed-check log/artifact escapes retained check directory')
+            if any(parent.is_symlink() for parent in p.parents if parent != lexical_root.parent):
+                raise Stop('Symlink in failed-check evidence path')
+            return p.resolve()
+        log_path = retained_check(check['log'])
+        if (log_path.parent != checks_dir or log_path.suffix != '.log' or
+                log_path.stat().st_mtime < finished or check_path.stat().st_mtime < finished):
+            raise Stop('Failed-check log is not a retained branch-check log')
+        artifacts = check.get('artifacts')
+        if not isinstance(artifacts, list) or not artifacts:
+            raise Stop('Failed-check artifact manifest is missing')
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                raise Stop('Malformed failed-check artifact manifest')
+            p = retained_check(artifact.get('path'))
+            if (not p.is_file() or p.stat().st_size != artifact.get('bytes') or
+                    hashlib.sha256(p.read_bytes()).hexdigest() != artifact.get('sha256') or
+                    p.stat().st_mtime < finished):
+                raise Stop('Failed-check log/artifact bytes do not match their receipt')
+        log_item = next((a for a in artifacts if Path(a.get('path', '')).resolve() == log_path), None)
+        if not log_item:
+            raise Stop('Failed-check log predates terminal worker completion or is unmanifested')
+        return dict(phase=record['phase'], attempt=record['attempt'], job=str(job_path),
+                    job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(), receipt=str(receipt_path),
+                    receipt_sha256=hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                    check_receipt=str(check_path), check_receipt_sha256=hashlib.sha256(check_path.read_bytes()).hexdigest(),
+                    blocker=self.state.get('blocked'), snapshot_sha256=check['source_snapshot_sha256'])
 
     @property
     def integration(self):
