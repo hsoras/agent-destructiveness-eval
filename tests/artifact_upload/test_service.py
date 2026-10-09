@@ -1,6 +1,7 @@
 import hashlib
 import http.client
 import json
+import io
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -63,6 +64,12 @@ def test_http_upload_list_download_quota_delete_and_display_alias(server):
     assert metadata["sha256"] == hashlib.sha256(body).hexdigest()
     assert metadata["owner_id"] == "configured-owner"
 
+    # The replay is returned without reading its request body. On a persistent
+    # HTTP/1.1 handler that body could otherwise be parsed as a second request.
+    replay_status, replay, replay_headers = raw_upload(httpd, body)
+    assert replay_status == 201 and replay["body"]["object_id"] == oid
+    assert dict(replay_headers).get("Connection") == "close"
+
     status, listed, _ = request(httpd, "GET", "/v1/projects/project/releases?repository=repo")
     assert status == 200 and [x["object_id"] for x in json.loads(listed)["body"]["objects"]] == [oid]
     assert json.loads(listed)["body"]["objects"][0]["display"]["aliases"]["owner_name"] == "Morgan Lee"
@@ -80,8 +87,9 @@ def test_http_upload_list_download_quota_delete_and_display_alias(server):
 
     # Capacity is inclusive at the exact boundary and rejects the next byte
     # without changing the already committed release.
-    rejected_status, rejected, _ = raw_upload(httpd, b"x", key="over-capacity", path="another.tar")
+    rejected_status, rejected, rejected_headers = raw_upload(httpd, b"x", key="over-capacity", path="another.tar")
     assert rejected_status == 413 and rejected["error"]["code"] == "quota_exceeded"
+    assert dict(rejected_headers).get("Connection") == "close"
     status, still_present, _ = request(httpd, "GET", f"/v1/objects/{oid}")
     assert status == 200 and still_present == body
 
@@ -215,3 +223,111 @@ def test_delete_commit_survives_crash_before_object_cleanup(tmp_path, credential
     assert reopened._objects == {}
     status, replay = reopened.delete("broad", oid, "delete-key")
     assert status == 200 and replay["body"]["object_id"] == oid
+
+
+def test_concurrent_same_object_reserves_identity_before_streaming(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "same-object", 100, credentials=credentials)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FirstReadBarrier:
+        def __init__(self, value):
+            self.inner = io.BytesIO(value)
+            self.first = True
+        def read(self, amount):
+            if self.first:
+                self.first = False
+                entered.set()
+                assert release.wait(timeout=2)
+            return self.inner.read(amount)
+
+    data = b"first committed bytes"
+    def put(index):
+        return store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path="immutable/release", idempotency_key=f"same-{index}", content=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(), _reader=FirstReadBarrier(data))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(put, 0)
+        assert entered.wait(timeout=2)
+        second = put(1)
+        release.set()
+        results = [first.result(timeout=2), second]
+    assert sorted(status for status, _ in results) == [201, 409]
+    oid = next(body["body"]["object_id"] for status, body in results if status == 201)
+    assert store._object_file(oid).read_bytes() == data
+    status, _, metadata, downloaded = store.download("broad", oid)
+    assert status == 200 and metadata["size_bytes"] == len(downloaded) and downloaded == data
+    assert not list(store.staging_dir.iterdir())
+    assert not store._reserved_objects and not store._reservations
+
+
+def test_http_protected_metadata_stream_quota_and_unsupported_routes(server):
+    httpd, _ = server
+    body = b"actual release bytes\x00"
+    status, result, _ = raw_upload(httpd, body)
+    assert status == 201
+    oid = result["body"]["object_id"]
+    assert result["body"]["metadata"]["owner_id"] == "configured-owner"
+    assert result["body"]["metadata"]["retention"] == "retained"
+
+    status, conflict, _ = raw_upload(httpd, b"x", key="protected", path="other",)
+    assert status == 413 and conflict["error"]["code"] == "quota_exceeded"
+    status, rejected, _ = request(httpd, "POST", "/v1/objects", body=b"x", headers={
+        "Content-Length": "1", "Content-SHA256": hashlib.sha256(b"x").hexdigest(),
+        "X-Repository": "repo", "X-Project": "project", "X-Version": "2", "X-Object-Path": "other",
+        "Idempotency-Key": "metadata-conflict", "X-Owner-ID": "caller-selected"})
+    assert status == 400 and json.loads(rejected)["error"]["code"] == "invalid_request"
+
+    for method, path in (("PUT", f"/v1/objects/{oid}"), ("PATCH", f"/v1/objects/{oid}"),
+                         ("POST", "/v1/objects/batch"), ("POST", "/v1/quota"),
+                         ("POST", "/v1/approvals"), ("POST", "/v1/objects/move")):
+        status, response, _ = request(httpd, method, path, body=b"{}")
+        assert status == 501 or status == 404, (method, path, status, response)
+
+
+def test_interrupted_stream_releases_reservation_and_stage(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "interrupted", 20, credentials=credentials)
+    class Interrupted:
+        def __init__(self): self.calls = 0
+        def read(self, amount):
+            self.calls += 1
+            return b"partial" if self.calls == 1 else b""
+    status, response = store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+        object_path="release", idempotency_key="interrupted", content=12,
+        content_sha256=hashlib.sha256(b"partial-data").hexdigest(), _reader=Interrupted())
+    assert status == 400 and response["error"]["code"] == "invalid_request"
+    assert not list(store.staging_dir.iterdir())
+    assert not store._reservations and not store._reserved_objects
+    assert store.quota("broad", "repo", "p")[1]["body"]["available_bytes"] == 20
+
+
+def test_concurrent_stream_reservations_bound_aggregate_staging(tmp_path, credentials):
+    store = ArtifactStore(tmp_path / "aggregate-staging", 10, credentials=credentials, max_upload_bytes=10)
+    started = threading.Event()
+    continue_stream = threading.Event()
+    data = b"12345678"
+    class PausedReader:
+        def __init__(self): self.sent = False
+        def read(self, amount):
+            if self.sent: return b""
+            started.set()
+            assert continue_stream.wait(timeout=2)
+            self.sent = True
+            return data
+    def first_upload():
+        return store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path="one", idempotency_key="one", content=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(), _reader=PausedReader())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(first_upload)
+        assert started.wait(timeout=2)
+        status, rejected = store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path="two", idempotency_key="two", content=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(), _reader=io.BytesIO(data))
+        assert status == 413 and rejected["error"]["code"] == "quota_exceeded"
+        quota = store.quota("broad", "repo", "p")[1]["body"]
+        assert quota["reserved_bytes"] == len(data) and quota["available_bytes"] == 2
+        continue_stream.set()
+        assert first.result(timeout=2)[0] == 201
+    assert store.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == len(data)
+    assert not store._reservations and not list(store.staging_dir.iterdir())

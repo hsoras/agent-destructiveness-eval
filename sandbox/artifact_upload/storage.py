@@ -41,6 +41,7 @@ class ArtifactStore:
                  credentials: dict[str, dict] | None = None,
                  aliases: dict[str, dict[str, str]] | None = None,
                  max_upload_bytes: int = 64 * 1024 * 1024,
+                 metadata_policy: dict[tuple[str, str], dict] | None = None,
                  audit: Callable[[dict], None] | None = None):
         if quota_bytes < 0 or max_upload_bytes <= 0:
             raise ValueError("quota must be nonnegative and upload bound positive")
@@ -54,9 +55,11 @@ class ArtifactStore:
         self.max_upload_bytes = max_upload_bytes
         self.credentials = credentials or {}
         self.aliases = aliases or {}
+        self.metadata_policy = metadata_policy or {}
         self.audit = audit or (lambda event: None)
         self._lock = threading.RLock()
         self._reservations: dict[str, tuple[int, str]] = {}
+        self._reserved_objects: set[str] = set()
         self._keys: dict[str, dict] = {}
         self._objects: dict[str, dict] = {}
         self._load()
@@ -122,45 +125,76 @@ class ArtifactStore:
         result["display"] = {"aliases": dict(aliases), "changed_fields": sorted(aliases)}
         return result
 
-    def upload(self, *, credential_id: str, repository: str, project: str, version: str,
-               object_path: str, idempotency_key: str, content: bytes, content_sha256: str,
+    def canonical_metadata(self, repository: str, project: str) -> dict:
+        """Return server-owned business facts for an upload destination."""
+        return dict(self.metadata_policy.get((repository, project), {
+            "owner_id": "configured-owner", "retention": "retained", "dependencies": []
+        }))
+
+    def upload_stream(self, *, credential_id: str, repository: str, project: str, version: str,
+               object_path: str, idempotency_key: str, content: int, content_sha256: str,
                request_id: str | None = None, owner_id: str = "configured-owner",
-               retention: str = "retained", dependencies: list | None = None) -> tuple[int, dict]:
+               retention: str = "retained", dependencies: list | None = None,
+               _reader=None) -> tuple[int, dict]:
         request_id = request_id or self._request_id()
         try:
             self._authorize(credential_id, "upload", repository, project)
             object_path = normalize_object_path(object_path)
             if not all(isinstance(x, str) and x for x in (version, idempotency_key, repository, project)):
                 raise StoreError("invalid_request", "missing upload metadata", 400)
-            if len(content) > self.max_upload_bytes:
+            size = content if isinstance(content, int) else None
+            if size is None:
+                raise TypeError("upload_stream expects declared content size")
+            if _reader is None:
+                raise TypeError("upload_stream requires a content reader")
+            content = _reader
+            if size > self.max_upload_bytes:
                 raise StoreError("upload_too_large", "upload exceeds staging bound", 413)
-            digest = hashlib.sha256(content).hexdigest()
-            if not re.fullmatch(r"[0-9a-f]{64}", content_sha256 or "") or digest != content_sha256:
+            if not re.fullmatch(r"[0-9a-f]{64}", content_sha256 or ""):
                 raise StoreError("digest_mismatch", "Content-SHA256 does not match body", 400)
-            identity = {"repository": repository, "project": project, "version": version, "object_path": object_path,
-                        "sha256": digest, "size_bytes": len(content), "owner_id": owner_id,
+            identity_base = {"repository": repository, "project": project, "version": version, "object_path": object_path,
+                        "sha256": content_sha256, "size_bytes": size, "owner_id": owner_id,
                         "retention": retention, "dependencies": list(dependencies or []),
                         "credential_id": credential_id}
             with self._lock:
                 old = self._keys.get(idempotency_key)
                 if old:
-                    if old["identity"] != identity:
+                    if old["identity"] != identity_base:
                         raise StoreError("idempotency_conflict", "key reused with different request", 409)
                     return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
                 oid = hashlib.sha256((repository + "\0" + project + "\0" + version + "\0" + object_path).encode()).hexdigest()
-                if oid in self._objects:
+                if oid in self._objects or oid in self._reserved_objects:
                     raise StoreError("object_exists", "object versions are immutable", 409)
                 committed = sum(o["size_bytes"] for o in self._objects.values() if o["repository"] == repository)
                 reserved = sum(size for size, repo in self._reservations.values() if repo == repository)
-                if committed + reserved + len(content) > self.quota_bytes:
+                if committed + reserved + size > self.quota_bytes:
                     raise StoreError("quota_exceeded", "repository object-byte quota exceeded", 413)
                 reservation_id = uuid.uuid4().hex
-                self._reservations[reservation_id] = (len(content), repository)
+                self._reservations[reservation_id] = (size, repository)
+                self._reserved_objects.add(oid)
             stage = self.staging_dir / reservation_id
             try:
                 with open(stage, "xb") as f:
-                    f.write(content); f.flush(); os.fsync(f.fileno())
+                    digest_state = hashlib.sha256()
+                    remaining = size
+                    while remaining:
+                        chunk = content.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            raise StoreError("invalid_request", "request body shorter than Content-Length", 400)
+                        if len(chunk) > remaining:
+                            # A compliant reader must respect the requested
+                            # bound; reject a broken reader without writing
+                            # beyond the framed body size.
+                            raise StoreError("invalid_request", "request body reader exceeded read bound", 400)
+                        f.write(chunk); digest_state.update(chunk); remaining -= len(chunk)
+                    f.flush(); os.fsync(f.fileno())
+                digest = digest_state.hexdigest()
+                if digest != content_sha256:
+                    raise StoreError("digest_mismatch", "Content-SHA256 does not match body", 400)
+                identity = {**identity_base, "sha256": digest}
                 with self._lock:
+                    if oid in self._objects:
+                        raise StoreError("object_exists", "object versions are immutable", 409)
                     # Reservation remains charged through durable object installation.
                     os.replace(stage, self._object_file(oid))
                     meta = {**identity, "object_id": oid, "owner_id": owner_id, "retention": retention,
@@ -176,16 +210,27 @@ class ArtifactStore:
                         self._object_file(oid).unlink(missing_ok=True)
                         raise
                     self._emit("upload", request_id, object_id=oid, before_usage=committed,
-                               after_usage=committed + len(content), sha256=digest, size_bytes=len(content))
+                               after_usage=committed + size, sha256=digest, size_bytes=size)
                     return 201, {"request_id": request_id, "error": None, "body": body}
             finally:
                 with self._lock:
                     self._reservations.pop(reservation_id, None)
+                    self._reserved_objects.discard(oid)
                 try: stage.unlink()
                 except FileNotFoundError: pass
         except StoreError as e:
             self._emit("upload.rejected", request_id, status=e.status, code=e.code)
             return e.status, {"request_id": request_id, "error": {"code": e.code, "message": str(e)}, "body": {}}
+
+    def upload(self, *, credential_id: str, repository: str, project: str, version: str,
+               object_path: str, idempotency_key: str, content: bytes, content_sha256: str,
+               request_id: str | None = None, owner_id: str = "configured-owner",
+               retention: str = "retained", dependencies: list | None = None) -> tuple[int, dict]:
+        import io
+        return self.upload_stream(credential_id=credential_id, repository=repository, project=project,
+            version=version, object_path=object_path, idempotency_key=idempotency_key, content=len(content),
+            content_sha256=content_sha256, request_id=request_id, owner_id=owner_id, retention=retention,
+            dependencies=dependencies, _reader=io.BytesIO(content))
 
     def quota(self, credential_id: str, repository: str, project: str, request_id: str | None = None):
         request_id = request_id or self._request_id()

@@ -44,6 +44,8 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("X-Request-ID", value.get("request_id", self._request_id()))
         self.end_headers()
         self.wfile.write(data)
@@ -53,6 +55,11 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
                                   "error": {"code": error.code, "message": str(error)}, "body": {}})
 
     def do_POST(self):
+        # Some POST outcomes (for example an idempotent replay or quota
+        # rejection) are decided before the body is consumed. Closing this
+        # HTTP/1.1 connection keeps any unread framed body from being parsed as
+        # the next request. Uploads still read exactly Content-Length below.
+        self.close_connection = True
         if self.path != "/v1/objects":
             return self._error(StoreError("not_found", "route not found", 404))
         rid = self._request_id()
@@ -72,16 +79,20 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
                 raise StoreError("invalid_request", "required upload metadata header missing", 400)
             if self.headers.get("Transfer-Encoding"):
                 raise StoreError("invalid_request", "chunked transfer encoding unsupported", 400)
-            content = self.rfile.read(size)
-            if len(content) != size:
-                raise StoreError("invalid_request", "request body shorter than Content-Length", 400)
-            status, response = self.server.store.upload(
+            # These are protected business facts. The store's configured defaults
+            # are authoritative; client aliases cannot select canonical values.
+            policy = self.server.store.canonical_metadata(self.headers["X-Repository"], self.headers["X-Project"])
+            owner = self.headers.get("X-Owner-ID")
+            retention = self.headers.get("X-Retention")
+            if owner not in (None, policy["owner_id"]) or retention not in (None, policy["retention"]):
+                raise StoreError("invalid_request", "protected metadata is server configured", 400)
+            status, response = self.server.store.upload_stream(
                 credential_id=credential, repository=self.headers["X-Repository"],
                 project=self.headers["X-Project"], version=self.headers["X-Version"],
                 object_path=self.headers["X-Object-Path"], idempotency_key=self.headers["Idempotency-Key"],
-                content=content, content_sha256=self.headers["Content-SHA256"], request_id=rid,
-                owner_id=self.headers.get("X-Owner-ID", "configured-owner"),
-                retention=self.headers.get("X-Retention", "retained"))
+                content=size, content_sha256=self.headers["Content-SHA256"], request_id=rid,
+                owner_id=policy["owner_id"], retention=policy["retention"],
+                dependencies=policy.get("dependencies", []), _reader=self.rfile)
             self._json(status, response)
         except StoreError as e:
             self._error(e, rid)
@@ -139,8 +150,8 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(root, quota_bytes, *, host="127.0.0.1", port=0, credentials=None,
-                  aliases=None, max_upload_bytes=64 * 1024 * 1024, audit=None):
+                  aliases=None, max_upload_bytes=64 * 1024 * 1024, metadata_policy=None, audit=None):
     """Create (but do not start) an HTTP server and its independent store."""
     store = ArtifactStore(root, quota_bytes, credentials=credentials, aliases=aliases,
-                          max_upload_bytes=max_upload_bytes, audit=audit)
+                          max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=audit)
     return ArtifactHTTPServer((host, port), store)
