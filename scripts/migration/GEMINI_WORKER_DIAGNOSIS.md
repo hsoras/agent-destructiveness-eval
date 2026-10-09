@@ -4,6 +4,102 @@ Gemini implementation readiness is **not established**. The real worker edited a
 Python file correctly, but did not run its test or produce a commit. This patch
 hardens diagnosis and fallback; it does not claim to repair account permissions.
 
+## Follow-up execution repair status
+
+The execution repair is still **unverified and disabled by default**. The following
+work remains on the isolated branch after `d19ef56`; do not enable the scoped route
+or claim Gemini readiness based on the coordinator-only Docker result.
+
+- `worker_environment.py` creates a fresh UUID project with one task workspace,
+  exact development argv grants, read-only virtualenv **and resolved runtime**
+  dependencies, protected Git/evidence paths, and explicit broker queue access.
+  It never modifies global/shared settings or an existing project. Python, pytest,
+  make, and normal npm development targets are eligible; privileged checks remain
+  coordinator-only. Every original mandatory coordinator check remains intact.
+- `job.py` checks localhost initialization in its existing execution environment,
+  forces the internal sandbox, records the selected project and exact launch argv,
+  requires structured results, and preserves a terminal receipt even when guest
+  cleanup fails. It does not escalate itself. The launcher must already run in an
+  operator-authorized host environment.
+- `providers.py` preserves global/shared restrictions and verifies the selected
+  UUID project bytes. CLI 1.3.2's zero-turn `/permissions` shortcut omits selected
+  project grants; actual conversation startup loads them. Any inherited
+  unsandboxed Allow grant rejects the scoped route. Observed unsandboxed Deny/Ask
+  overlap now rejects preflight rather than falsely marking commands ready.
+- Git ownership stays with `Coordinator.verify_worker`, which validates edits,
+  scope, branch/HEAD and mandatory tests before committing. The project receipt
+  identifies the private worktree Git directory (HEAD, index, commondir) and common
+  Git directory (branch ref, objects, config). Shared metadata is not mounted;
+  native and terminal Git mutation is denied. Actual subprocess protection still
+  needs the negative worker probe.
+- `docker_guest.py` exposes only fixed build/run operations over a bounded file
+  queue. The trusted coordinator uses the named isolated OrbStack machine's own
+  Docker daemon. Source descriptors are pinned without following symlinks; request
+  reads and subprocess output are bounded. Build uses a cached approved image ID
+  and no network; run has no network/mounts, read-only root, unprivileged UID,
+  dropped capabilities, no-new-privileges and CPU/memory/PID limits. No worker sees
+  a host Docker socket or unrestricted daemon command. OrbStack isolated machines
+  share its Linux kernel; this is not a separate adversarial VM.
+- `scoped_worker_smoke.py` requires actual edit/unittest/pytest/make tool evidence,
+  negative subprocess tests for Git and trusted receipts, guest build/run lineage,
+  a clean coordinator-owned task commit, structured output, independent Sol review,
+  unchanged fixture baseline and idempotent state recovery. It never merges.
+
+The first scoped E2E attempt failed with sandbox `Operation not permitted` when
+executing the virtualenv interpreter:
+`/private/tmp/gemini-scoped-e2e-20261009/report.json`. Its executable resolves outside
+`.venv`, so a narrow read-only runtime grant was added. The next disposable probe
+was then denied before execution by `unsandboxed(*)`, even though its call requested
+ordinary sandboxed Python execution:
+`/private/tmp/gemini-worker-project-probe/runtime.jsonl`. Exit 0/SUCCESS is not a
+passed test. The resolved runtime grant is therefore not yet validated.
+
+Automatic approval review rejected a proposed fresh disposable project probe
+without that explicit Deny, stating it could weaken the worker boundary. No
+workaround was executed. User authorization was requested to test the documented
+CLI behavior with `--sandbox`, no unsandboxed Allow grants, and headless bypass
+requests denied. Until resolved, this blocks real Python and end-to-end worker
+verification. It does not establish an authentication or quota failure, or prove
+that all safe Antigravity deployments are fundamentally impossible.
+
+The trusted broker's actual hardened precheck passed build and run:
+`/private/tmp/gemini-broker-hardened-precheck.log`. It used only
+`gemini-worker-smoke-20261009`, daemon
+`7541c977-dd0a-4b7e-9878-c48c87bdaecd`, with no host daemon changes. This machine is
+operator-provisioned (isolated, network-isolated, SSH forwarding disabled, no
+mounts, two CPUs and 2 GiB RAM) with Docker installed and `python:3.11-slim` cached.
+Provisioning is not automatic; existing machines are never reconfigured by the
+broker. The original 79 safety cases remain; new tests cover policy/runtime
+paths, inherited restrictions, localhost failure, structured receipts, descriptor
+races, bounded I/O, container cleanup and failed project/cleanup recovery.
+
+After authorization, reproduce only in a fresh disposable artifact root from an
+already authorized host execution environment:
+
+```sh
+/path/to/python3.11 scripts/migration/scoped_worker_smoke.py \
+  --state-dir /private/tmp/new-gemini-scoped-smoke \
+  --docker-machine gemini-worker-smoke-20261009
+```
+
+Do not update the Boss's frozen configuration, providers policy, persisted state,
+or running processes to try this. `providers.json`, `config.json` and
+`orchestrate.py` remain unchanged. Keep Luna fallback and independent review.
+The integration/reload instructions below describe the existing diagnostic
+commit; **do not integrate or activate this unverified execution repair yet**.
+Independent read-only GPT-6.1 Sol Medium review found no remaining code blockers
+in its final pass; it explicitly withheld Gemini readiness approval pending real
+worker filesystem probes and the full E2E. The last full test run is retained at
+`/private/tmp/gemini-scoped-final-tests.log` (95 tests, 229.129 seconds, all 79
+existing safety cases included); the latest 17 focused scoped/broker
+checks pass, including cancellation during an active operation and skipping queued
+requests. The real final file-queue precheck passed at
+`/private/tmp/gemini-broker-queue-final.log` with build and run receipts at
+`/private/tmp/gemini-broker-queue-final/queue/summary.json`. These remain trusted
+coordinator checks, not Gemini worker successes.
+
+## Historical evidence for diagnostic commit d19ef56
+
 ## Evidence and root cause
 
 Infrastructure baseline: `0d421fd`; isolated branch: `infra/gemini-worker-fix`.

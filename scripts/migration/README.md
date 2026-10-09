@@ -256,3 +256,12 @@ python3 scripts/migration/orchestrate.py resume --max-workers 2 --approved-execu
 ```
 
 These commands are documentation only and were not executed for this infrastructure task.
+
+
+Scoped Gemini execution repair is under verification on `infra/gemini-worker-fix`.
+See [the execution status and retained evidence](GEMINI_WORKER_DIAGNOSIS.md).
+The opt-in project policy and dedicated Docker broker are disabled in the shipped
+provider configuration. Do not enable them for migration until the real scoped
+worker smoke proves Python/pytest/build execution, protected filesystem boundaries,
+guest build/run, coordinator commit and independent review. A successful trusted
+Docker precheck or unit suite does not certify Gemini readiness.

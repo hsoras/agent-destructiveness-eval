@@ -62,7 +62,7 @@ def preflight(route, cwd, timeout=30):
     return result
 
 
-def effective_permissions(cwd, timeout=30):
+def effective_permissions(cwd, timeout=30, project=None):
     """Ask the CLI for project/shared/global rules without starting an agent turn."""
     command = ['agy', '-p', '/permissions', '--output-format', 'json']
     try:
@@ -87,8 +87,19 @@ def effective_permissions(cwd, timeout=30):
                 permissions[access].extend(rules)
         if seen != {'project', 'shared', 'global'}:
             raise ValueError('Incomplete effective permission scopes')
-        return dict(ready=True, permissions=permissions, scopes=scopes, command=command)
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError) as e:
+        selected = None
+        if project is not None:
+            from worker_environment import selected_project_policy
+            selected = selected_project_policy(project, cwd)
+            # Keep restrictions reported at any scope; augment only with the exact
+            # selected project that --project applies at conversation startup.
+            for access in permissions:
+                permissions[access].extend(selected.get(access, []))
+            if any(rule.startswith('unsandboxed(') for rule in permissions['allow']):
+                raise ValueError('Scoped worker cannot inherit any unsandboxed Allow grant')
+        return dict(ready=True, permissions=permissions, scopes=scopes, command=command,
+                    selected_project=project, selected_project_policy=selected)
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as e:
         return dict(ready=False, reason='permissions', error=str(e), command=command)
 
 
@@ -112,9 +123,14 @@ def permission_preflight(commands, settings=None, *, permissions=None):
                 if not re.fullmatch(r'[a-z_]+\(.+\)', rule):
                     raise ValueError('Malformed permission rule')
         def matches(rule, argv):
-            if not rule.startswith('command('):
+            if rule.startswith('unsandboxed('):
+                # Installed CLI 1.3.2 also applies unsandboxed Deny/Ask rules
+                # to ordinary command checks. Never certify a conflicting rule.
+                target = rule[len('unsandboxed('):-1]
+            elif rule.startswith('command('):
+                target = rule[8:-1]
+            else:
                 return False
-            target = rule[8:-1]
             if target == '*':
                 return True
             if target.startswith('regex:'):
@@ -134,8 +150,9 @@ def permission_preflight(commands, settings=None, *, permissions=None):
             uncertain = uncertain or (Path(argv[0]).name == 'git' and any(
                 arg == '-c' or arg.startswith('--config-env') for arg in argv[1:]))
             restrictions = permissions.get('deny', []) + permissions.get('ask', [])
-            if (uncertain or any(rule.startswith('command(regex:') or matches(rule, argv) for rule in restrictions) or
-                    not any(matches(rule, argv) for rule in permissions.get('allow', []))):
+            if (uncertain or any(rule.startswith(('command(regex:', 'unsandboxed(regex:')) or matches(rule, argv) for rule in restrictions) or
+                    not any(rule.startswith('command(') and matches(rule, argv)
+                            for rule in permissions.get('allow', []))):
                 missing.append(argv)
         return dict(ready=not missing, reason='permissions' if missing else None,
                     required_commands=commands, unavailable_commands=missing)
