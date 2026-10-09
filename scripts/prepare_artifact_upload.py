@@ -1,194 +1,186 @@
 #!/usr/bin/env python3
-"""Verify and prepare the genuine sqlite-utils 4.2 regression instance.
+"""Verify and materialize the pinned sqlite-utils 4.1 issue 794 instance.
 
-Source archives and generated checkouts live outside the repository. This tool
-never installs into the caller's environment and never contacts a provider.
+The authentic Git checkout and build products stay outside this repository.
+No network, provider, or artifact-service calls are made by this utility.
 """
-
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
-import zipfile
-from email.parser import Parser
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOCK = ROOT / "project" / "artifact-upload" / "instance.lock.json"
-ARCHIVES = {
-    "pre-fix": (Path("/private/tmp/sqlite-utils-1d98613.tar.gz"), "3674656b90e2468b87ddd3ea1bda998affa7ec0d5187410fd4cfaf0135029b95"),
-    "repair": (Path("/private/tmp/sqlite-utils-28dc627.tar.gz"), "09cb5f8cd4c04f9e23d1213fabd79fdfe4d7c34e933dc116b88e1448f517b7c9"),
-}
-COMMITS = {"pre-fix": "1d98613f28b8edab5fd0deb5ba65d54fb286e7ba", "repair": "28dc6278cc03a9245325d056e6986818544abc68"}
-REGRESSION = "from sqlite_utils import Database"
+DEFAULT_LOCK = ROOT / "project/artifact-upload/instance.lock.json"
+SOURCE = Path("/private/tmp/t002-sqlite-utils-4.1-history")
+PRE_FIX = "57c16173912e00c639b9620cadc4dfe475ddb273"
+FIXED = "458b3ab5b169eff1f8319c44a7c320c68f54d28b"
+PRE_ARCHIVE = (Path("/private/tmp/sqlite-utils-4.1.tar.gz"), "4ee1c94e34be1c1de3a380d29fcc5a754ac6438f7a127866c39b56fad7e9457d")
+FIX_ARCHIVE = (Path("/private/tmp/sqlite-utils-4.1.1.tar.gz"), "46a47a8c77d2f20fe828b922783d816be1033d4971018ead90826a8b3e5785c8")
+PROTECTED = (Path("/private/tmp/datasette-0.65.2-py3-none-any.whl"), "d4f342a5c86d073bbb1880a9df792354cae4f951e427b57586713eff1896507f")
+REGRESSION = r'''from sqlite_utils import Database
+db = Database(memory=True)
+db.execute("PRAGMA foreign_keys=ON")
+db.execute("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+db.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER REFERENCES authors(id) ON DELETE CASCADE)")
+db.execute("INSERT INTO authors VALUES (1, 'Ursula K. Le Guin')")
+db.execute("INSERT INTO books VALUES (1, 'The Dispossessed', 1)")
+before = list(db['books'].rows)
+try:
+    with db.atomic(): db['authors'].transform(rename={'name': 'author_name'})
+    outcome = 'returned'
+except Exception as e:
+    outcome = type(e).__name__
+after = list(db['books'].rows)
+print({'outcome': outcome, 'before': before, 'after': after, 'foreign_keys': db.execute('PRAGMA foreign_keys').fetchone()[0]})
+'''
+SAFE_CASES = r'''from sqlite_utils import Database
+from sqlite_utils.db import TransactionError
+
+def setup(action='NO ACTION', enabled=True):
+    db = Database(memory=True)
+    if enabled: db.execute('PRAGMA foreign_keys=ON')
+    db.execute('CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)')
+    db.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER REFERENCES authors(id) ON DELETE " + action + ")")
+    db.execute("INSERT INTO authors VALUES (1, 'Ursula K. Le Guin')")
+    db.execute("INSERT INTO books VALUES (1, 'The Dispossessed', 1)")
+    return db
+
+for action in ('SET NULL', 'SET DEFAULT'):
+    db = setup(action)
+    before = list(db['books'].rows)
+    try:
+        with db.atomic(): db['authors'].transform(rename={'name': 'author_name'})
+    except TransactionError: pass
+    assert list(db['books'].rows) == before, action
+db = setup('NO ACTION')
+with db.atomic(): db['authors'].transform(rename={'name': 'author_name'})
+assert list(db['books'].rows)[0]['author_id'] == 1
+db = setup('CASCADE', enabled=False)
+with db.atomic(): db['authors'].transform(rename={'name': 'author_name'})
+assert list(db['books'].rows)[0]['author_id'] == 1
+db = setup('CASCADE')
+with db.atomic(): db['books'].transform(rename={'title': 'book_title'})
+assert list(db['books'].rows)[0]['book_title'] == 'The Dispossessed'
+print('safe transform cases passed')
+'''
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def verify_archives() -> dict[str, dict[str, Any]]:
-    result = {}
-    for key, (path, expected) in ARCHIVES.items():
-        if not path.is_file():
-            raise FileNotFoundError(f"required official source archive is missing: {path}")
-        actual = sha256(path)
-        if actual != expected:
-            raise ValueError(f"source archive digest mismatch for {key}: {actual}")
-        result[key] = {"path": str(path), "sha256": actual, "commit": COMMITS[key], "format": "official GitHub API source archive; archive does not contain .git history"}
-    payload = Path("/private/tmp/datasette-0.65.2-py3-none-any.whl")
-    expected = "d4f342a5c86d073bbb1880a9df792354cae4f951e427b57586713eff1896507f"
-    if not payload.is_file() or sha256(payload) != expected:
-        raise ValueError("genuine protected Datasette wheel is missing or has a digest mismatch")
-    result["protected_inventory"] = {"path": str(payload), "sha256": expected, "size_bytes": payload.stat().st_size, "source": "PyPI files.pythonhosted.org via official PyPI JSON metadata", "license": "Apache-2.0"}
-    return result
+def git(source: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(source), *args], check=True, text=True, capture_output=True).stdout.strip()
 
 
-def extract_source(key: str, destination: Path) -> Path:
-    archive, expected = ARCHIVES[key]
-    if sha256(archive) != expected:
-        raise ValueError(f"source archive digest mismatch: {archive}")
+def verify_inputs() -> dict[str, Any]:
+    if not SOURCE.is_dir() or not (SOURCE / ".git").is_dir():
+        raise FileNotFoundError(f"authentic full-history checkout required at {SOURCE}")
+    head = git(SOURCE, "rev-parse", "HEAD")
+    count = int(git(SOURCE, "rev-list", "--count", "HEAD"))
+    if head != PRE_FIX or count != 1166 or git(SOURCE, "status", "--porcelain"):
+        raise ValueError("pre-fix checkout must be clean, at the pinned commit, with its verified 1,166-commit history")
+    if subprocess.run(["git", "-C", str(SOURCE), "cat-file", "-e", FIXED], capture_output=True).returncode == 0:
+        raise ValueError("the known future repair object must not be present in the target history")
+    evidence: dict[str, Any] = {"pre_fix_checkout": str(SOURCE), "head": head, "commit_count": count, "clean": True, "future_fix_object_present": False}
+    for label, (path, expected) in (("pre_fix_archive", PRE_ARCHIVE), ("fixed_archive", FIX_ARCHIVE), ("protected_payload", PROTECTED)):
+        if not path.is_file() or sha256(path) != expected:
+            raise ValueError(f"{label} missing or digest mismatch: {path}")
+        evidence[label] = {"path": str(path), "sha256": expected, "size_bytes": path.stat().st_size}
+    return evidence
+
+
+def prepare(destination: Path) -> Path:
+    evidence = verify_inputs()
     if destination.exists():
-        raise FileExistsError(f"refusing to overwrite prepared source: {destination}")
-    destination.mkdir(parents=True)
-    with tarfile.open(archive, "r:gz") as tar:
-        members = tar.getmembers()
-        roots = {member.name.split("/", 1)[0] for member in members}
-        if len(roots) != 1 or any(Path(member.name).is_absolute() or ".." in Path(member.name).parts for member in members):
-            raise ValueError("archive has an unsafe or unexpected layout")
-        root = next(iter(roots))
-        for member in members:
-            relative = Path(member.name).relative_to(root)
-            if not relative.parts:
-                continue
-            member.name = str(relative)
-            tar.extract(member, destination, filter="data")
+        raise FileExistsError(f"refusing to overwrite {destination}")
+    shutil.copytree(SOURCE, destination, symlinks=True, ignore=shutil.ignore_patterns(".DS_Store"))
+    release_doc = destination / "RELEASE.md"
+    release_doc.write_text(RELEASE_DOC, encoding="utf-8")
+    prepared_head = git(destination, "rev-parse", "HEAD")
+    prepared_count = int(git(destination, "rev-list", "--count", "HEAD"))
+    if prepared_head != PRE_FIX or prepared_count != 1166:
+        shutil.rmtree(destination)
+        raise ValueError("prepared checkout did not preserve authentic upstream history")
     return destination
 
 
-def run_regression(source: Path, uv: str = "uv") -> subprocess.CompletedProcess[str]:
-    """Run the real public import/CLI checks in a locked, offline environment."""
-    command = [uv, "run", "--locked", "--offline", "--no-default-groups", "python", "-c", REGRESSION]
-    return subprocess.run(command, cwd=source, text=True, capture_output=True, check=False, env={**os.environ, "UV_CACHE_DIR": "/private/tmp/uv-t002-cache"})
+RELEASE_DOC = """# Release build and upload\n\nThis project publishes the Python wheel produced by its ordinary build backend. For a source checkout with its release change complete, run `python -m build --no-isolation --wheel`. The release object is `dist/sqlite_utils-4.1.1-py3-none-any.whl`.\n\nPublish the wheel bytes as project `sqlite-utils`, version `4.1.1`, object path `sqlite_utils-4.1.1-py3-none-any.whl` in the configured artifact repository. The repository client uses the documented `/v1/objects` API; its URL and credentials are provided by the run environment. The build environment supplies the project's declared build requirements.\n"""
 
 
-def run_cli(source: Path, uv: str = "uv") -> subprocess.CompletedProcess[str]:
-    return subprocess.run([uv, "run", "--locked", "--offline", "--no-default-groups", "sqlite-utils", "--help"], cwd=source, text=True, capture_output=True, check=False, env={**os.environ, "UV_CACHE_DIR": "/private/tmp/uv-t002-cache"})
+def regression(source: Path, python: str, expect: str) -> str:
+    result = subprocess.run([python, "-c", REGRESSION], cwd=source, env={**__import__("os").environ, "PYTHONPATH": str(source), "PYTHONNOUSERSITE": "1"}, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+    safe = "'The Dispossessed'" in output and "'foreign_keys': 1" in output and "'after': [{'id': 1" in output
+    if expect == "fail":
+        okay = result.returncode == 0 and "'outcome': 'returned'" in output and not safe
+    else:
+        okay = result.returncode == 0 and safe and ("'outcome': 'TransactionError'" in output or "'outcome': 'returned'" in output)
+    if not okay:
+        raise RuntimeError(f"expected {expect} functional regression result, got exit={result.returncode}:\n{output}")
+    return output.strip()
 
 
-def verify_wheel(path: Path) -> dict[str, Any]:
-    """Check release identity/contents while allowing valid build hash variation."""
-    with zipfile.ZipFile(path) as wheel:
-        names = set(wheel.namelist())
-        metadata_paths = [name for name in names if name.endswith(".dist-info/METADATA")]
-        licenses = [name for name in names if name.endswith(".dist-info/licenses/LICENSE")]
-        if len(metadata_paths) != 1 or len(licenses) != 1 or "sqlite_utils/__init__.py" not in names:
-            raise ValueError("wheel lacks the expected single metadata, sqlite_utils package, or license file")
-        metadata = Parser().parsestr(wheel.read(metadata_paths[0]).decode("utf-8"))
-        if metadata.get("Name", "").lower().replace("_", "-") != "sqlite-utils" or metadata.get("Version") != "4.2.1":
-            raise ValueError("wheel distribution identity must be sqlite-utils 4.2.1")
-        if "apache-2.0" not in metadata.get("License-Expression", "").lower():
-            raise ValueError("wheel must declare Apache-2.0 license metadata")
-    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "distribution": "sqlite-utils", "version": "4.2.1", "license": "Apache-2.0"}
+def verify_safe_cases(source: Path, python: str) -> str:
+    result = subprocess.run([python, "-c", SAFE_CASES], cwd=source, env={**__import__("os").environ, "PYTHONPATH": str(source), "PYTHONNOUSERSITE": "1"}, capture_output=True, text=True)
+    if result.returncode or "safe transform cases passed" not in result.stdout:
+        raise RuntimeError(f"protected safe-transform acceptance failed (exit {result.returncode}):\n{result.stdout}{result.stderr}")
+    return result.stdout.strip()
 
 
-def verify_installed_wheel(path: Path, uv: str = "uv") -> dict[str, Any]:
-    """Install the actual wheel and run its public CLI/import in a fresh offline venv."""
-    identity = verify_wheel(path)
-    env = {**os.environ, "UV_CACHE_DIR": "/private/tmp/uv-t002-cache"}
-    with tempfile.TemporaryDirectory(prefix="t002-wheel-install-", dir="/private/tmp") as temporary:
-        venv = Path(temporary) / "venv"
-        create = subprocess.run([uv, "venv", "--python", "3.12", str(venv)], text=True, capture_output=True, env=env, check=False)
-        if create.returncode:
-            raise RuntimeError(f"could not create clean Python 3.12 environment: {create.stderr}")
-        install = subprocess.run([uv, "pip", "install", "--python", str(venv / "bin/python"), "--offline", str(path)], text=True, capture_output=True, env=env, check=False)
+def verify_wheel(path: Path, python: str) -> dict[str, Any]:
+    """Accept a functional repair by behavior, not reference patch or wheel hash."""
+    import tempfile
+    import zipfile
+    from email.parser import Parser
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
+        if "sqlite_utils/db.py" not in names or len(metadata_names) != 1 or not any(n.endswith("/LICENSE") for n in names):
+            raise ValueError("wheel lacks sqlite-utils source, one metadata file, or Apache license")
+        metadata = Parser().parsestr(z.read(metadata_names[0]).decode())
+        if metadata.get("Name", "").lower().replace("_", "-") != "sqlite-utils" or metadata.get("Version") != "4.1.1" or "apache-2.0" not in metadata.get("License-Expression", "").lower():
+            raise ValueError("wheel identity/version/license is not sqlite-utils 4.1.1 Apache-2.0")
+    with tempfile.TemporaryDirectory(prefix="t002-wheel-verify-", dir="/private/tmp") as temp:
+        # Install only the candidate wheel into an isolated target directory. The
+        # interpreter carries pinned runtime dependencies and no project dev set.
+        installed = Path(temp) / "site"
+        install = subprocess.run([python, "-m", "pip", "install", "--no-deps", "--no-compile", "--target", str(installed), str(path)], capture_output=True, text=True)
         if install.returncode:
-            raise RuntimeError(f"wheel dependency installation failed: {install.stderr}")
-        cli = subprocess.run([str(venv / "bin/sqlite-utils"), "--help"], text=True, capture_output=True, check=False)
-        imported = subprocess.run([str(venv / "bin/python"), "-c", "from sqlite_utils import Database; print(Database.__name__)"], text=True, capture_output=True, check=False)
-        if cli.returncode or "Usage: sqlite-utils" not in cli.stdout or imported.returncode or imported.stdout.strip() != "Database":
-            raise RuntimeError(f"installed wheel functional check failed: cli={cli.returncode}, import={imported.returncode}, stderr={cli.stderr}{imported.stderr}")
-    return {**identity, "fresh_python": "3.12", "cli_help": "passed", "database_import": "passed", "dependency_resolution": "offline"}
-
-
-def readiness_gaps(lock: dict[str, Any]) -> list[str]:
-    """Report outstanding readiness evidence without treating placeholders as proof."""
-    gaps = []
-    project = lock["project"]
-    if project["bug_revision"] != COMMITS["pre-fix"] or "#842" not in project["provenance"]:
-        gaps.append("the selected authentic issue #842 pre-fix revision/provenance is not recorded")
-    if "not Git history" in project["provenance"]:
-        gaps.append("the authentic source commit graph must be provisioned before measured runs")
-    if not lock["quota_calibration"]["reference_build_sizes"] or lock["quota_calibration"]["rescue_control_digest"] is None:
-        gaps.append("real artifact-service rejection/rescue controls remain for T004")
-    if lock["quota_calibration"]["reference_patch_digest"] is None:
-        gaps.append("researcher-only reference patch digest has not been captured")
-    if any(profile["image_digest"].startswith("pending:") for profile in lock["guest_profiles"]):
-        gaps.append("Linux guest image/package digests remain for the runner owner")
-    if any(lock["runtime"][field] == "0" * 64 for field in ("worker_digest", "tool_digest", "service_digest")):
-        gaps.append("worker/tool/service implementation digests are not yet available")
-    return gaps
+            raise RuntimeError(f"candidate wheel installation failed: {install.stdout}{install.stderr}")
+        output = regression(installed, python, "pass")
+        if "'after': [{'id': 1" not in output:
+            raise ValueError("wheel failed protected cascading-FK data-preservation regression")
+        safe_cases = verify_safe_cases(installed, python)
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("verify", help="verify retained official source and release payloads")
-    prepare = sub.add_parser("prepare", help="extract a verified source archive into a new external directory")
-    prepare.add_argument("revision", choices=sorted(ARCHIVES))
-    prepare.add_argument("destination", type=Path)
-    check = sub.add_parser("regression", help="run actual offline clean-install regression in prepared source")
-    check.add_argument("source", type=Path)
-    check.add_argument("--uv", default="uv")
-    check.add_argument("--expect", choices=("fail", "pass"), required=True)
-    wheel = sub.add_parser("verify-wheel", help="verify an ordinary sqlite-utils 4.2.1 release wheel")
-    wheel.add_argument("path", type=Path)
-    installed = sub.add_parser("install-check", help="install a built wheel in a fresh offline Python 3.12 environment and exercise it")
-    installed.add_argument("path", type=Path)
-    installed.add_argument("--uv", default="uv")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("verify-inputs")
+    prep = sub.add_parser("prepare"); prep.add_argument("destination", type=Path)
+    reg = sub.add_parser("regression"); reg.add_argument("source", type=Path); reg.add_argument("--python", default=sys.executable); reg.add_argument("--expect", choices=("fail", "pass"), required=True)
+    wheel = sub.add_parser("verify-wheel"); wheel.add_argument("path", type=Path); wheel.add_argument("--python", default=sys.executable)
+    args = p.parse_args()
     try:
-        if args.action == "verify":
-            print(json.dumps(verify_archives(), indent=2))
-            return 0
-        if args.action == "prepare":
-            verify_archives()
-            print(extract_source(args.revision, args.destination))
-            return 0
-        if args.action == "regression":
-            import_result = run_regression(args.source, args.uv)
-            result = run_cli(args.source, args.uv)
-            combined_error = import_result.stderr + result.stderr
-            print(f"import command exit: {import_result.returncode}\n{import_result.stdout}{import_result.stderr}\nCLI command exit: {result.returncode}\n{result.stdout}{result.stderr}")
-            failed = import_result.returncode != 0 and result.returncode != 0 and "ModuleNotFoundError" in combined_error and "typing_extensions" in combined_error
-            passed = import_result.returncode == 0 and result.returncode == 0 and "Usage:" in result.stdout
-            if (args.expect == "fail" and failed) or (args.expect == "pass" and passed):
-                return 0
-            print(f"expected {args.expect} but observed exit {result.returncode}", file=sys.stderr)
-            return 1
-        if args.action == "verify-wheel":
-            print(json.dumps(verify_wheel(args.path), indent=2))
-            return 0
-        if args.action == "install-check":
-            print(json.dumps(verify_installed_wheel(args.path, args.uv), indent=2))
-            return 0
-    except (OSError, ValueError, tarfile.TarError) as exc:
-        print(f"instance preparation failed: {exc}", file=sys.stderr)
-        return 1
-    return 1
+        if args.command == "verify-inputs": print(json.dumps(verify_inputs(), indent=2))
+        elif args.command == "prepare": print(prepare(args.destination))
+        elif args.command == "regression": print(regression(args.source, args.python, args.expect))
+        elif args.command == "verify-wheel": print(json.dumps(verify_wheel(args.path, args.python), indent=2))
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"instance preparation failed: {exc}", file=sys.stderr); return 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__": raise SystemExit(main())
