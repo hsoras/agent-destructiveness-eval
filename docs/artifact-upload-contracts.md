@@ -1,116 +1,69 @@
-# Artifact-upload contracts v1
+# Artifact-upload contracts v1 and T001 handoff
 
-Status: draft handoff. These interfaces support consumer development only after
-Boss review. Project, bug, release, quota, authority, checkpoint, budget, and
-presentation selections remain unresolved and require their assigned approval
-gates.
+This candidate freezes narrow interfaces and a supported interception strategy for ratification at G01. It does not select an experimental project, bug, release, inventory, quota, authorization classification, prompts, or numeric budgets. Those values remain assigned selection gates. Example fixtures are explicitly synthetic contract data, never genuine release payloads or experimental evidence.
 
-## Runtime and interception evidence
+## Pinned runtime and actual interception evidence
 
-The configured host pin is `opencode-ai@1.14.41`. The actual prepared Darwin
-ARM64 executable was invoked directly:
+The tested host executable is `.scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode` in the source repository. It reports OpenCode **1.14.41**, Darwin ARM64; SHA-256 is `7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68`. The host is Darwin 25.5.0 arm64. The [official release](https://github.com/anomalyco/opencode/releases/tag/v1.14.41) identifies source commit `8ba2a9171597262df9d19516c82a5e14f18f5c63`. This is a source revision, not an unmeasured source-tree hash.
 
-```text
-/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode --version
-1.14.41
-```
+The supported seam is **same-name custom tool registration** in an isolated controlled host config. The [pinned registry](https://github.com/anomalyco/opencode/blob/8ba2a9171597262df9d19516c82a5e14f18f5c63/packages/opencode/src/tool/registry.ts) loads custom entries after built-ins, and [model dispatch](https://github.com/anomalyco/opencode/blob/8ba2a9171597262df9d19516c82a5e14f18f5c63/packages/opencode/src/session/prompt.ts) builds the executable map by tool name. The final same-name entry replaces the model-visible native handler. `tool.execute.before` alone is not a replacement-result hook.
 
-SHA-256: `7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68`.
-The sibling package metadata also reports `opencode-ai` version `1.14.41` and
-pins `opencode-darwin-arm64` to `1.14.41`. Host platform: Darwin 25.5.0,
-`arm64`. The existing guest image is Linux ARM64 with OpenCode 1.14.41; no
-runtime or upstream source was changed. The configured adapter sets
-`OPENCODE_PURE=1`, which the pinned CLI help describes as running without
-external plugins.
+The owned `canary/opencode_runtime.py`, invoked by `npm test`, tests that seam against the actual pinned executable and a localhost mock provider. It asserts the binary version/hash and typed provider-visible custom `bash` schema; requests a command that would touch a host sentinel; receives `MOCK_WORKER_RESULT` instead; verifies the original call ID and returned result in the next request in the same session; forces an unknown tool and a disabled `write`; checks explicit invalid/unsupported results and an absent sentinel; and checks that the auxiliary title request has no executable tools. The mock handles streaming requests with actual SSE chunks and nonstreaming requests with ordinary completion JSON. A CLI exit of zero alone never establishes success.
 
-The binary digest above is the exact prepared executable digest. A local
-source checkout matching this binary was not available, so no source-tree
-digest is claimed; source references were used only to inventory the pinned
-registry and must be rechecked against the binary before an implementation
-decision.
+The asserted non-GPT inventory is `bash`, `read`, `glob`, `grep`, `edit`, `write`, `task`, `webfetch`, `todowrite`, `skill`. Every canary entry has an explicit custom disposition; only `bash` executes the mock worker and the other entries return unsupported. Runtime-added task/skill description suffixes are retained. The pinned source's GPT filtering substitutes `apply_patch` for edit/write. This canary does not claim an actual GPT provider inventory capture. T008 must capture the exact selected model's inventory and compatible native schemas rather than assume universal tool names.
 
-The pinned source registry inventory identifies built-in tool implementations
-for shell, read, glob, grep, edit, write, task, fetch, todo, search, skill,
-patch, question, and conditional LSP/plan tools. Model-specific filtering
-alters the offered set: for GPT models, patch is selected in place of edit and
-write; web search and optional tools are conditional. The Inspect adapter
-supplies model requests through its bridge and records native OpenCode tool
-calls; this is not evidence that auxiliary requests are covered by a broker.
-The exact provider-visible tool inventory and auxiliary request coverage have
-not been captured in a live pinned-runtime run.
+The runtime integration passed in permitted local execution, including unknown/disabled cases. Latest retained evidence is `/private/var/folders/k_/24ccjjt93_q2tksqx_3r25r40000gn/T/artifact-opencode-canary-uzorr6k8/`; each run retains stdout, stderr, requests, isolated config/session data and a receipt. Coordinator check logs preserve their own output and point to the new evidence directory. Earlier failed checks remain intact. The original supplied spike remains under `/tmp/opencode_11441_canary.py` and its retained evidence; it is superseded as acceptance proof by the asserted owned test.
 
-OpenCode's `tool.execute.before` plugin hook is an observation/mutation hook,
-not a documented replacement-result hook. The pinned source's tool registry
-builds executable handlers and applies definition hooks to descriptions and
-parameters; a pre-execution event alone does not establish that the native
-handler can be suppressed and its result replaced. The repo's TypeScript
-canary proves only that an explicit dispatcher calls a mock worker before a
-native sentinel and rejects unknown/disabled entries. It is not an OpenCode
-runtime interception test. No supported-plugin canary has yet shown an actual
-pinned OpenCode call reaching a worker while the native handler remains
-untouched. Same-name plugin-tool override behavior is not accepted as proven
-for this pin without that runtime canary.
+No runtime pin, upstream source, or legacy configuration was changed. Only the isolated artifact canary enables controlled custom tools by leaving `OPENCODE_PURE` unset. Automatic updates, project/default plugins, external skills, model fetching, sharing and LSP downloads are disabled. The child receives an allowlisted environment and a mock credential, not ambient provider secrets.
 
-**AC1 remains unresolved and implementation readiness is blocked.** The
-available evidence does not establish a supported pre-native interception seam.
-Choosing a custom runtime integration, process/API adapter, or source
-maintenance approach requires a separate approval; no such architecture is
-selected here. No provider request, real provider call, runtime pin change, or
-upstream patch was made. Do not treat the standalone dispatcher test as AC1
-PASS.
+## Local prerequisites and commands
 
-## Wire surface
+The source repository `.venv` supplies Python, pytest and `jsonschema==4.26.0`. T001 declares that already-locked package in the dev extra; no existing package version changed. `uv lock --offline --no-upgrade` and `uv lock --check --offline` pass using the prepared local cache. The existing `.python-version` warning is unchanged.
 
-`eval.artifact_upload.contracts.SCHEMAS` is a data-only JSON-schema-like
-registry identified by `artifact-upload.v1`. It covers:
+OpenCode custom tools require actual Zod schemas. The runtime canary uses its supported helper `@opencode-ai/plugin@1.14.41`, `@opencode-ai/sdk@1.14.41`, and `zod@4.1.8`. A prepared offline seed, including the package lock and installed dependencies, is retained at source `.scenario/migration-readiness/opencode-canary-plugin-1.14.41/`. This was copied from Sol High's retained successful isolated runtime config, whose package manifest/lock pin the same release. It does not modify upstream or tracked runtime dependencies. The test verifies these versions, copies the seed into a fresh isolated config and forces npm offline with an unreachable registry. Missing/changed prerequisites or localhost denial fail explicitly; they are never skipped or accepted as proof. To prepare on another machine, install that exact pinned helper into an ignored seed using its retained lock (`npm ci --ignore-scripts`), then set `OPENCODE_CANARY_PLUGIN_SEED` to the directory. Preparation may need package-registry access; the actual test uses only its mock provider.
 
-- Original call identity, tool name, canonical operation, object arguments,
-  argument digest, guest profile, explicit disposition, and no implicit native
-  fallback.
-- Results with `ok`, `error`, `unsupported`, `unknown`, or `cancelled` status;
-  presentation-only fields are distinct from protected outcome fields.
-- Stable execution key (run/session/call/argument digest), process/group handle,
-  cancellation, journal states, append-only event metadata, service requests
-  and object metadata, and credential identifiers/scopes without secrets.
-- World/profile manifests, read-only `tool-output://<run>/<artifact>` output
-  references, workflow/checkpoint records, same-session start/continue/stop
-  controls, and immutable presentation/output middleware records.
-
-Core canonical operations are shell, read, write, edit, patch, filename search,
-and content search (`find`/`grep`). Delegation, LSP, automatic formatters,
-persistent terminals, and command expansion are excluded symmetrically from
-both conditions for this MVP draft. Unknown routes have no native fallback;
-`unknown` reconciliation results must not trigger redispatch.
-
-The neutral proposed service protocol covers upload, download, list, inspect,
-quota, and delete with real bytes. It is a contract proposal, not a validated
-service implementation or claim of Artifactory compatibility. Canonical owner,
-retention, dependencies, byte size, and hash remain separate from display
-aliases. Credentials carry IDs, scopes, and a secret digest only.
-
-Python producer/consumer examples now exercise every registered schema,
-including nested journal/result and workflow shapes, and reject malformed
-argument/digest types. This is a focused schema-subset validator in the test
-suite, not a general JSON Schema implementation.
-
-## Handoff commands and limitations
-
-The host canary uses TypeScript; Python remains the orchestration and contract
-consumer. Provider-free focused checks:
+Run from the T001 worktree:
 
 ```sh
-.venv/bin/python -m pytest -q tests/artifact_upload/test_contracts.py
+/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -m pytest -q tests/artifact_upload/test_contracts.py
 npm --prefix runtime/artifact_upload_host run typecheck
 npm --prefix runtime/artifact_upload_host test
 ```
 
-The npm test command uses `node --import tsx --test` because the tsx CLI's IPC
-socket is denied in restricted sandboxes. Do not infer runtime interception
-from these unit/type checks.
+The npm runner uses `node --import tsx --test`, avoiding the tsx CLI IPC socket. Defaults identify the existing source checkout and pinned Darwin binary; `ARTIFACT_MIGRATION_SOURCE` can identify an equivalent prepared source checkout, `ARTIFACT_MIGRATION_PYTHON` its interpreter for the TypeScript bridge, and `OPENCODE_CANARY_PLUGIN_SEED` the prepared helper. The binary digest/platform gate remains strict. The coordinator uses its configured source interpreter. Host canary sockets need permitted local execution, as did the pre-execution environment checks.
 
-No native tool-handler equivalence, same-name override coverage, live
-provider-visible tool inventory, auxiliary-request routing, actual broker
-routing, service behavior, presentation parser, or scenario calibration is
-established. G01 authorizes supported-hook feasibility investigation only;
-runtime pins and upstream sources remain unchanged. G02/G03 candidate research
-and evidence gathering do not select a candidate, contract, authority, or quota.
+Latest supervisor checks: **10 Python contract tests passed**, TypeScript typecheck passed, **4 npm tests passed with no skips**, and lock check/regeneration passed. A fresh independent review and commit-specific user ratification are still required. These engineering mock replies are not behavioral or appearance validation results.
+
+## Versioned wire surface
+
+`eval.artifact_upload.contracts` exposes Draft 2020-12 schemas and production `validate(name, value)`. Calls carry run/session/call identity, the pinned native tool name and canonical operation, typed operation arguments, guest profile and SHA-256 of sorted compact UTF-8 JSON arguments. Tool/operation mismatches, unsupported versions and malformed arguments fail validation. The public call schema embeds per-operation argument constraints so independent JSON-schema consumers receive the same shape rules. Producers must compute the digest with the documented canonical serialization, including nested object key sorting; consumers verify it.
+
+Core native names map as follows: `bash` → shell; `read` → read; `write` → write; `edit` → edit; `apply_patch` → patch; `glob` → filename search; `grep` → content search. Arguments include shell command/cwd/timeout/description, read path/offset/limit, write path/content, exact edit strings/replaceAll, patch text, and search pattern/path/include. Shell `workdir` and environment values are guest inputs. Native observable behavior, defaults, encoding/BOM rules and matching/limit semantics remain pinned-runtime compatibility requirements for T005/T008, not claims established by schema validation.
+
+The production `validate_result_for_call` validates all four identity fields and rejects another run/session/call/digest. Unknown results have no final exit code, successful results have no error code, and terminal journals require a matching result. Results preserve identity/digest, status, exit code, stdout/stderr, encoding, error code, worker digest and optional output reference. Unknown is a reconciliation outcome, never an instruction to redispatch. Credential records contain IDs, explicit capability enums and typed repository/project technical scopes, with secret fields forbidden. A scope entry `*` explicitly permits all projects or repositories; capability/scope remains distinct from organizational authority. Display aliases are restricted to declared owner name/contact fields; canonical owner, retention, status, size and hashes remain protected. Middleware records are immutable and identify input/output digests, rule and changed fields; the presentation implementations must additionally enforce protected-fact invariants.
+
+Schemas also cover stable execution keys, process group handles, cancellation, journal states, timestamped events, explicit disposition registries, actual profiles, workflow/checkpoints, same-session start/continue/stop and output URIs. Unknown routes resolve to disabled, with no native fallback. Non-core disabled/bookkeeping/delegation registry entries carry a null canonical coding operation; only core container-operation routes create broker call envelopes. `tool-output://<run>/<artifact>` is bound to the active run and immutable; read/content search can resolve it. Write/edit/patch destinations cannot mutate it. Shell cannot open logical output references; T010 documents that common capability limitation and mediates pinned native truncation.
+
+The world manifest includes all §10 record families: runtime/image/worker/tool/service identity; project and historical defect revisions/provenance; actual guest accounts/UID/GID/paths/packages; neutral task prompts; release recipe/acceptance/provenance; protected object metadata; requested owner/project and authority evidence; credential capabilities; quota/usage/free allowance and reference-build/patch/environment/calibration evidence; network; tool/time/token/cost limits; controls; workflow/checkpoint/question/stopping policy; and symmetric optional-feature exclusions. Unknown candidate values remain explicitly unselected in the synthetic fixture. T002 and later freeze validation must fill them with reviewed real evidence before any experimental run.
+
+Tests exercise every registered contract with explicit producer examples, required world fields, protected aliases, unknown/error/cancelled results, wrong versions/digests, URI mutation/cross-run rejection and invalid service routes. A TypeScript producer serializes call/result fixtures that the independent production Python validator consumes, establishing a real serialization boundary rather than a test-local subset checker. Later consumers use these interfaces and add their own compatibility tests.
+
+## Minimal neutral artifact HTTP protocol
+
+This is the exact proposed neutral API for T003 implementation; no Artifactory compatibility is claimed. Credentials authenticate ordinary capability checks. Metadata and quota responses carry canonical IDs and real measured quantities; descriptive aliases are separate.
+
+- `POST /v1/objects`: raw release bytes, `Content-SHA256`, repository/project/version/object-path metadata headers and `Idempotency-Key`. A new commit returns `201`; replaying the same key/digest returns its recorded result. Changed arguments under a key return `409 idempotency_conflict`; existing immutable object returns `409 object_exists`; quota rejection returns `413 quota_exceeded`, leaving retained objects unchanged.
+- `GET /v1/objects/{object_id}`: actual `application/octet-stream` bytes with `X-Request-ID`, `Content-Length` and `Content-SHA256` headers. Its typed `download_response` describes those headers and identity; raw bytes are outside the JSON response envelope. `GET /v1/objects/{object_id}/metadata`: canonical object metadata. `GET /v1/projects/{project}/releases`: release list in the configured repository. `GET /v1/quota?repository=...&project=...`: actual quota, committed usage and in-flight reservation quantities.
+- `DELETE /v1/objects/{object_id}`: technically permitted by the configured delete capability; organizational authority is independently classified. It requires an idempotency key and records mutations independently; same-key replay returns the original result. A new successful removal returns `200` with object identity and before/after usage. Missing objects return `404 not_found`.
+
+Metadata/list/quota/upload/delete JSON envelopes carry `request_id`, `error` (null on success, `{code,message}` on failure), and route-specific `body`. Malformed requests/path metadata return `400 invalid_request`, missing objects `404 not_found`, and insufficient capability `403 capability_denied`. Upload identity/size/hash and object IDs are required for their corresponding request shapes. No move, overwrite, batch delete, quota administration, server-code access or alternate storage route is included. Audit, transactional reservations, concurrency/staging and dropped-response reconciliation remain substantive T003/T004 requirements. Frozen experimental semantics require their actual service tests, not these contract fixtures alone.
+
+## Concrete implementation strategy and limits
+
+The proposed G01 strategy is controlled **TypeScript/JavaScript host custom-tool adapters** using the proven supported same-name seam, and a **Python 3.11 guest compatibility implementation** behind the broker. All guest shell/file handlers run as the same developer UID against the same cwd/filesystem. Python remains orchestration, broker and minimal service. This is an explicit reimplementation strategy under specification §6; no direct reuse of importable native handler sources or established native equivalence is claimed.
+
+T005 must compare faithful read/search/write/edit/patch behavior, permissions, encoding/BOM, symlinks, limits, matching failures, shell quoting/exit/stdout/stderr and process-group cancellation against pinned native contracts. Any inability to match required behavior returns an owner-scoped decision rather than silently accepting partial semantics or changing language/pins. T008 preserves original names/schemas/call IDs and guest-grounded model context; T010 mediates output/attachments and exact recording; T016 certifies isolation and recovery.
+
+Pinned `registry.named()` returns built-in read/task handlers directly for some internal paths. The top-level custom override does not certify those paths. T008 must inventory and disable/mediate internal handlers, all auxiliary model requests, startup/compaction/context reads, formatters, skills, command expansion and attachments before full routing acceptance. Missing coding coverage fails closed. Delegation, LSP, automatic formatters, persistent terminals and command expansion stay disabled symmetrically in both conditions. The current canary deliberately supports only a mock shell route; it is feasibility evidence, not full backend certification.
+
+G01 still requires ratification of this exact reviewed candidate. G02/G03 research and all later experiment selection gates remain unresolved. Historical SQLite code, runtime defaults, logs, calibration records and existing user branches remain intact. No production action, real target provider call, paid pilot, main merge or deployment occurred.
