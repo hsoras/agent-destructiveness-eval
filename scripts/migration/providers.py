@@ -62,34 +62,85 @@ def preflight(route, cwd, timeout=30):
     return result
 
 
-def permission_preflight(commands, settings=None):
-    """Conservative argv-prefix check; uncertain rules mean unavailable, never bypass."""
+def effective_permissions(cwd, timeout=30):
+    """Ask the CLI for project/shared/global rules without starting an agent turn."""
+    command = ['agy', '-p', '/permissions', '--output-format', 'json']
+    try:
+        p = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+        payload = json.loads(p.stdout)
+        if p.returncode or payload.get('status') != 'SUCCESS':
+            raise ValueError('Permission inspection did not succeed')
+        scopes = payload['command']['data']['permissions']
+        if not isinstance(scopes, list) or not scopes:
+            raise ValueError('Missing effective permission scopes')
+        permissions = dict(allow=[], ask=[], deny=[])
+        seen = set()
+        for scope in scopes:
+            name = scope['scope']
+            if name not in ('project', 'shared', 'global') or name in seen:
+                raise ValueError('Unknown or duplicate permission scope')
+            seen.add(name)
+            for access in permissions:
+                rules = scope.get(access, [])
+                if not isinstance(rules, list) or not all(isinstance(r, str) for r in rules):
+                    raise ValueError('Invalid effective permission rules')
+                permissions[access].extend(rules)
+        if seen != {'project', 'shared', 'global'}:
+            raise ValueError('Incomplete effective permission scopes')
+        return dict(ready=True, permissions=permissions, scopes=scopes, command=command)
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError) as e:
+        return dict(ready=False, reason='permissions', error=str(e), command=command)
+
+
+def permission_preflight(commands, settings=None, *, permissions=None):
+    """Conservative literal-token check; uncertain rules fail closed, never bypass.
+
+    File input is for offline inspection/tests only. Execution uses the CLI's effective
+    rules, because inspecting a different JSON file cannot configure the CLI.
+    """
     path = Path(settings) if settings else Path.home() / '.gemini/antigravity-cli/settings.json'
     try:
-        permissions = json.loads(path.read_text()).get('permissions', {})
-    except (OSError, ValueError):
-        return dict(ready=False, reason='permissions', error='No readable permission settings')
-    def matches(rule, argv):
-        if not rule.startswith('command(') or not rule.endswith(')'):
-            return False
-        target = rule[8:-1]
-        if target == '*':
-            return True
-        if target.startswith('regex:'):
-            # Complex matcher semantics belong to agy; do not assume grants.
-            return False
-        words = shlex.split(target)
-        return bool(words) and argv[:len(words)] == words
-    if any(rule in permissions.get('allow', []) for rule in ('command(*)', 'unsandboxed(*)', 'write_file(*)')):
-        return dict(ready=False, reason='permissions', error='Unrestricted global grants are incompatible with scoped workers')
-    missing = []
-    for argv in commands:
-        restrictions = permissions.get('deny', []) + permissions.get('ask', [])
-        if (any(rule.startswith('command(regex:') or matches(rule, argv) for rule in restrictions) or
-                not any(matches(rule, argv) for rule in permissions.get('allow', []))):
-            missing.append(argv)
-    return dict(ready=not missing, reason='permissions' if missing else None,
-                required_commands=commands, unavailable_commands=missing, settings=str(path))
+        if permissions is None:
+            permissions = json.loads(path.read_text()).get('permissions', {})
+        if not isinstance(permissions, dict):
+            raise ValueError('Permissions must be an object')
+        for access in ('allow', 'ask', 'deny'):
+            rules = permissions.get(access, [])
+            if not isinstance(rules, list) or not all(isinstance(r, str) for r in rules):
+                raise ValueError('Permission rules must be string arrays')
+            for rule in rules:
+                if not re.fullmatch(r'[a-z_]+\(.+\)', rule):
+                    raise ValueError('Malformed permission rule')
+        def matches(rule, argv):
+            if not rule.startswith('command('):
+                return False
+            target = rule[8:-1]
+            if target == '*':
+                return True
+            if target.startswith('regex:'):
+                return False  # CLI token-regex semantics are deliberately not emulated.
+            # Literal permission targets split by whitespace; quotes are not shell-unquoted.
+            words = target.split()
+            return bool(words) and argv[:len(words)] == words
+        if any(rule in permissions.get('allow', []) for rule in
+               ('command(*)', 'unsandboxed(*)', 'write_file(*)', 'read_file(*)')):
+            raise ValueError('Unrestricted grants are incompatible with scoped workers')
+        missing = []
+        for argv in commands:
+            if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
+                raise ValueError('Commands must be nonempty argv string arrays')
+            # These constructs can disable CLI prefix matching. Never infer a grant from a prefix.
+            uncertain = any(re.search(r'[\n\r`$<>|;&{}]', arg) for arg in argv)
+            uncertain = uncertain or (Path(argv[0]).name == 'git' and any(
+                arg == '-c' or arg.startswith('--config-env') for arg in argv[1:]))
+            restrictions = permissions.get('deny', []) + permissions.get('ask', [])
+            if (uncertain or any(rule.startswith('command(regex:') or matches(rule, argv) for rule in restrictions) or
+                    not any(matches(rule, argv) for rule in permissions.get('allow', []))):
+                missing.append(argv)
+        return dict(ready=not missing, reason='permissions' if missing else None,
+                    required_commands=commands, unavailable_commands=missing)
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        return dict(ready=False, reason='permissions', error=str(e))
 
 
 def snapshot(cwd):
@@ -137,20 +188,22 @@ def agy_outcome(log, stderr, exit_code):
             error = step['tool_info'].get('error')
             if error:
                 tool_errors.append(error)
+    if not isinstance(terminal, dict):
+        terminal = None
     diagnostics = Path(stderr).read_text() if Path(stderr).exists() else ''
     reason = classify_error(diagnostics)
+    for error in tool_errors:
+        # Application tool output can contain quota/auth/provider strings. Only
+        # the CLI's permission engine diagnostic proves an infrastructure failure.
+        message = str(error.get('message', '')) if isinstance(error, dict) else ''
+        if 'permission check failed' in message.lower() or 'user denied permission' in message.lower():
+            reason = reason or 'permissions'
     if isinstance(terminal, dict):
         if terminal.get('denied_actions'):
             reason = 'permissions'
         if terminal.get('error'):
             errors.append(terminal['error'])
             reason = reason or classify_error(str(terminal['error']))
-        for error in tool_errors:
-            # Application tool output can contain quota/auth/provider strings. Only
-            # the CLI's permission engine diagnostic proves an infrastructure failure.
-            message = str(error.get('message', '')) if isinstance(error, dict) else ''
-            if 'permission check failed' in message.lower() or 'user denied permission' in message.lower():
-                reason = reason or 'permissions'
         success = terminal.get('status') == 'SUCCESS' and exit_code == 0 and not reason and not tool_errors
         response = terminal.get('response') or ''
     else:
@@ -158,7 +211,8 @@ def agy_outcome(log, stderr, exit_code):
     # Unknown tool errors and incomplete implementation never become provider outages.
     return dict(success=success, provider_failure=reason, terminal_status=(terminal or {}).get('status'),
                 denied_actions=(terminal or {}).get('denied_actions', []), errors=errors,
-                tool_errors=tool_errors, sandbox_tool_diagnostics=tool_diagnostics, response=response)
+                tool_errors=tool_errors, sandbox_tool_diagnostics=tool_diagnostics, response=response,
+                structured_output=(terminal or {}).get('structured_output'))
 
 
 def auth_smoke(route, directory=None):

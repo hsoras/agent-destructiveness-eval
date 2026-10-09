@@ -10,13 +10,17 @@ import unittest
 from unittest.mock import patch
 import test_orchestrate as legacy
 from orchestrate import Coordinator, Stop, atomic, git, watch_state
-from providers import agy_outcome, snapshot, permission_preflight
+from providers import agy_outcome, snapshot, permission_preflight, effective_permissions
 from usage import log_usage, usage_report
 
 AGY = '''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 args=sys.argv[1:]
 mode=os.environ.get('AGY_FAILURE','')
+if '-p' in args and args[args.index('-p')+1] == '/permissions':
+ if mode == 'policy_unavailable':
+  print('permission inspection unavailable', file=sys.stderr); sys.exit(1)
+ print(json.dumps(dict(status='SUCCESS',command=dict(data=dict(permissions=[dict(scope='project'),dict(scope='shared',ask=['command(*)']),dict(scope='global',allow=['command(git diff)'])])))));sys.exit(0)
 if args == ['models']:
  if mode == 'init':
   print('failed to initialize local listener',file=sys.stderr); sys.exit(1)
@@ -192,6 +196,115 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(permission_preflight([['git','diff','--check']],path)['ready'])
         atomic(path, dict(permissions=dict(allow=['command(*)'])))
         self.assertFalse(permission_preflight([['git','diff','--check']],path)['ready'])
+
+    def test_effective_policy_includes_shared_and_project_restrictions(self):
+        payload = dict(status='SUCCESS', command=dict(data=dict(permissions=[
+            dict(scope='global', allow=['command(git diff)']),
+            dict(scope='shared', ask=['command(git)']), dict(scope='project') ])))
+        result = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
+        with patch('providers.subprocess.run', return_value=result) as invoke:
+            effective = effective_permissions(self.repo, 2)
+        self.assertTrue(effective['ready'])
+        self.assertEqual(invoke.call_args.kwargs['cwd'], self.repo)
+        self.assertEqual(invoke.call_args.args[0], ['agy', '-p', '/permissions', '--output-format', 'json'])
+        self.assertFalse(permission_preflight([['git','diff']], permissions=effective['permissions'])['ready'])
+
+    def test_effective_policy_unknown_or_incomplete_fails_closed(self):
+        for scopes in ([], [dict(scope='global')], [dict(scope='unknown')],
+                       [dict(scope='global', allow='command(git)')]):
+            payload = dict(status='SUCCESS', command=dict(data=dict(permissions=scopes)))
+            with patch('providers.subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), '')):
+                self.assertFalse(effective_permissions(self.repo)['ready'])
+        with patch('providers.subprocess.run', side_effect=subprocess.TimeoutExpired('agy', 2)):
+            self.assertFalse(effective_permissions(self.repo, 2)['ready'])
+
+    def test_unsafe_or_unresolved_argv_does_not_prefix_match(self):
+        policy = dict(allow=['command(git)', 'command(python3 -m pytest)'])
+        for command in (['git','diff','$(whoami)'], ['git','-c','core.pager=sh','log'],
+                        ['git','diff','x; curl example.invalid'], ['git','diff','{output}'],
+                        ['python3','-m','pytest','/tmp/results-$USER']):
+            self.assertFalse(permission_preflight([command], permissions=policy)['ready'])
+        self.assertTrue(permission_preflight([['python3','-m','pytest','tests/unit.py']], permissions=policy)['ready'])
+        self.assertFalse(permission_preflight([['python3.11','-m','pytest']], permissions=policy)['ready'])
+        self.assertFalse(permission_preflight([['git','status']], permissions=dict(allow=['command(git st)']))['ready'])
+
+    def test_malformed_and_uncertain_rules_fail_closed(self):
+        for policy in ([], dict(allow='command(git)'), dict(allow=[None]),
+                       dict(allow=['command(git)'], ask=['command(regex:git .*']),
+                       dict(allow=['command(git)'], deny=['command(git']),
+                       dict(allow=['command(git)', 'read_file(*)']),
+                       dict(allow=['command("git diff")'])):
+            self.assertFalse(permission_preflight([['git','diff']], permissions=policy)['ready'])
+
+    def test_effective_policy_inspection_failure_safely_falls_back(self):
+        self.routing['primary']['check_permissions'] = True
+        c = self.assert_fallback('policy_unavailable')
+        self.assertEqual(c.state['records']['T001']['provider_failure']['reason'], 'permissions')
+        readiness = json.loads(Path(str(c.artifact('T001','worker-1-job.json'))+'.preflight.json').read_text())
+        self.assertFalse(readiness['ready'])
+        self.assertIn('effective_policy', readiness['permissions'])
+        self.assertFalse(Path(str(c.artifact('T001','worker-1-job.json'))+'.child.json').exists())
+
+    def test_effective_shared_ask_fallback(self):
+        self.routing['primary']['check_permissions'] = True
+        self.assert_fallback()
+
+    def test_alternate_settings_cannot_misrepresent_execution_policy(self):
+        self.routing['primary'].update(check_permissions=True, permissions_settings=str(self.root/'alternate.json'))
+        atomic(self.root/'alternate.json', dict(permissions=dict(allow=['command(git)'])))
+        c = self.assert_fallback()
+        preflight_path = Path(str(c.artifact('T001','worker-1-job.json'))+'.preflight.json')
+        self.assertIn('does not configure agy', json.loads(preflight_path.read_text())['permissions']['error'])
+
+    def test_focused_worker_checks_leave_required_coordinator_gates_intact(self):
+        self.config['worker_checks'] = {'T001': [['git','diff','--check']]}
+        self.config['public_checks'] = {'T001': [[sys.executable,'-c','raise SystemExit(2)']]}
+        c = self.routed()
+        self.assertEqual(c.worker_checks('T001'), [['git','diff','--check']])
+        self.assertEqual(c.task_checks('T001'), self.config['checks']['T001'] + self.config['public_checks']['T001'])
+        with self.assertRaisesRegex(Stop, 'required check'):
+            c.execute(self.tasks)
+        self.assertFalse(c.artifact('T001','review-1-job.json').exists())
+        self.assertIsNone(c.state['records']['T001']['commit'])
+
+    def test_explicit_tool_denial_without_terminal_is_provider_failure(self):
+        log=self.root/'denied.jsonl'; stderr=self.root/'denied.stderr'; stderr.write_text('')
+        log.write_text(json.dumps(dict(event='step_update', step_update=dict(tool_info=dict(
+            error=dict(message='Permission check failed: user denied permission'))))))
+        outcome=agy_outcome(log,stderr,0)
+        self.assertFalse(outcome['success']); self.assertEqual(outcome['provider_failure'],'permissions')
+
+    def test_structured_output_is_retained_separately_from_response(self):
+        log=self.root/'structured.jsonl'; stderr=self.root/'structured.stderr'; stderr.write_text('')
+        output=dict(changed_paths=['probe.py'], tests=[], commit='', limitations=['denied'])
+        log.write_text(json.dumps(dict(event='result',result=dict(status='SUCCESS',
+            response='extra prose', structured_output=output))))
+        outcome=agy_outcome(log,stderr,0)
+        self.assertEqual(outcome['structured_output'],output)
+        self.assertEqual(outcome['response'],'extra prose')
+
+    def test_implementation_smoke_rejects_commit_and_coordinator_pass_without_worker_evidence(self):
+        import contextlib
+        import io
+        from worker_smoke import smoke
+        # This simulated CLI commits the right bytes but provides no test tool evidence.
+        # A terminal SUCCESS and coordinator pass must never certify a worker test pass.
+        replacement = """(cwd/'probe.py').write_text('def answer():\\n    return 42\\n')
+import subprocess
+subprocess.run(['git','add','--','probe.py'],check=True)
+subprocess.run(['git','commit','-m','simulated worker commit'],check=True,stdout=subprocess.DEVNULL)
+head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+result=dict(status='SUCCESS',response='Unverified test claim',structured_output=dict(changed_paths=['probe.py'],tests=['claimed PASS'],commit=head,limitations=[]))
+print(json.dumps(dict(event='result',result=result)));sys.exit(0)
+"""
+        self.agy.write_text(AGY.replace("cwd=pathlib.Path.cwd()", "cwd=pathlib.Path.cwd()\n"+replacement))
+        root=self.root/'implementation-smoke'
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(smoke(root))
+        report=json.loads((root/'report.json').read_text())
+        self.assertTrue(report['edited'] and report['committed'] and report['structured'] and report['isolated'])
+        self.assertEqual(report['coordinator_test_exit'],0)
+        self.assertFalse(report['worker_test_evidence'] or report['gemini_edit_test_commit'])
 
     def test_gemini_coordinator_interruption_preserves_processes(self):
         atomic(self.root/'config.json',self.config); atomic(self.root/'routing.json',self.routing)

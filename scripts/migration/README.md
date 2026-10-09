@@ -134,22 +134,32 @@ while keeping `agy --sandbox` on for agent terminal commands.
 Gemini runs in the same isolated task worktree with `-p`, explicit model/effort,
 `--output-format stream-json`, `--sandbox`, `--mode accept-edits`, and
 `--disable-slash-commands`. It never uses permission-bypass flags. Existing CLI
-settings are inherited. Before implementation, the runner conservatively checks
-literal command-prefix grants for the task's worker validation commands against
-`~/.gemini/antigravity-cli/settings.json`. Missing/uncertain grants, Ask/Deny rules,
-or unrestricted command/file grants make Gemini unavailable. Regex grants are
-conservatively treated as unverified, so use narrow literal prefixes for required
-commands. Do not add `command(*)` or `unsandboxed(*)`. Review your existing grants:
-this adapter does not replace global permissions or forcibly remove existing rules.
-The documentation smoke uses `git diff --no-index --exit-code <expected-document> <document>` from the temporary fixture root outside the Git checkout under the already allowed `command(git diff)`;
-actual Python/pytest checks may need separate narrow rules before Gemini can run.
+settings are inherited. Before implementation, checked routes inspect the CLI's
+**effective project, shared, and global rules** using the zero-agent-turn
+`agy -p /permissions --output-format json` command. A bounded conservative
+literal-token check covers the task's worker validation commands. Missing/uncertain
+grants, Ask/Deny conflicts, malformed/incomplete effective policies, or unrestricted
+command/file grants make Gemini unavailable. Regex grants are not inferred. An
+alternate `permissions_settings` JSON file is rejected: inspecting it cannot make
+the CLI load it. No global/shared/project settings are rewritten.
 
 For new configurations, `worker_checks` can name focused developer commands;
-otherwise required branch/public checks supply the permission preflight. Coordinator
-validation remains mandatory regardless of worker checks or worker sandbox errors.
-The permission preflight is conservative, not an emulator of every agy permission
-syntax. New CLI syntax/schema changes can stop Gemini safely. Unexpected tool
-failures or missing terminal results do not become provider outages by inference.
+otherwise required branch/public checks supply the permission preflight. Keep
+Docker, network and privileged integration checks at the trusted coordinator.
+Coordinator validation remains mandatory regardless of worker checks or worker
+sandbox errors. Do not rewrite an active frozen configuration to adopt new checks.
+The preflight is a conservative command-policy check, not proof that a sandboxed
+command can reach its executable, dependencies, or linked Git metadata.
+
+Authentication and the documentation smoke do not prove implementation readiness.
+The real implementation probe, `python3 scripts/migration/worker_smoke.py`, uses a
+new disposable repository/worktree and requires genuine editing, worker test tool
+evidence, a clean Git commit, structured output, and independent validation. It
+consumes account allowance and exits 1 on incomplete evidence. **The 2026-10-09
+implementation probe failed**: Python was soft-denied and a separate Git probe could
+not reach shared worktree metadata. See [GEMINI_WORKER_DIAGNOSIS.md](GEMINI_WORKER_DIAGNOSIS.md)
+for exact evidence, limitations, and the operator-only integration/reload procedure.
+Do not describe Gemini implementation as fixed until that real probe passes.
 
 stdout JSONL, stderr, final response, terminal status, errors, denied actions,
 usage, exit receipt, runner/child PIDs, and preflight output are retained under

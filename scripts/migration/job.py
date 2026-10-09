@@ -9,7 +9,7 @@ import sys
 import time
 from orchestrate import atomic
 from usage import log_usage
-from providers import agy_outcome, preflight, snapshot, permission_preflight
+from providers import agy_outcome, preflight, snapshot, permission_preflight, effective_permissions
 
 job_path = Path(sys.argv[1])
 job = json.loads(job_path.read_text())
@@ -24,7 +24,17 @@ try:
     if provider == 'agy':
         readiness = preflight(job['route'], job['cwd'], job.get('preflight_seconds', 30))
         if readiness['ready'] and job['route'].get('check_permissions'):
-            permissions = permission_preflight(job.get('permission_commands', []), job['route'].get('permissions_settings'))
+            settings = job['route'].get('permissions_settings')
+            default_settings = Path.home() / '.gemini/antigravity-cli/settings.json'
+            if settings and Path(settings).resolve() != default_settings.resolve():
+                permissions = dict(ready=False, reason='permissions',
+                                   error='permissions_settings does not configure agy; alternate policy files are unsupported')
+            else:
+                effective = effective_permissions(job['cwd'], job.get('preflight_seconds', 30))
+                permissions = (permission_preflight(job.get('permission_commands', []),
+                                                    permissions=effective['permissions'])
+                               if effective['ready'] else dict(effective))
+                permissions['effective_policy'] = effective
             readiness['permissions'] = permissions
             if not permissions['ready']:
                 readiness.update(ready=False, reason='permissions')
