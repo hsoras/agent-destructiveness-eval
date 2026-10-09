@@ -655,12 +655,45 @@ class Coordinator:
                 group = [t for t in tasks if t['wave'] == wave]
                 if str(wave) not in self.state['checkpoints'] and all(records.get(t['id'], {}).get('phase') == 'merged' for t in group):
                     self.checkpoint(tasks, wave)
-            active = [t for t in tasks if t['id'] in records and records[t['id']]['phase'] != 'merged']
+            # A rejected task is retained for explicit repair, while independent recorded
+            # work in the same wave remains eligible for review and integration.
+            unfinished_waves = [t['wave'] for t in tasks
+                                if records.get(t['id'], {}).get('phase') != 'merged']
+            earliest_wave = min(unfinished_waves) if unfinished_waves else None
+            active = [t for t in tasks if t['id'] in records and
+                      t['wave'] == earliest_wave and
+                      records[t['id']]['phase'] not in ('merged', 'rejected')]
             if not active:
-                active = select(tasks, records, self.config['scopes'])
+                rejected_in_wave = any(
+                    t['wave'] == earliest_wave and
+                    records.get(t['id'], {}).get('phase') == 'rejected'
+                    for t in tasks)
+                # Do not assign fresh work alongside a rejected attempt whose scope
+                # remains occupied; only recorded peer work can safely drain.
+                active = [] if rejected_in_wave else select(tasks, records, self.config['scopes'])
                 if not active:
-                    print('All tasks integrated, or no graph-ready tasks. No merge into main was performed.')
-                    return
+                    if all(records.get(t['id'], {}).get('phase') == 'merged' for t in tasks):
+                        print('All tasks integrated. No merge into main was performed.')
+                        return
+                    blockers = []
+                    for task in tasks:
+                        record = records.get(task['id'])
+                        if not record or record['phase'] == 'merged':
+                            continue
+                        if record['phase'] == 'rejected':
+                            review = record.get('review') or {}
+                            detail = '; '.join(str(x) for x in review.get('findings', []))
+                            if not detail:
+                                detail = record.get('repair', 'independent review rejected this attempt')
+                            blockers.append(f'{task["id"]} rejected: {detail}')
+                        else:
+                            blockers.append(f'{task["id"]} {record["phase"]}')
+                    if not blockers:
+                        blockers.append('no graph-ready task')
+                    message = 'Safe work exhausted: ' + ' | '.join(blockers)
+                    self.state['blocked'] = message
+                    self.save()
+                    raise Stop(message + '. No success claim; no merge into main was performed.')
                 prior = {str(t['wave']) for t in tasks if t['wave'] < active[0]['wave']}
                 if any(w not in self.state['checkpoints'] for w in prior):
                     raise Stop('Prior wave checkpoint missing')
@@ -690,8 +723,6 @@ class Coordinator:
                     self.accept_review(t, job)
                 elif r['phase'] == 'review_finished':
                     self.accept_review(t, json.loads(Path(r['job']).read_text()))
-                if r['phase'] == 'rejected':
-                    raise Stop(f'{t["id"]}: rejected; inspect review/logs and request targeted repair')
             for t in active:  # Task-column order, one merge and integration check at a time.
                 self.integrate(t)
             waves = sorted({t['wave'] for t in active})

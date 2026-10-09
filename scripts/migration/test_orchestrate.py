@@ -66,6 +66,48 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('migration: record verified T001',log)
         self.assertIn('migration: record verified T002',log)
 
+    def test_rejected_task_does_not_block_recorded_peer(self):
+        self.c.initialize(self.tasks)
+        rejected = self.c.prepare(self.tasks[0])
+        rejected.update(phase='rejected', attempt=2,
+                        review={'approved': False, 'findings':['Review found a concrete defect.'],
+                                'criteria': []})
+        peer = self.c.prepare(self.tasks[1])
+        peer['attempt'] = 1
+        w = Path(peer['worktree'])
+        (w / 'docs/smoke-beta.md').write_text(
+            '# Smoke beta\n\nThis is the beta orchestration smoke document.\n')
+        self.c.verify_worker(self.tasks[1])
+        peer['phase'] = 'approved'
+        peer['review'] = {'approved': True, 'findings': [], 'criteria': [
+            {'id':'AC1','passed':True,'evidence':'Exact expected bytes are present.'},
+            {'id':'AC2','passed':True,'evidence':'Only the assigned file changed.'}]}
+        self.c.save()
+        with self.assertRaisesRegex(Stop, 'Safe work exhausted.*No success claim'):
+            self.c.execute(self.tasks)
+        self.assertEqual(rejected['phase'], 'rejected')
+        self.assertEqual(peer['phase'], 'merged')
+        self.assertIn('Safe work exhausted', self.c.state['blocked'])
+        self.assertIn('T001 rejected: Review found a concrete defect.', self.c.state['blocked'])
+        self.assertNotIn('No success claim', self.c.state['blocked'])
+        self.assertNotIn('1', self.c.state['checkpoints'])
+        self.assertEqual(peer['attempt'], 1)
+
+    def test_rejected_task_blocks_new_same_wave_assignment(self):
+        self.config['scopes']['T002'] = self.config['scopes']['T001']
+        self.c.initialize(self.tasks)
+        rejected = self.c.prepare(self.tasks[0])
+        rejected.update(phase='rejected', attempt=2,
+                        review={'approved': False, 'findings':['Review found a concrete defect.'],
+                                'criteria': []})
+        self.c.save()
+        with patch.object(self.c, 'launch') as launch:
+            with self.assertRaisesRegex(Stop, 'Safe work exhausted'):
+                self.c.execute(self.tasks)
+        self.assertNotIn('T002', self.c.state['records'])
+        launch.assert_not_called()
+        self.assertIn('T001 rejected: Review found a concrete defect.', self.c.state['blocked'])
+
     def test_failed_integration_never_marks_merged(self):
         self.config['regression_checks']=[[sys.executable,'-c','raise SystemExit(7)']]
         with self.assertRaisesRegex(Stop,'required check failed'):
