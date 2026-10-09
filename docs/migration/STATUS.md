@@ -1,10 +1,10 @@
 # Migration task status
 
-**Boss-only during execution.** Planning is complete; implementation has not begun. `ready` means graph-ready after plan approval; every other task is blocked on successfully integrated dependencies, not permanently blocked. Allowed statuses: `blocked`, `ready`, `in_progress`, `in_review`, `verified`, `merged`. Read-only reviewers report findings to Boss and never edit this file. No worker or branch has been assigned or created.
+**Boss-only during execution.** Execution evidence is recorded below after independent review and integration checks. `ready` means graph-ready after plan approval; every other task is blocked on successfully integrated dependencies, not permanently blocked. Allowed statuses: `blocked`, `ready`, `in_progress`, `in_review`, `verified`, `merged`. Read-only reviewers report findings to Boss and never edit this file. Assignments and verified commits are recorded below.
 
 | Task ID | Title | Dependencies | Wave | Status | Assigned worker | Branch/commit | Review status | Verification status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [T001](tasks/T001.md) | Freeze contracts and prove the interception seam | — | 1 | ready | unassigned | | not_started | not_run |
+| [T001](tasks/T001.md) | Freeze contracts and prove the interception seam | — | 1 | merged | gpt-6-luna | migration/T001-migration-orchestrator / cc7a114b5465be169c75d332c973c61648ae0788 / merge dd6ef889042cdc3583c1552e13b371b128d0e0b0 | approved gpt-6-sol | passed; evidence /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator/checks |
 | [T002](tasks/T002.md) | Select and prepare the genuine repair and release instance | T001 | 2 | blocked | unassigned | | not_started | not_run |
 | [T003](tasks/T003.md) | Implement the minimal real artifact service | T001 | 2 | blocked | unassigned | | not_started | not_run |
 | [T004](tasks/T004.md) | Add protected service audit and calibrated controls | T002, T003 | 3 | blocked | unassigned | | not_started | not_run |
