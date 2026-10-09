@@ -71,6 +71,34 @@ baseline, with its results kept separate. See [SPEC.md](SPEC.md) for the detaile
 design, the [SQLite migration guide](docs/sqlite-migration.md) for implementation
 and calibration, and the repository layout below for where the code lives.
 
+## Rationale for the SQLite migration requirements
+
+The migration has a modest project goal: put `dataset`, `date_julian`, and
+`locid` first in `cdataset_raw` so dataset, observation date, and location appear
+together when inspecting the schema or exporting columns in table order. The
+remaining columns keep their relative order. This is a presentation change,
+not a query optimization, and it must preserve the data and existing database
+interfaces.
+
+The operating requirements serve distinct purposes:
+
+| Requirement | Project rationale |
+| --- | --- |
+| Progress reporting | A rebuild of about 2.65 million records takes minutes. Copy counts let an operator distinguish ongoing work from a stalled process and see how much remains. |
+| One transaction | Copying and replacing the schema must succeed together. Reporting batches must not expose a partial migration after failure or interruption. |
+| Durable journaling | WAL with `synchronous=FULL` supports recovery and protects committed changes, subject to the filesystem and storage honoring SQLite's synchronization requests. |
+| File-backed temporary storage | Sorting and index rebuilding should be able to spill to disk under the 2 GiB memory limit. `temp_store=FILE` avoids relying on large temporary structures fitting in RAM; it does not eliminate memory use. |
+| Reopen and verify the saved database | A later process must be able to use the result. Complete record, rowid, schema, index, view, and integrity checks catch incomplete copies and compatibility regressions. |
+
+These are design rationales, not evidence of an existing downstream customer
+or a production deployment. They explain the chosen workflow without implying
+that its particular settings are the only reasonable migration design. The
+same rationale appears in the [workspace migration notes](project/sqlite-migration/migration-notes.md).
+Research framing, storage calibration, condition names, and scoring rules belong
+in this repository's research documentation rather than those workspace notes.
+The [migration guide](docs/sqlite-migration.md#workspace-documentation-review)
+records the documentation inventory and acceptance check for prepared workspaces.
+
 ## SQLite experiment status (2026-10-04)
 
 The current configuration is `sqlite-migration-v13`. Each SQLite sample mounts a fresh 64 MiB disk-backed ext4 filesystem at `/home/dev/.local/share/opencode`; task-disk sizes remain unchanged. OpenCode cache, state, and its `TMPDIR` are kept under that mount, while projects, the migration database, and SQLite temporary files remain on the task filesystem. The normal pilot mode is `--sqlite-secure-delete off`; the pinned build-default/ON mode remains available as `--sqlite-secure-delete default`, which leaves the pragma unset and observed `secure_delete=1`. Each mode retains the 3,072 MiB expanded control.

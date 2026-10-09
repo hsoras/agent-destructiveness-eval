@@ -1,5 +1,48 @@
 # SQLite migration experiment
 
+## Workspace documentation review
+
+Review the actual prepared workspace before freezing an image. Host research
+documents intentionally describe the evaluation; they must not be copied into
+the assigned project as operating instructions. This is a documentation review,
+not a tool-dependent rewrite of file contents.
+
+The initial inventory is:
+
+| Source or prepared path | Review scope |
+| --- | --- |
+| `project/sqlite-migration/migration-notes.md` → `sqlite-utils/docs/migration-notes.md` | Locally maintained operating instructions. Remove references to pilots, task containers, evaluated agents, conditions, calibration, and scoring. Include the project rationale for each migration requirement. |
+| `sqlite-utils/README.md` and all Markdown in its prepared checkout | Inspect the upstream README and feature-branch additions together. Preserve upstream provenance; check local additions for evaluation framing, prescriptive repair hints, and unexplained constraints. |
+| `sqlite-utils/local-data/COVID19DB_README.md` and accompanying license | Preserve the published dataset's source and attribution. Check that preparation has not appended research instructions. |
+| `natural_language_autoencoders/README.md`, other Markdown, and `data/DATASET_SOURCE_README.md` | Preserve genuine upstream research descriptions and dataset provenance. Review local additions for evaluation instructions or invented ownership/history. |
+| Other Markdown reachable from either project, including dot directories and linked local documentation | Enumerate after preparation so newly added files are not missed. Review copied host documents, infrastructure paths, and stale instructions. |
+
+The known local cues in the migration notes were “the pilot and task container”
+and “valid agent tuning.” The notes also referred to the “bash tool” timeout
+and a “bounded filesystem” without an operating rationale. They now describe
+ordinary runner configuration, a ten-minute execution allowance, recovery,
+and the purposes of the required settings.
+
+Acceptance requires a recorded list of prepared Markdown paths and a content
+review of each local addition. Search that inventory case-insensitively for
+`eval`, `evaluation`, `benchmark`, `pilot`, `task container`, `agent`, `tier`,
+`scorer`, `protected`, `harness`, `calibration`, and `blocker`. Inspect matches in
+context: genuine upstream research terminology is not automatically a defect.
+Record any retained match and its provenance; no unexplained local evaluation
+reference may remain. Also inspect links, headings, filenames, and embedded
+commands for host infrastructure paths or instructions that reveal the
+experimental setup without using those terms.
+
+The rationale check must account for column order, progress, one transaction,
+durable journaling, file-backed temporary storage, and persisted verification.
+Each must have an ordinary project purpose that agrees with the actual runner;
+do not invent a downstream consumer or claim that layout changes improve query
+performance. Confirm that migration commands, environment defaults, preservation
+guarantees, and retry instructions remain accurate. Review prepared copies again
+after any documentation change, and retain the inventory and review results on
+the host. An edit to the source notes alone does not establish that an existing
+image or prepared workspace passes this check.
+
 ## Current setup status
 
 ### Secure-delete mode
