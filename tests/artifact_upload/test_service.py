@@ -375,6 +375,58 @@ def test_delete_cleanup_failure_keeps_stable_event_pending(tmp_path, credentials
     assert sink and sink[0]["event_id"] == first_delivery["event_id"]
 
 
+def test_pending_delete_blocks_same_identity_reupload_until_recovery_and_replay(tmp_path, credentials):
+    root = tmp_path / "delete-reupload-generation"
+    delivered = []
+    store = ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
+    old_bytes = b"old physical generation"
+    args = dict(credential_id="broad", repository="repo", project="p", version="1",
+                object_path="release", content_sha256=hashlib.sha256(old_bytes).hexdigest())
+    status, created = store.upload(**args, idempotency_key="put-old", content=old_bytes)
+    assert status == 201
+    oid = created["body"]["object_id"]
+
+    attempted = []
+    def unavailable(event):
+        attempted.append(dict(event))
+        raise RuntimeError("audit sink unavailable")
+    store.audit = unavailable
+    status, deleted = store.delete("broad", oid, "delete-old")
+    assert status == 200 and deleted["audit_pending"] is True
+    old_event = next(event for event in store._outbox if event["event_type"] == "artifact.delete")
+    assert attempted[-1]["event_id"] == old_event["event_id"]
+
+    new_bytes = b"new physical generation"
+    same_identity = {**args, "content": new_bytes,
+                     "content_sha256": hashlib.sha256(new_bytes).hexdigest()}
+    status, conflict = store.upload(**same_identity, idempotency_key="put-new")
+    assert status == 409 and conflict["error"]["code"] == "object_exists"
+    assert store._object_file(oid).read_bytes() == old_bytes
+    quota = store.quota("broad", "repo", "p")[1]["body"]
+    assert quota["committed_bytes"] == 0 and quota["reserved_bytes"] == 0
+
+    recovered_events = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=recovered_events.append)
+    assert [event["event_id"] for event in recovered_events] == [old_event["event_id"]]
+    assert not reopened._object_file(oid).exists()
+    # The old DELETE request remains an idempotent replay after a new physical
+    # generation has been committed; it must not unlink or alter that generation.
+    status, reuploaded = reopened.upload(**same_identity, idempotency_key="put-new")
+    assert status == 201 and reuploaded["body"]["object_id"] == oid
+    expected_digest = hashlib.sha256(new_bytes).hexdigest()
+    assert reopened._object_file(oid).read_bytes() == new_bytes
+    status, replay = reopened.delete("broad", oid, "delete-old")
+    assert status == 200 and replay["body"]["object_id"] == oid
+    status, _, metadata, downloaded = reopened.download("broad", oid)
+    assert status == 200 and downloaded == new_bytes
+    assert metadata["size_bytes"] == len(new_bytes) and metadata["sha256"] == expected_digest
+    quota = reopened.quota("broad", "repo", "p")[1]["body"]
+    assert quota["committed_bytes"] == len(new_bytes) and quota["reserved_bytes"] == 0
+    final = ArtifactStore(root, 100, credentials=credentials, audit=recovered_events.append)
+    assert final.download("broad", oid)[3] == new_bytes
+    assert [event["event_id"] for event in recovered_events].count(old_event["event_id"]) == 1
+
+
 def test_concurrent_same_object_reserves_identity_before_streaming(tmp_path, credentials):
     store = ArtifactStore(tmp_path / "same-object", 100, credentials=credentials)
     entered = threading.Event()

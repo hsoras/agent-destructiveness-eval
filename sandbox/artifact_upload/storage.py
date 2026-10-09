@@ -152,6 +152,17 @@ class ArtifactStore:
         self._outbox.append(event)
         return event
 
+    def _delete_cleanup_pending(self, oid: str) -> bool:
+        """Keep a logical object identity unavailable until old-byte cleanup is acked.
+
+        Object files are named by logical object ID, so reusing that name while a
+        delete event is pending would let recovery for the old generation unlink
+        the new generation. The index lock makes this check atomic with delete
+        commit and outbox acknowledgement.
+        """
+        return any(event.get("event_type") == "artifact.delete" and
+                   event.get("object_id") == oid for event in self._outbox)
+
     def _authorize(self, credential_id: str, capability: str, repository: str, project: str):
         cred = self.credentials.get(credential_id)
         if cred is None or capability not in cred.get("capabilities", []):
@@ -213,7 +224,7 @@ class ArtifactStore:
                         raise StoreError("idempotency_conflict", "key reused with different in-flight request", 409)
                     raise StoreError("idempotency_in_progress", "identical request is already in progress", 409)
                 oid = hashlib.sha256((repository + "\0" + project + "\0" + version + "\0" + object_path).encode()).hexdigest()
-                if oid in self._objects or oid in self._reserved_objects:
+                if oid in self._objects or oid in self._reserved_objects or self._delete_cleanup_pending(oid):
                     raise StoreError("object_exists", "object versions are immutable", 409)
                 committed = sum(o["size_bytes"] for o in self._objects.values() if o["repository"] == repository)
                 reserved = sum(size for size, repo in self._reservations.values() if repo == repository)
