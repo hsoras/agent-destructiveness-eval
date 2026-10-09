@@ -7,9 +7,10 @@ import sys
 import tempfile
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from orchestrate import Coordinator, Stop, atomic, config_template, git, lock, overlap, read_graph, select
+from orchestrate import Coordinator, Stop, atomic, config_template, digest, git, lock, overlap, pytest_evidence, read_graph, select
 from smoke import fixture
 
 FAKE = '''#!/usr/bin/env python3
@@ -101,6 +102,35 @@ class SafetyTests(unittest.TestCase):
     def test_skipped_required_check_fails(self):
         with self.assertRaisesRegex(Stop,'skipped'):
             self.c.checks(self.repo,[[sys.executable,'-c','print("1 passed, 2 skipped")']], 'skip')
+
+    def test_pytest_check_accepts_only_exact_command_and_failure(self):
+        checks = self.repo / 'checks'
+        checks.mkdir()
+        source = checks / 'test_baseline.py'
+        source.write_text('def test_ok():\n    pass\n\ndef test_known():\n    assert False, "known"\n')
+        command = ['{python}', '-m', 'pytest', '-q', 'checks']
+        with self.assertRaisesRegex(Stop, 'required check failed'):
+            self.c.checks(self.repo, [command], 'baseline-unapproved')
+        report = next((self.c.directory / 'checks/baseline-unapproved').glob('*.xml'))
+        case = ET.parse(report).find('.//testcase/failure/..')
+        failure = case.find('failure')
+        self.config['baseline_exceptions'] = [dict(
+            command=command, classname=case.get('classname'), name=case.get('name'),
+            failure_sha256=digest(json.dumps(dict(message=failure.get('message'), text=failure.text), sort_keys=True)),
+            source_sha256={'checks/test_baseline.py': digest(source.read_text())})]
+        result = self.c.checks(self.repo, [command], 'baseline-approved')[0]
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['exit'], 1)
+        self.assertEqual(result['tests_failed'], 1)
+        self.assertEqual(len(result['accepted_baseline_exceptions']), 1)
+        # Task briefs use .venv/bin/python; it resolves to the same interpreter.
+        task_command = ['.venv/bin/python', *command[1:]]
+        self.assertTrue(self.c.checks(self.repo, [task_command], 'same-resolved-command')[0]['passed'])
+        with self.assertRaisesRegex(Stop, 'required check failed'):
+            self.c.checks(self.repo, [command + ['-x']], 'different-command')
+        (checks / 'test_new.py').write_text('def test_new():\n    assert False, "new regression"\n')
+        with self.assertRaisesRegex(Stop, 'required check failed'):
+            self.c.checks(self.repo, [command], 'additional-failure')
 
     def test_dependency_wave_and_ownership(self):
         tasks=[dict(id='A',wave=1,deps=[]),dict(id='B',wave=1,deps=[]),dict(id='C',wave=2,deps=['A'])]
@@ -257,6 +287,20 @@ class SafetyTests(unittest.TestCase):
             self.c.initialize(self.tasks)
         self.assertFalse(self.c.file.exists())
 
+    def test_dependency_lock_ownership_and_generated_modules_ignore(self):
+        repo=Path(__file__).resolve().parents[2]
+        cfg=config_template(repo)
+        from orchestrate import owns
+        self.assertTrue(owns('uv.lock',cfg['scopes']['T001']))
+        self.assertFalse(owns('uv.lock',cfg['scopes']['T002']))
+        result=subprocess.run(['git','check-ignore','--no-index','runtime/artifact_upload_host/node_modules/example.js'],cwd=repo,text=True,capture_output=True)
+        self.assertEqual(result.returncode,0)
+        for name in ('runtime/artifact_upload_host/canary/node_modules/example.js', 'sandbox/artifact_upload/worker/native/node_modules/example.js'):
+            result=subprocess.run(['git','check-ignore','--no-index',name],cwd=repo,text=True,capture_output=True)
+            self.assertEqual(result.returncode,0)
+        self.assertFalse(owns('runtime/artifact_upload_host/node_modules/example.js',cfg['scopes']['T001']))
+        self.assertIn('uv.lock',cfg['exclusions']['T008'])
+
     def test_real_plan_parses_all_tasks_and_scopes(self):
         repo=Path(__file__).resolve().parents[2]
         cfg=config_template(repo)
@@ -270,6 +314,85 @@ class SafetyTests(unittest.TestCase):
             self.assertLessEqual(len(group),2)
             if len(group)==2:
                 self.assertFalse(overlap(cfg['scopes'][group[0]['id']],cfg['scopes'][group[1]['id']]))
+
+class BaselineExceptionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='migration-baseline-tests-')
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        (self.root / 'source.py').write_text('original source\n')
+        self.report = self.root / 'report.xml'
+        self.suite = ET.Element('testsuite')
+        ET.SubElement(self.suite, 'testcase', classname='tests.example', name='test_ok')
+        self.case = ET.SubElement(self.suite, 'testcase', classname='tests.example', name='test_known')
+        self.failure = ET.SubElement(self.case, 'failure', message='AssertionError: known')
+        self.failure.text = 'exact known traceback'
+        self.exception = dict(classname='tests.example', name='test_known',
+                              failure_sha256=digest(json.dumps(dict(message=self.failure.get('message'), text=self.failure.text), sort_keys=True)),
+                              source_sha256={'source.py': digest('original source\n')})
+
+    def audit(self, exit_code=1, exceptions=None):
+        ET.ElementTree(self.suite).write(self.report)
+        return pytest_evidence(self.report, self.root, exit_code,
+                               [self.exception] if exceptions is None else exceptions)
+
+    def test_exact_exception_recorded_without_claiming_all_tests_pass(self):
+        result = self.audit()
+        self.assertEqual(result['tests_passed'], 1)
+        self.assertEqual(result['tests_failed'], 1)
+        self.assertEqual(result['accepted_baseline_exceptions'], ['tests.example::test_known'])
+
+    def test_changed_signature_or_hidden_source_change_blocks(self):
+        for field in ('message', 'text', 'source'):
+            with self.subTest(field=field):
+                if field == 'message':
+                    self.failure.set('message', 'different error')
+                elif field == 'text':
+                    self.failure.text = 'different traceback'
+                else:
+                    (self.root / 'source.py').write_text('hidden new leak\n')
+                with self.assertRaisesRegex(Stop, 'changed'):
+                    self.audit()
+                self.failure.set('message', 'AssertionError: known')
+                self.failure.text = 'exact known traceback'
+
+    def test_additional_failure_and_duplicate_known_failure_block(self):
+        for name in ('test_new', 'test_known'):
+            with self.subTest(name=name):
+                case = ET.SubElement(self.suite, 'testcase', classname='tests.example', name=name)
+                ET.SubElement(case, 'failure', message='AssertionError: known').text = 'exact known traceback'
+                with self.assertRaisesRegex(Stop, 'Unapproved or duplicate'):
+                    self.audit()
+                self.suite.remove(case)
+
+    def test_skips_collection_errors_and_abnormal_exits_block(self):
+        for tag in ('skipped', 'error'):
+            element = ET.SubElement(self.case, tag)
+            with self.assertRaisesRegex(Stop, 'collection errors or skipped'):
+                self.audit()
+            self.case.remove(element)
+        for code in (0, 2, 3, 4, 5, -15):
+            with self.subTest(code=code), self.assertRaisesRegex(Stop, 'exit status'):
+                self.audit(code)
+
+    def test_exception_not_required_when_test_passes(self):
+        self.case.remove(self.failure)
+        self.assertEqual(self.audit(0)['accepted_baseline_exceptions'], [])
+
+    def test_missing_empty_or_malformed_report_blocks(self):
+        with self.assertRaises(FileNotFoundError):
+            pytest_evidence(self.report, self.root, 1, [self.exception])
+        self.report.write_text('<broken')
+        with self.assertRaises(ET.ParseError):
+            pytest_evidence(self.report, self.root, 1, [self.exception])
+        self.suite = ET.Element('testsuite')
+        with self.assertRaisesRegex(Stop, 'Missing tests'):
+            self.audit()
+
+    def test_unconfigured_exception_blocks(self):
+        with self.assertRaisesRegex(Stop, 'Unapproved'):
+            self.audit(exceptions=[])
+
 
 if __name__=='__main__':
     unittest.main()

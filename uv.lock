@@ -1046,6 +1046,16 @@ wheels = [
 ]
 
 [[package]]
+name = "jsonrpcserver"
+version = "5.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "oslash" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e3/3b/8d4d4fe8c59a1a4d1e6edd6126ec118b989510fadf262950a5c4f4bca664/jsonrpcserver-5.0.9.tar.gz", hash = "sha256:a71fb2cfa18541c80935f60987f92755d94d74141248c7438847b96eee5c4482", size = 14506, upload-time = "2022-09-15T02:28:24.004Z" }
+
+[[package]]
 name = "jsonschema"
 version = "4.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1606,6 +1616,18 @@ wheels = [
 ]
 
 [[package]]
+name = "oslash"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/60/b2/54ea4a7c6f768469a4c6a2f27f5c7cf572d63e9fd7f7618fca89c30966b3/OSlash-0.6.3.tar.gz", hash = "sha256:868aeb58a656f2ed3b73d9dd6abe387b20b74fc9413d3e8653b615b15bf728f3", size = 35228, upload-time = "2020-10-12T20:50:14.165Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2d/c3/77d40a6e20fdfbf92b086d2c47e3cc82731e179e3f44bdc8e60b7306bcc3/OSlash-0.6.3-py3-none-any.whl", hash = "sha256:89b978443b7db3ac2666106bdc3680add3c886a6d8fcdd02fd062af86d29494f", size = 26943, upload-time = "2020-10-12T20:50:13.06Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2148,6 +2170,18 @@ wheels = [
 ]
 
 [[package]]
+name = "returns"
+version = "0.27.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/d5/a3208e3193848ecfec2adb689f474cc6c66c4b7e1711c31528c5b3cfbc93/returns-0.27.0.tar.gz", hash = "sha256:f70a452dd81e6d024c97523683aba85076b15e00874e723afb23bcf3aa4ecea2", size = 105261, upload-time = "2026-04-14T07:11:21.206Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ab/9c/1db56b3a26b56abde214833556c83af7e9817999bc05163c9e1bf200952d/returns-0.27.0-py3-none-any.whl", hash = "sha256:a84f243b9a17e9b96c16b709f5cca819550c38a2fc4db725ee2539354956af12", size = 160133, upload-time = "2026-04-14T07:11:23.187Z" },
+]
+
+[[package]]
 name = "rich"
 version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2382,6 +2416,19 @@ dev = [
     { name = "pytest" },
 ]
 
+[package.dev-dependencies]
+migration-regression = [
+    { name = "aiohttp" },
+    { name = "httpx" },
+    { name = "jsonrpcserver" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pydantic" },
+    { name = "returns" },
+    { name = "semver" },
+    { name = "tenacity" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "inspect-ai", specifier = "==0.3.263" },
@@ -2390,6 +2437,19 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+migration-regression = [
+    { name = "aiohttp", specifier = "==3.14.3" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "jsonrpcserver", specifier = "==5.0.9" },
+    { name = "packaging", specifier = "==26.3" },
+    { name = "psutil", specifier = "==7.2.2" },
+    { name = "pydantic", specifier = "==2.13.5" },
+    { name = "returns", specifier = "==0.27.0" },
+    { name = "semver", specifier = "==3.1.0" },
+    { name = "tenacity", specifier = "==9.1.4" },
+]
 
 [[package]]
 name = "tenacity"

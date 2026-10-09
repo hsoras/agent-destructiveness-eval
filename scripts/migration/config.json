@@ -17,6 +17,7 @@
       "runtime/artifact_upload_host/package.json",
       "docs/artifact-upload-contracts.md",
       "pyproject.toml",
+      "uv.lock",
       "runtime/artifact_upload_host/package-lock.json",
       "runtime/artifact_upload_host/pnpm-lock.yaml",
       "runtime/artifact_upload_host/yarn.lock"
@@ -363,6 +364,7 @@
       "runtime/artifact_upload_host/package.json",
       "docs/artifact-upload-contracts.md",
       "pyproject.toml",
+      "uv.lock",
       "runtime/artifact_upload_host/package-lock.json",
       "runtime/artifact_upload_host/pnpm-lock.yaml",
       "runtime/artifact_upload_host/yarn.lock"
@@ -381,5 +383,28 @@
     "T001",
     "T002"
   ],
-  "note": "Review exact scopes/checks before execution. Add named evidence fixture paths explicitly; no broad ownership inferred from prose."
+  "note": "Review exact scopes/checks before execution. Add named evidence fixture paths explicitly; no broad ownership inferred from prose.",
+  "baseline_exceptions": [
+    {
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "tests"
+      ],
+      "classname": "tests.test_scenarios",
+      "name": "test_blocker_runtime_has_no_guest_visible_harness_names",
+      "failure_sha256": "6004e7e7979137d30627cb18d4229484c59a46b3adbdcadca8dd178bbb870fe1",
+      "source_sha256": {
+        "tests/test_scenarios.py": "96859e7866de97efac9e8fdfc13f33effd742a16c5cdee0d7274331c0e86a275",
+        "sandbox/Dockerfile": "4ab5fbe3ea467cbe5fc1eba413483c94e7520b17fb380c048c803ac6c963c74c",
+        "sandbox/compose.yaml": "4ff9ab4df1e940753948236710610c1a34b39bbed0f693bb7269d3b102f33413",
+        "sandbox/workspace_bootstrap.py": "8e005711a24f7503952bccd4cfcf41d9d2ac8f2f59158d51b94aaf357bcf0795",
+        "sandbox/validation_coordinator.py": "35ecc85704d4acf67c34cb6aba21dcb01ae91138e261d2f67484e32276f04422",
+        "sandbox/blocker_validate.py": "ab77321fd1c85077348543dd56cc16a4275f2033a9e46041f7814a51f30caaa3"
+      },
+      "reason": "User-approved legacy source-text assertion exception: sandbox-tools installation paths do not establish guest visibility. Test remains enabled; changed signature/source or any other failure blocks integration."
+    }
+  ]
 }

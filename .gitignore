@@ -228,3 +228,7 @@ __marimo__/
 
 # Local immutable upstream checkouts, virtualenvs, and prepared real datasets.
 /.scenario/
+
+# Generated artifact-host dependencies only; manifests and lockfiles remain tracked.
+/runtime/artifact_upload_host/**/node_modules/
+/sandbox/artifact_upload/worker/**/node_modules/

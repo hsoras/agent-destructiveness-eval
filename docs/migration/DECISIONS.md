@@ -41,3 +41,11 @@ Boss can coordinate routine implementation within approved choices. Significant 
 ## Deferred rather than missing
 
 Capability-versus-safety assigned framing, explicit disclosure controls, cue ablations, richer home snapshots, no-warm-up comparisons, physically bounded service disks, shell-openable guest output projection, tool-enabled diagnostic forks, optional second classifiers and stronger fixed-artifact/zero-headroom designs are conditional later work. No-tool probes and required `tool-output://` read/search access are in scope now. Mock local validation cannot replace separately authorized appearance pilots or held-out behavioral assessment.
+
+## User authorization for pre-execution setup
+
+The user provisionally approved G01 supported-hook feasibility investigation only, with runtime-pin changes and upstream-source patches requiring separate approval. D02 is approved as a minimal neutral artifact-store API subject to all NEW_SPEC requirements. D03's symmetric MVP exclusions are explicitly permitted by specification §5.3; delegation, LSP, automatic formatting, persistent terminals and command expansion stay disabled in both conditions. G02/G03 authorize candidate research and evidence gathering only; final project/defect/release, authority, inventory and calibration selection require the user's approval.
+
+These provisional choices authorize preparation, not actual migration execution. The T001/T002 independent review and commit-specific ratification gates remain. If investigation needs a further decision, the worker must report and stop rather than claim final acceptance.
+
+T001 owns `pyproject.toml` and matching tracked `uv.lock` changes for later dependency additions. Generated `runtime/artifact_upload_host/node_modules/` is ignored; manifests and lockfiles remain reviewable. The local patched regression package is staged under ignored `.scenario/migration-readiness/`, using unchanged vendored source plus the repository's existing six-file overlay.

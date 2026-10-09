@@ -62,3 +62,7 @@ Run deterministic coordinator safety tests (real Git, simulated Codex, no model 
 ```sh
 python3 -m unittest discover -s scripts/migration -p 'test_*.py' -v
 ```
+
+The completed pre-execution setup, exact environment preparation commands, test receipts and remaining baseline failures are documented in [READINESS.md](READINESS.md). Use `uv sync --locked --extra dev --group migration-regression --inexact`, then `.venv/bin/python scripts/migration/prepare_regression.py` to prepare the local patched regression package without changing vendored runtime sources. Generated backend `node_modules` is ignored; manifests and lockfiles remain tracked. T001 alone owns shared Python manifest/lockfile changes.
+
+The accepted legacy regression exception is documented in [BASELINE_EXCEPTIONS.md](../../docs/migration/BASELINE_EXCEPTIONS.md). Pytest checks produce JUnit XML and durable JSON/log receipts. Only the exact configured full-suite command can accept the pinned guest-name assertion; receipts retain the failing test and raw exit 1. Changed failure signatures or scanned source hashes, extra failures, errors, skips, or missing reports stop integration. Do not regenerate or refresh this baseline automatically.

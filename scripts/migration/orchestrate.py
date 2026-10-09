@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 HERE = Path(__file__).resolve().parent
 WORKER = 'gpt-6-luna'
@@ -57,6 +58,39 @@ def ancestor(cwd, a, b):
 
 def digest(data):
     return hashlib.sha256(data.encode()).hexdigest()
+
+def pytest_evidence(report, cwd, exit_code, exceptions):
+    """Audit every collected result; allow only an exact approved baseline failure."""
+    tree = ET.parse(report)
+    cases = tree.findall('.//testcase')
+    if not cases or tree.findall('.//error') or tree.findall('.//skipped'):
+        raise Stop('Missing tests, collection errors or skipped required tests')
+    failures = tree.findall('.//failure')
+    if exit_code != (1 if failures else 0):
+        raise Stop('Unexpected pytest exit status')
+    accepted = []
+    for case in cases:
+        failed = case.findall('failure')
+        if not failed:
+            continue
+        identity = (case.get('classname'), case.get('name'))
+        candidates = [e for e in exceptions if (e['classname'], e['name']) == identity]
+        if len(candidates) != 1 or len(failed) != 1 or identity in accepted:
+            raise Stop(f'Unapproved or duplicate pytest failure: {identity}')
+        exception = candidates[0]
+        failure = failed[0]
+        signature = digest(json.dumps({'message': failure.get('message', ''),
+                                       'text': (failure.text or '').replace(str(Path(cwd).resolve()), '{repo}')}, sort_keys=True))
+        if signature != exception['failure_sha256']:
+            raise Stop(f'Baseline failure signature changed: {identity}')
+        for name, expected in exception['source_sha256'].items():
+            if hashlib.sha256((Path(cwd) / name).read_bytes()).hexdigest() != expected:
+                raise Stop(f'Baseline failure source changed: {name}')
+        accepted.append(identity)
+    if len(accepted) != len(failures):
+        raise Stop('Unaccounted pytest failures')
+    return dict(tests_passed=len(cases) - len(failures), tests_failed=len(failures),
+                accepted_baseline_exceptions=[f'{c}::{n}' for c, n in accepted], junit=str(report))
 
 def section(text, n):
     m = re.search(rf'^## {n}\. .*?\n(.*?)(?=^## |\Z)', text, re.M | re.S)
@@ -114,7 +148,7 @@ def config_template(repo):
     scopes, checks = {}, {}
     for t in tasks:
         line = re.search(r'\*\*Proposed owned paths:\*\* (.*?) These new paths', t['text'])[1]
-        paths = re.findall(r'(?<![\w/])(?:[\w.-]+/)+[\w.-]*|(?<![\w/])(?:README\.md|pyproject\.toml)', line)
+        paths = re.findall(r'(?<![\w/])(?:[\w.-]+/)+[\w.-]*|(?<![\w/])(?:README\.md|pyproject\.toml|uv\.lock)', line)
         # The prose cannot name the chosen npm lockfile; explicitly bound known candidates.
         if t['id'] == 'T001':
             paths += ['runtime/artifact_upload_host/package-lock.json', 'runtime/artifact_upload_host/pnpm-lock.yaml', 'runtime/artifact_upload_host/yarn.lock']
@@ -226,6 +260,10 @@ class Coordinator:
                 'production operations, paid experiment pilots, or merge into main. Stop and report a required unsafe action. '
                 'Run applicable local checks; do not hide skips or incomplete acceptance. Report exact evidence, limitations and failed criteria. '
                 'Only supplied coding task is authorized; do not launch other agents or tasks.\n'
+                'User decision limits: G01 permits supported-hook feasibility investigation only; no runtime pin changes or upstream patches without separate approval. '
+                'D02 permits a neutral minimal artifact API only if it satisfies the spec. D03 permits symmetric MVP exclusion of the spec-optional features. '
+                'G02/G03 permit candidate research and evidence gathering; do not finalize a candidate, release contract, authority or quota without separate user approval. '
+                'If these approvals are needed, report the gate and stop; later explicit user approvals may be supplied in targeted repair instructions.\n'
                 f'Excluded ownership: {json.dumps(self.config.get("exclusions", {}).get(task["id"], []))}\nRepair findings (if any): {repair}\nRepository instructions:\n' + '\n'.join(instructions) +
                 '\nTask file, requirements, acceptance and validation:\n' + task['text'] +
                 '\nAuthoritative spec (including relevant sections cited above):\n' + spec +
@@ -361,6 +399,12 @@ class Coordinator:
             if any('$' in a or '`' in a for a in argv):
                 raise Stop(f'Unresolved shell syntax in check: {argv}')
             env = dict(os.environ, MIGRATION_RUN_ID=output.stem, PYTHONDONTWRITEBYTECODE='1')
+            pytest = argv[1:3] == ['-m', 'pytest']
+            if pytest:
+                report = output.with_suffix('.xml')
+                check_argv = list(argv)
+                argv += ['-o', 'junit_family=xunit2', '--junitxml=' + str(report)]
+            p = None
             try:
                 with output.open('w') as f:
                     p = subprocess.Popen(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -376,9 +420,18 @@ class Coordinator:
                         raise
                 text = output.read_text()
                 failed = p.returncode != 0 or bool(re.search(r'\b(?:\d+ skipped|\d+ xfailed|\d+ xpassed|no tests ran|0 passed)\b', text))
-                results.append(dict(command=argv, exit=p.returncode, log=str(output), passed=not failed))
-            except (OSError, subprocess.TimeoutExpired) as e:
-                results.append(dict(command=argv, passed=False, error=str(e), log=str(output)))
+                evidence = {}
+                if pytest:
+                    exceptions = [e for e in self.config.get('baseline_exceptions', [])
+                                  if [x.replace('{python}', self.config['python']) for x in e['command']] == check_argv]
+                    evidence = pytest_evidence(report, cwd, p.returncode, exceptions)
+                    failed = bool(re.search(r'\b(?:\d+ skipped|\d+ xfailed|\d+ xpassed|no tests ran|0 passed)\b', text))
+                results.append(dict(command=argv, exit=p.returncode, log=str(output), passed=not failed, **evidence))
+            except (OSError, subprocess.TimeoutExpired, ET.ParseError, Stop) as e:
+                results.append(dict(command=argv, exit=p.returncode if p else None,
+                                    passed=False, error=str(e), log=str(output)))
+                if pytest:
+                    results[-1]['junit'] = str(report)
             atomic(output.with_suffix('.json'), results[-1])
             if not results[-1]['passed']:
                 raise Stop(f'{label}: required check failed/missing/skipped: {shlex.join(argv)}; see {output}')
