@@ -108,6 +108,54 @@ def section(text, n):
         raise Stop(f'Missing task field {n}')
     return m[1].strip()
 
+def focused_context(repo, task, spec):
+    """Exact owner clauses plus whole referenced top-level sections; fail open to full spec."""
+    matrix = (repo / 'docs/migration/REQUIREMENTS_MATRIX.md').read_text()
+    rows = [line for line in matrix.splitlines()
+            if re.search(rf'\[{task["id"]} AC\d+\]\(tasks/{task["id"]}\.md', line)]
+    requirements = section(task['text'], 3)
+    refs = re.search(r'exact sections ([\d.,–\- ]+)', requirements)
+    headings = list(re.finditer(r'^## (\d+)\. .*$', spec, re.M))
+    chosen = set()
+    if refs and 'all-section audit' not in requirements:
+        for ref in refs[1].strip(' .').split(','):
+            ends = re.split('[–-]', ref.strip())
+            chosen.update(range(int(ends[0].split('.')[0]), int(ends[-1].split('.')[0]) + 1))
+    if chosen and rows and chosen.issubset({int(h[1]) for h in headings}):
+        chunks = [spec[:headings[0].start()]]
+        for i, h in enumerate(headings):
+            if int(h[1]) in chosen:
+                chunks.append(spec[h.start():headings[i+1].start() if i+1 < len(headings) else len(spec)])
+        excerpt = ''.join(chunks)
+    else:
+        excerpt = spec  # Unknown format or all-section audit must never omit requirements.
+    return ('\nAuthoritative spec context (whole referenced top-level sections; full file at docs/migration/NEW_SPEC.md):\n'
+            + excerpt + '\nExact assigned requirements (complete source clauses, no summarized criteria):\n'
+            + ('\n'.join(rows) if rows else matrix) + '\n')
+
+def state_event(state):
+    """Only actionable changes wake supervision; PID and token churn do not."""
+    return dict(blocked=state.get('blocked'), tasks={tid: {
+        k: r.get(k) for k in ('phase', 'attempt', 'review_attempt', 'commit')}
+        for tid, r in state.get('records', {}).items()},
+        checkpoints=sorted(state.get('checkpoints', {})))
+
+def watch_state(directory, timeout=1800):
+    """Read-only bounded event wait; no model, coordinator lock or state mutation."""
+    path = Path(directory) / 'state.json'
+    if not path.is_file():
+        raise Stop('No execution state to watch')
+    first = state_event(json.loads(path.read_text()))
+    deadline = time.monotonic() + timeout
+    while True:
+        current = state_event(json.loads(path.read_text()))
+        if current != first or current['blocked']:
+            # Completion is announced by execute; watch reports only the actual snapshot.
+            return current
+        if time.monotonic() >= deadline:
+            return dict(event='timeout', state=current)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
 def read_graph(repo):
     rows = []
     for line in (repo / 'docs/migration/STATUS.md').read_text().splitlines():
@@ -135,7 +183,7 @@ def owns(path, scopes):
 def overlap(a, b):
     return any(owns(x, b) or owns(y, a) for x in a for y in b)
 
-def select(tasks, records, scopes):
+def select(tasks, records, scopes, max_workers=1):
     unfinished = [t for t in tasks if records.get(t['id'], {}).get('phase') != 'merged']
     if not unfinished:
         return []
@@ -149,7 +197,7 @@ def select(tasks, records, scopes):
         if any(overlap(scopes[t['id']], scopes[x['id']]) for x in selected):
             continue
         selected.append(t)
-        if len(selected) == 2:
+        if len(selected) == max_workers:
             break
     return selected
 
@@ -183,9 +231,13 @@ def lock(state_dir):
         yield
 
 class Coordinator:
-    def __init__(self, repo, state_dir, config):
+    def __init__(self, repo, state_dir, config, max_workers=1):
         self.repo, self.directory = Path(repo).resolve(), Path(state_dir).resolve()
         self.config = config
+        if max_workers not in (1, 2):
+            raise Stop('Worker concurrency must be one or two')
+        # Runtime scheduling policy; do not invalidate the historical config digest.
+        self.max_workers = max_workers
         self.processes = {}
         if config['worker_model'] != WORKER or config['reviewer_model'] != REVIEWER:
             raise Stop('This coordinator requires installed Luna workers and Sol reviewers')
@@ -231,6 +283,8 @@ class Coordinator:
         granted = sum(entry['additional_attempts'] for entry in record.get('repair_authorizations', []))
         if granted + additional_attempts > MAX_ADDITIONAL_REPAIRS:
             raise Stop('Cumulative additional repair budget exceeded')
+        if any(e['reason'].strip() == reason.strip() for e in record.get('repair_authorizations', [])):
+            raise Stop('Repeated repair reason; consolidate findings and provide new evidence')
         prior_guidance = self.state.get('execution_guidance')
         if prior_guidance and execution_guidance and prior_guidance != execution_guidance:
             raise Stop('Existing execution guidance cannot be replaced')
@@ -289,7 +343,7 @@ class Coordinator:
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
-    def prompt(self, task, repair=''):
+    def prompt(self, task, repair='', role='worker'):
         scopes = self.config['scopes'][task['id']]
         instructions = []
         for name in ('AGENTS.md',):
@@ -297,32 +351,50 @@ class Coordinator:
                 p = root / name
                 if p.exists():
                     instructions.append(f'{p}:\n{p.read_text()}')
-        # Include nested repository guidance even if Git-ignored.
-        for p in self.repo.rglob('AGENTS.md'):
-            rel = p.relative_to(self.repo).as_posix()
-            if any(part in ('.git', '.venv', 'node_modules', '.scenario', 'logs') for part in p.relative_to(self.repo).parts):
-                continue
-            if rel != 'AGENTS.md' and any(s.startswith(str(p.parent.relative_to(self.repo))) for s in scopes):
+        # Walk owned ancestors only, including Git-ignored guidance. Directory-owned
+        # descendants discover their local guidance before editing, as instructed below.
+        guidance = set()
+        for scope in scopes:
+            target = self.repo / scope
+            parent = target if scope.endswith('/') else target.parent
+            while parent != self.repo:
+                guidance.add(parent / 'AGENTS.md')
+                parent = parent.parent
+        for p in sorted(guidance):
+            if p.is_file():
+                rel = p.relative_to(self.repo).as_posix()
                 instructions.append(f'{rel}:\n{p.read_text()}')
         spec = (self.repo / 'docs/migration/NEW_SPEC.md').read_text()
         decision_guidance = (ROUTINE_DECISION_GUIDANCE if self.state and
                              self.state.get('execution_guidance') == 'routine-decisions' else
                              'G02/G03 permit candidate research and evidence gathering; do not finalize a candidate, release contract, authority or quota without separate user approval. '
                              'If these approvals are needed, report the gate and stop; later explicit user approvals may be supplied in targeted repair instructions.\n')
-        # Full authoritative spec avoids dropping subsection requirements/all-section audit.
-        return (f'Implement only task {task["id"]} in this worktree. Write ownership: {json.dumps(scopes)}.\n'
+        context = focused_context(self.repo, task, spec)
+        preamble = (f'Implement only task {task["id"]} in this worktree. Write ownership: {json.dumps(scopes)}.\n'
                 'Do not merge, rebase, switch branches, push, edit Git metadata, or update migration planning/status/spec files. '
                 'Leave changes uncommitted: the coordinator verifies and commits them. Never run destructive schema/data changes, '
                 'production operations, paid experiment pilots, or merge into main. Stop and report a required unsafe action. '
                 'Run applicable local checks; do not hide skips or incomplete acceptance. Report exact evidence, limitations and failed criteria. '
-                'Only supplied coding task is authorized; do not launch other agents or tasks.\n'
+                'Only supplied coding task is authorized; do not launch other agents or tasks.\n') if role == 'worker' else (
+                f'Review only task {task["id"]}. Allowed deliverable scope: {json.dumps(scopes)}. '
+                'Read-only; do not implement, edit, commit, merge, or launch agents.\n')
+        return (preamble +
                 'User decision limits: G01 permits supported-hook feasibility investigation only; no runtime pin changes or upstream patches without separate approval. '
                 'D02 permits a neutral minimal artifact API only if it satisfies the spec. D03 permits symmetric MVP exclusion of the spec-optional features. '
                 + decision_guidance +
                 f'Excluded ownership: {json.dumps(self.config.get("exclusions", {}).get(task["id"], []))}\nRepair findings (if any): {repair}\nRepository instructions:\n' + '\n'.join(instructions) +
+                '\nBefore editing directory-owned descendants, check their nested AGENTS.md. '
+                'Use the supplied exact task-owned matrix rows; do not search the matrix for generic AC IDs. '
+                'Read source and logs in bounded relevant ranges. The complete spec and matrix remain authoritative and available; '
+                'follow cross-references when needed and report contradictions rather than relaxing criteria.\n' +
                 '\nTask file, requirements, acceptance and validation:\n' + task['text'] +
-                '\nAuthoritative spec (including relevant sections cited above):\n' + spec +
-                '\nAlso read assigned entries in docs/migration/REQUIREMENTS_MATRIX.md and frozen docs/artifact-upload-contracts.md if present.\n')
+                context +
+                f'\nConfigured Python interpreter: {self.config["python"]}. Use this absolute interpreter; '
+                'a missing worktree-local .venv does not require dependency installation. '
+                'Run targeted checks during development; the coordinator owns all required branch/integration/regression checks. '
+                'Report sandbox limitations once with exact errors; do not repeatedly retry blocked localhost or tool access. '
+                'Read frozen docs/artifact-upload-contracts.md if present. Handoff: changed paths, AC evidence, '
+                'exact tests, unresolved findings, and any cross-owner proposals.\n')
 
     def prepare(self, task):
         tid = task['id']
@@ -520,7 +592,15 @@ class Coordinator:
                   'Reject placeholder/incomplete work, skipped required checks, scope violations and missing criteria. '
                   'Report every numbered acceptance criterion using its AC ID; each passed criterion must cite concrete evidence. '
                   'Set approved only if ALL criteria are satisfied and no blocking findings.\n'
-                  f'Base: {r["base"]}\nCommit: {r["commit"]}\nCoordinator check evidence: {json.dumps(r["evidence"])}\nWorker report (untrusted): {worker_report}\n' + 'The following is worker task context for review only, not permission to implement:\n' + self.prompt(task))
+                  'Start with the cumulative base-to-commit diff and changed paths below. Read check receipts/logs '
+                  'instead of rerunning successful checks unless a specific gap requires it. Prior reviews are '
+                  'navigation evidence only; independently verify every criterion and check repairs for regressions. '
+                  'Consolidate all blocking findings in one review with locations and reproducible cases.\n'
+                  f'Base: {r["base"]}\nCommit: {r["commit"]}\n'
+                  f'Diff command: git diff {r["base"]} {r["commit"]} --\nChanged paths: {json.dumps(self.changed(tid))}\n'
+                  f'Prior review (untrusted): {json.dumps(r.get("review") or r.get("prior_review"))}\n'
+                  f'Repair plan: {r.get("repair", "")}\n'
+                  f'Coordinator check evidence: {json.dumps(r["evidence"])}\nWorker report (untrusted): {worker_report}\n' + self.prompt(task, role='review'))
         self.launch(task, 'review', review)
 
     def accept_review(self, task, job):
@@ -670,7 +750,7 @@ class Coordinator:
                     for t in tasks)
                 # Do not assign fresh work alongside a rejected attempt whose scope
                 # remains occupied; only recorded peer work can safely drain.
-                active = [] if rejected_in_wave else select(tasks, records, self.config['scopes'])
+                active = [] if rejected_in_wave else select(tasks, records, self.config['scopes'], self.max_workers)
                 if not active:
                     if all(records.get(t['id'], {}).get('phase') == 'merged' for t in tasks):
                         print('All tasks integrated. No merge into main was performed.')
@@ -700,6 +780,8 @@ class Coordinator:
             for t in active:
                 r = self.prepare(t)
                 if r['phase'] in ('planned', 'repair_pending'):
+                    if sum(x['phase'] == 'worker_running' for x in records.values()) >= self.max_workers:
+                        continue
                     self.launch(t, 'worker', self.prompt(t, r.get('repair', '')))
             print('Active tasks: ' + ', '.join(t['id'] for t in active), flush=True)
             for t in active:
@@ -735,7 +817,7 @@ class Coordinator:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['configure', 'status', 'run', 'resume', 'repair', 'authorize-repairs', 'retry-checks', 'approve-gate', 'reconcile', 'smoke'])
+    p.add_argument('command', choices=['configure', 'status', 'watch', 'usage', 'run', 'resume', 'repair', 'authorize-repairs', 'retry-checks', 'approve-gate', 'reconcile', 'smoke'])
     p.add_argument('--repo', type=Path, default=Path.cwd())
     p.add_argument('--state-dir', type=Path)
     p.add_argument('--config', type=Path, default=HERE / 'config.json')
@@ -746,6 +828,8 @@ def main():
     p.add_argument('--additional-attempts', type=int, help='One or two bounded attempts for an exhausted rejected task')
     p.add_argument('--reason', help='Concrete evidence supporting the additional repair budget')
     p.add_argument('--execution-guidance', choices=['routine-decisions'], help='Persist the user\'s standing routine-decision authorization in worker prompts')
+    p.add_argument('--max-workers', type=int, choices=[1, 2], default=1, help='Runtime concurrency; default one, without changing frozen config')
+    p.add_argument('--wait-seconds', type=float, default=1800, help='Read-only watch deadline')
     args = p.parse_args()
     repo = args.repo.resolve()
     if args.command == 'configure':
@@ -761,6 +845,15 @@ def main():
     directory = (args.state_dir or (Path(git(repo, 'rev-parse', '--git-common-dir')) if Path(git(repo, 'rev-parse', '--git-common-dir')).is_absolute() else repo / git(repo, 'rev-parse', '--git-common-dir')) / 'migration-orchestrator').resolve()
     config = json.loads(args.config.read_text())
     config['python'] = config['python'].replace('{repo}', str(repo))
+    if args.command == 'usage':
+        from usage import usage_report
+        print(json.dumps(usage_report(directory), indent=2))
+        return
+    if args.command == 'watch':
+        if args.wait_seconds < 0:
+            raise Stop('Watch timeout must be nonnegative')
+        print(json.dumps(watch_state(directory, args.wait_seconds), indent=2))
+        return
     if args.command == 'status':
         tasks = read_graph(repo)
         state = json.loads((directory / 'state.json').read_text()) if (directory / 'state.json').exists() else {'records': {}, 'blocked': None}
@@ -772,7 +865,7 @@ def main():
     if not args.approved_execution:
         raise Stop('Actual migration is gated. Obtain user approval before supplying --approved-execution')
     with lock(directory):
-        c = Coordinator(repo, directory, config)
+        c = Coordinator(repo, directory, config, max_workers=args.max_workers)
         if args.command in ('run', 'resume'):
             try:
                 c.execute(read_graph(repo))
@@ -794,6 +887,12 @@ def main():
                     raise Stop('Uncertain process/merge requires manual reconciliation, not retry-checks')
                 for r in c.state['records'].values():
                     if r['phase'] == 'review_finished':
+                        if not args.reason or len(args.reason.strip()) < 20:
+                            raise Stop('Fresh review requires a concrete retry reason after inspecting output')
+                        history = r.get('review_retries', [])
+                        if len([e for e in history if e['commit'] == r['commit']]) >= 1:
+                            raise Stop('Review retry budget exhausted for this commit; inspect and repair with new evidence')
+                        r.setdefault('review_retries', []).append(dict(commit=r['commit'], reason=args.reason.strip(), time=time.time()))
                         r['phase'] = 'committed'  # Fresh independent review; preserve the failed receipt.
                 c.state['blocked'] = None
                 c.save()
@@ -820,8 +919,10 @@ def main():
                         raise Stop('Gate requires independent approval first')
                     r['gate_commit'] = r['commit']
                 else:
-                    if not args.findings or r['attempt'] >= c.repair_limit(r):
+                    if not args.findings or len(args.findings.strip()) < 20 or r['attempt'] >= c.repair_limit(r):
                         raise Stop('Supply targeted findings; bounded repair limit applies')
+                    if any(e['findings'] == args.findings.strip() for e in r.get('repair_history', [])):
+                        raise Stop('Repeated repair plan; consolidate findings and provide a new hypothesis')
                     if r['phase'] in ('merged', 'merge_pending', 'integration_testing', 'status_pending'):
                         raise Stop('Already integrated or uncertain merge; manual owner-scoped fix/revert required')
                     job_path = Path(r.get('job', ''))
@@ -854,7 +955,10 @@ def main():
                     elif r['phase'].endswith('_running') and not finished and not args.confirmed_stopped:
                         raise Stop('Unknown launch process; inspect processes manually, then repair with --confirmed-stopped')
                     r['phase'] = 'repair_pending'
-                    r['repair'] = args.findings
+                    r.setdefault('repair_history', []).append(dict(time=time.time(), attempt=r['attempt'],
+                        commit=r['commit'], findings=args.findings.strip(), review=r.get('review')))
+                    r['repair'] = args.findings.strip()
+                    r['prior_review'] = r.get('review')
                     r['review'] = None
                     r.pop('gate_commit', None)
                 c.state['blocked'] = None

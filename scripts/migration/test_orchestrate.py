@@ -10,7 +10,8 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from orchestrate import Coordinator, Stop, atomic, config_template, digest, git, lock, overlap, pytest_evidence, read_graph, select
+from orchestrate import Coordinator, Stop, atomic, config_template, digest, focused_context, git, lock, overlap, pytest_evidence, read_graph, select, watch_state
+from usage import log_usage, usage_report
 from smoke import fixture
 
 FAKE = '''#!/usr/bin/env python3
@@ -46,7 +47,7 @@ class SafetyTests(unittest.TestCase):
         (bindir / 'codex').chmod(0o755)
         self.env = patch.dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
         self.env.start()
-        self.c = Coordinator(self.repo, self.root / 'state', self.config)
+        self.c = Coordinator(self.repo, self.root / 'state', self.config, max_workers=2)
         self.tasks = read_graph(self.repo)
 
     def tearDown(self):
@@ -65,6 +66,134 @@ class SafetyTests(unittest.TestCase):
         log=git(self.c.integration,'log','--format=%s')
         self.assertIn('migration: record verified T001',log)
         self.assertIn('migration: record verified T002',log)
+
+    def test_default_serial_workers_and_frozen_config_resume(self):
+        c = Coordinator(self.repo, self.root / 'state', self.config)
+        c.execute(self.tasks)
+        exits = [json.loads(c.artifact(t['id'], 'worker-1-exit.json').read_text()) for t in self.tasks]
+        self.assertLessEqual(exits[0]['finished'], exits[1]['started'])
+        self.assertTrue(all(r['phase'] == 'merged' for r in c.state['records'].values()))
+        before = c.file.read_bytes()
+        Coordinator(self.repo, self.root / 'state', self.config, max_workers=2).execute(self.tasks)
+        self.assertEqual(before, c.file.read_bytes())
+        self.assertEqual(len(select(self.tasks, {}, self.config['scopes'])), 1)
+        self.assertEqual(len(select(self.tasks, {}, self.config['scopes'], 2)), 2)
+
+    def test_default_capacity_drains_existing_planned_tasks(self):
+        self.c.initialize(self.tasks)
+        for t in self.tasks:
+            self.c.prepare(t)
+        c = Coordinator(self.repo, self.root / 'state', self.config)
+        c.execute(self.tasks)
+        exits = [json.loads(c.artifact(t['id'], 'worker-1-exit.json').read_text()) for t in self.tasks]
+        self.assertLessEqual(exits[0]['finished'], exits[1]['started'])
+        self.assertTrue(all(r['attempt'] == 1 for r in c.state['records'].values()))
+
+    def test_watch_reports_events_without_writes_or_launches(self):
+        import threading
+        self.c.initialize(self.tasks)
+        self.c.prepare(self.tasks[0])
+        before = self.c.file.read_bytes()
+        self.assertEqual(watch_state(self.c.directory, 0)['event'], 'timeout')
+        self.assertEqual(before, self.c.file.read_bytes())
+        def update():
+            time.sleep(.05)
+            self.c.state['blocked'] = 'Concrete blocker'
+            self.c.save()
+        thread = threading.Thread(target=update)
+        thread.start()
+        try:
+            self.assertEqual(watch_state(self.c.directory, 3)['blocked'], 'Concrete blocker')
+        finally:
+            thread.join()
+        before = self.c.file.read_bytes()
+        self.assertEqual(watch_state(self.c.directory, 0)['blocked'], 'Concrete blocker')
+        self.assertEqual(before, self.c.file.read_bytes())
+        self.assertFalse(list(self.c.directory.glob('tasks/*/*-job.json')))
+
+    def test_focused_context_preserves_every_owned_matrix_clause(self):
+        repo = Path(__file__).resolve().parents[2]
+        spec = (repo / 'docs/migration/NEW_SPEC.md').read_text()
+        matrix = (repo / 'docs/migration/REQUIREMENTS_MATRIX.md').read_text()
+        for task in read_graph(repo):
+            text = focused_context(repo, task, spec)
+            for row in matrix.splitlines():
+                if f'[{task["id"]} AC' in row:
+                    self.assertIn(row, text)
+            if task['id'] == 'T018':
+                self.assertIn(spec, text)
+            else:
+                self.assertLess(len(text), len(spec) + len(matrix))
+        t = dict(self.tasks[0], text=self.tasks[0]['text'])
+        self.assertIn('Documentation smoke', focused_context(self.repo, t, (self.repo / 'docs/migration/NEW_SPEC.md').read_text()))
+
+    def test_reviewer_context_is_read_only_and_evidence_directed(self):
+        self.c.initialize(self.tasks)
+        t = self.tasks[0]
+        r = self.c.prepare(t)
+        r['attempt'] = 1
+        (Path(r['worktree']) / 'docs/smoke-alpha.md').write_text('# Smoke alpha\n\nThis is the alpha orchestration smoke document.\n')
+        self.c.artifact('T001', 'worker-1-result.txt').write_text('Untrusted PASS')
+        self.c.verify_worker(t)
+        with patch.object(self.c, 'launch') as launch:
+            self.c.launch_review(t)
+        prompt = launch.call_args.args[2]
+        self.assertNotIn('Implement only task', prompt)
+        self.assertIn(f'git diff {r["base"]} {r["commit"]}', prompt)
+        self.assertIn('every numbered acceptance criterion', prompt)
+        self.assertIn('Coordinator check evidence', prompt)
+        self.assertIn('instead of rerunning successful checks', prompt)
+
+    def recovery_command(self, *args):
+        config = self.root / 'cli-config.json'
+        atomic(config, self.config)
+        return subprocess.run([sys.executable, str(Path(__file__).with_name('orchestrate.py')),
+            *args, '--repo', str(self.repo), '--state-dir', str(self.c.directory),
+            '--config', str(config), '--approved-execution'], text=True, capture_output=True)
+
+    def test_repair_requires_new_plan_and_retains_review_evidence(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        review = dict(approved=False, findings=['Concrete defect'], criteria=[])
+        r.update(phase='rejected', attempt=1, review=review)
+        self.c.save()
+        findings = 'Retained evidence shows a concrete defect; repair it and test its regression.'
+        result = self.recovery_command('repair', '--task', 'T001', '--findings', findings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.c.file.read_text())
+        record = state['records']['T001']
+        self.assertEqual(record['phase'], 'repair_pending')
+        self.assertEqual(record['prior_review'], review)
+        self.assertEqual(record['repair_history'][0]['review'], review)
+        before = self.c.file.read_bytes()
+        result = self.recovery_command('repair', '--task', 'T001', '--findings', findings)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Repeated repair plan', result.stderr)
+        self.assertEqual(before, self.c.file.read_bytes())
+        self.assertFalse(list(self.c.directory.glob('tasks/*/*-job.json')))
+
+    def test_unchanged_commit_review_retry_is_reasoned_and_bounded(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='review_finished', attempt=1, commit=r['base'])
+        self.c.save()
+        before = self.c.file.read_bytes()
+        result = self.recovery_command('retry-checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('concrete retry reason', result.stderr)
+        self.assertEqual(before, self.c.file.read_bytes())
+        reason = 'Inspected invalid schema output; rerun one independent review.'
+        result = self.recovery_command('retry-checks', '--reason', reason)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.c.file.read_text())
+        state['records']['T001']['phase'] = 'review_finished'
+        atomic(self.c.file, state)
+        before = self.c.file.read_bytes()
+        result = self.recovery_command('retry-checks', '--reason', reason)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Review retry budget exhausted', result.stderr)
+        self.assertEqual(before, self.c.file.read_bytes())
+        self.assertFalse(list(self.c.directory.glob('tasks/*/*-job.json')))
 
     def test_rejected_task_does_not_block_recorded_peer(self):
         self.c.initialize(self.tasks)
@@ -252,6 +381,12 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('runtime pin changes', prompt)
         with self.assertRaisesRegex(Stop, 'existing repair budget'):
             persisted.authorize_repairs('T001', 1, entry['reason'])
+        persisted.state['records']['T001']['attempt'] = 4
+        persisted.save()
+        before = persisted.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'Repeated repair reason'):
+            persisted.authorize_repairs('T001', 1, entry['reason'])
+        self.assertEqual(before, persisted.file.read_bytes())
 
     def test_authorization_rejects_changed_inputs_and_branch(self):
         self.c.initialize(self.tasks)
@@ -270,7 +405,7 @@ class SafetyTests(unittest.TestCase):
     def test_coordinator_interruption_does_not_duplicate_workers(self):
         atomic(self.root/'config.json',self.config)
         harness=self.root/'harness.py'
-        harness.write_text(f'import sys;sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});from orchestrate import *;import json\nc=Coordinator(Path({str(self.repo)!r}),Path({str(self.root/"state")!r}),json.loads(Path({str(self.root/"config.json")!r}).read_text()));c.execute(read_graph(c.repo))\n')
+        harness.write_text(f'import sys;sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});from orchestrate import *;import json\nc=Coordinator(Path({str(self.repo)!r}),Path({str(self.root/"state")!r}),json.loads(Path({str(self.root/"config.json")!r}).read_text()),max_workers=2);c.execute(read_graph(c.repo))\n')
         with patch.dict(os.environ,FAKE_DELAY='2'):
             p=subprocess.Popen([sys.executable,str(harness)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             deadline=time.time()+15
@@ -401,6 +536,35 @@ class SafetyTests(unittest.TestCase):
             self.assertLessEqual(len(group),2)
             if len(group)==2:
                 self.assertFalse(overlap(cfg['scopes'][group[0]['id']],cfg['scopes'][group[1]['id']]))
+
+class UsageTests(unittest.TestCase):
+    def test_multiple_turns_missing_usage_and_partial_logs(self):
+        with tempfile.TemporaryDirectory(prefix='migration-usage-tests-') as temp:
+            root = Path(temp)
+            log = root / 'tasks/T003/worker-1.jsonl'
+            log.parent.mkdir(parents=True)
+            events = [dict(type='thread.started', thread_id='independent-session'),
+                      dict(type='turn.completed', usage=dict(input_tokens=100, cached_input_tokens=80, output_tokens=10, reasoning_output_tokens=3)),
+                      dict(type='turn.completed', usage=dict(input_tokens=50, cached_input_tokens=20, output_tokens=5)),
+                      dict(type='item.completed', item=dict(type='command_execution', aggregated_output='abc'))]
+            log.write_text('\n'.join(json.dumps(e) for e in events) + '\n{partial\n[]\n')
+            result = log_usage(log)
+            self.assertEqual(result['tokens']['input_tokens'], 150)
+            self.assertEqual(result['tokens']['cached_input_tokens'], 100)
+            self.assertEqual(result['uncached_input_tokens'], 50)
+            self.assertEqual(result['tokens']['output_tokens'], 15)
+            self.assertEqual(result['usage_records'], 2)
+            self.assertEqual(result['malformed_lines'], 2)
+            self.assertEqual(result['command_output_bytes'], 3)
+            missing = log.with_name('worker-2.jsonl')
+            missing.write_text('{"type":"turn.completed"}\n')
+            before = {p: p.read_bytes() for p in (log, missing)}
+            report = usage_report(root)
+            self.assertEqual(report['groups'][0]['calls'], 2)
+            self.assertEqual(report['groups'][0]['calls_with_usage'], 1)
+            self.assertIsNone(report['agents'][1]['tokens'])
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+
 
 class BaselineExceptionTests(unittest.TestCase):
     def setUp(self):

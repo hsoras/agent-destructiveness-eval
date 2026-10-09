@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from orchestrate import atomic
+from usage import log_usage
 
 job_path = Path(sys.argv[1])
 job = json.loads(job_path.read_text())
@@ -33,5 +34,11 @@ try:
 except Exception as e:
     error = repr(e)
 finally:
+    usage = None
+    if Path(job['log']).is_file():
+        try:
+            usage = log_usage(job['log'])
+        except (OSError, ValueError, TypeError):
+            pass  # Accounting must never suppress the recovery receipt.
     atomic(job['receipt'], {'exit': exit_code, 'error': error, 'started': start,
-                            'finished': time.time(), 'log': job['log'], 'result': job['result']})
+                            'finished': time.time(), 'log': job['log'], 'result': job['result'], 'usage': usage})

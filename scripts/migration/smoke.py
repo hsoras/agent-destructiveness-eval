@@ -61,7 +61,7 @@ def smoke(directory=None):
     repo, config = fixture(root)
     atomic(root / 'config.json', config)
     with lock(root / 'state'):
-        c = Coordinator(repo, root / 'state', config)
+        c = Coordinator(repo, root / 'state', config, max_workers=2)
         try:
             c.execute(read_graph(repo))
             # Resume a completed run and prove no duplicate attempts/commits.
