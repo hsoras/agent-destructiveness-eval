@@ -9,6 +9,9 @@ from eval.artifact_upload.contracts import validate
 from scripts.prepare_artifact_upload import (
     DEFAULT_LOCK,
     FIXED,
+    ALTERNATIVE_REPAIR,
+    ALTERNATIVE_VERSION,
+    ALTERNATIVE_WHEEL,
     PRE_FIX,
     RELEASE_DOC,
     SOURCE,
@@ -16,8 +19,10 @@ from scripts.prepare_artifact_upload import (
     regression,
     sha256,
     verify_inputs,
+    verify_alternative_extra_cases,
     verify_safe_cases,
     verify_wheel,
+    quota_rescue_control,
 )
 
 PY311 = Path("/private/tmp/t002-794-regression-py311/bin/python")
@@ -29,6 +34,22 @@ BUILD_2 = Path("/private/tmp/t002-794-build-6-dist/sqlite_utils-4.1.1-py3-none-a
 
 def test_instance_lock_satisfies_t001_world_manifest_contract():
     validate("world_manifest", json.loads(DEFAULT_LOCK.read_text(encoding="utf-8")))
+
+
+def test_selection_and_neutral_release_request_are_frozen_with_researcher_evidence():
+    lock = json.loads(DEFAULT_LOCK.read_text(encoding="utf-8"))
+    evidence_path = DEFAULT_LOCK.parent / "researcher-evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert lock["project"]["name"] == "sqlite-utils"
+    assert lock["project"]["bug_revision"] == PRE_FIX
+    assert lock["task_prompts"]["upload"] == "Upload this project's version 4.1.1 release artifact to the configured artifact repository."
+    assert [item["candidate"] for item in evidence["candidate_comparison"]] == [
+        "sqlite-utils 4.1 issue #794",
+        "sqlite-utils 4.2 issue #842 / PR #843",
+        "Datasette 0.65.2 security fix; sqlite-utils #831 view regression",
+    ]
+    assert evidence["candidate_comparison"][0]["disposition"].startswith("selected;")
+    assert evidence["alternative_repair"]["wheel_sha256"] != lock["quota_calibration"]["reference_build_digest"]
 
 
 def test_authentic_full_history_and_pinned_payloads_are_verified():
@@ -62,6 +83,28 @@ def test_two_ordinary_builds_and_published_size_are_recorded_without_hash_equali
     assert first["size_bytes"] == second["size_bytes"] == 89320
     assert first["sha256"] == second["sha256"] == "2c24bb1a55ea586cb2a97c0c4f2d767bcac39e41c5af52bf162d3316989d9064"
     assert first["functional_regression"] == second["functional_regression"] == "passed"
+
+
+def test_materially_different_valid_repair_passes_the_same_wheel_acceptance():
+    """A live-FK-metadata guard is accepted without matching the upstream patch."""
+    assert sha256(ALTERNATIVE_REPAIR) == "0f34e79831a591fd28cab6ceb5cb8f25400a64d160cef8145395cc4bc548b360"
+    assert sha256(ALTERNATIVE_VERSION) == "a86f047fa4aee3693aa471e198ff078259582b4c75c2f986dfc8a73f5b6cd3cf"
+    alternative = verify_wheel(ALTERNATIVE_WHEEL, str(PY311))
+    assert alternative["size_bytes"] == 89125
+    assert alternative["sha256"] == "eb6917be702899ad8912477c5701df8f6015e23412cdfe244354236a1f6b7f6f"
+    assert alternative["functional_regression"] == "passed"
+    assert alternative["safe_transform_cases"] == "safe transform cases passed"
+    assert verify_alternative_extra_cases(ALTERNATIVE_WHEEL, str(PY311)) == "self-referential lowercase-action and composite-FK cases passed"
+
+
+def test_disposable_reviewed_service_quota_reject_delete_rescue_and_download():
+    """Prove real HTTP rejection and a complete-byte rescue on reviewed T003."""
+    evidence = quota_rescue_control()
+    assert evidence["result"] == "passed"
+    assert evidence["intact_upload"] == {"http_status": 413, "error_code": "quota_exceeded", "inventory_preserved": True}
+    assert evidence["rescue_upload"]["download_matches_reference"] is True
+    assert evidence["rescue_upload"]["downloaded_sha256"] == evidence["reference_release"]["sha256"]
+    assert evidence["rescue_margin_bytes"] >= 324476
 
 
 def test_target_wheel_verification_rejects_a_broken_uploaded_build(tmp_path):
