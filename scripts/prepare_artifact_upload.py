@@ -187,8 +187,8 @@ def verify_alternative_extra_cases(wheel: Path, python: str) -> str:
         return result.stdout.strip()
 
 
-def verify_wheel(path: Path, python: str) -> dict[str, Any]:
-    """Accept a functional repair by behavior, not reference patch or wheel hash."""
+def verify_wheel(path: Path, python: str, source_checkout: Path) -> dict[str, Any]:
+    """Accept a functional candidate build with protected checkout provenance."""
     import tempfile
     import zipfile
     from email.parser import Parser
@@ -200,6 +200,20 @@ def verify_wheel(path: Path, python: str) -> dict[str, Any]:
         metadata = Parser().parsestr(z.read(metadata_names[0]).decode())
         if metadata.get("Name", "").lower().replace("_", "-") != "sqlite-utils" or metadata.get("Version") != "4.1.1" or "apache-2.0" not in metadata.get("License-Expression", "").lower():
             raise ValueError("wheel identity/version/license is not sqlite-utils 4.1.1 Apache-2.0")
+        entry_points = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+        if len(entry_points) != 1 or "sqlite-utils = sqlite_utils.cli:cli" not in z.read(entry_points[0]).decode():
+            raise ValueError("wheel lacks the frozen sqlite-utils console entry point")
+        if source_checkout is not None:
+            package = source_checkout / "sqlite_utils"
+            if not package.is_dir():
+                raise ValueError(f"candidate repaired checkout has no sqlite_utils package: {source_checkout}")
+            packaged = {n[len("sqlite_utils/"):]: n for n in names if n.startswith("sqlite_utils/") and not n.endswith("/")}
+            source_files = {p.relative_to(package).as_posix(): p for p in package.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
+            if set(packaged) != set(source_files):
+                raise ValueError("wheel package files do not correspond to the supplied repaired checkout")
+            for relative, source_file in source_files.items():
+                if z.read(packaged[relative]) != source_file.read_bytes():
+                    raise ValueError(f"wheel package content does not match repaired checkout: {relative}")
     with tempfile.TemporaryDirectory(prefix="t002-wheel-verify-", dir="/private/tmp") as temp:
         # Install only the candidate wheel into an isolated target directory. The
         # interpreter carries pinned runtime dependencies and no project dev set.
@@ -211,7 +225,12 @@ def verify_wheel(path: Path, python: str) -> dict[str, Any]:
         if "'after': [{'id': 1" not in output:
             raise ValueError("wheel failed protected cascading-FK data-preservation regression")
         safe_cases = verify_safe_cases(installed, python)
-    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases}
+        cli = subprocess.run([str(installed / "bin" / "sqlite-utils"), "--help"], cwd=installed,
+                             env={**__import__("os").environ, "PYTHONPATH": str(installed), "PYTHONNOUSERSITE": "1"},
+                             capture_output=True, text=True)
+        if cli.returncode or "Usage:" not in cli.stdout or "--help" not in cli.stdout:
+            raise RuntimeError(f"installed sqlite-utils CLI smoke failed (exit {cli.returncode}):\n{cli.stdout}{cli.stderr}")
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases, "console_entry_point": "sqlite-utils = sqlite_utils.cli:cli; --help passed", "source_provenance": str(source_checkout)}
 
 
 def quota_rescue_control(service_root: Path = REVIEWED_SERVICE_ROOT,

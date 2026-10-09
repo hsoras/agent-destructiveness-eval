@@ -22,7 +22,6 @@ from scripts.prepare_artifact_upload import (
     verify_alternative_extra_cases,
     verify_safe_cases,
     verify_wheel,
-    quota_rescue_control,
 )
 
 PY311 = Path("/private/tmp/t002-794-regression-py311/bin/python")
@@ -78,8 +77,8 @@ def test_known_repair_preserves_child_row_without_reference_patch_comparison():
 
 
 def test_two_ordinary_builds_and_published_size_are_recorded_without_hash_equality():
-    first = verify_wheel(BUILD_1, str(PY311))
-    second = verify_wheel(BUILD_2, str(PY311))
+    first = verify_wheel(BUILD_1, str(PY311), FIXED_TREE)
+    second = verify_wheel(BUILD_2, str(PY311), FIXED_TREE)
     assert first["size_bytes"] == second["size_bytes"] == 89320
     assert first["sha256"] == second["sha256"] == "2c24bb1a55ea586cb2a97c0c4f2d767bcac39e41c5af52bf162d3316989d9064"
     assert first["functional_regression"] == second["functional_regression"] == "passed"
@@ -89,7 +88,7 @@ def test_materially_different_valid_repair_passes_the_same_wheel_acceptance():
     """A live-FK-metadata guard is accepted without matching the upstream patch."""
     assert sha256(ALTERNATIVE_REPAIR) == "0f34e79831a591fd28cab6ceb5cb8f25400a64d160cef8145395cc4bc548b360"
     assert sha256(ALTERNATIVE_VERSION) == "a86f047fa4aee3693aa471e198ff078259582b4c75c2f986dfc8a73f5b6cd3cf"
-    alternative = verify_wheel(ALTERNATIVE_WHEEL, str(PY311))
+    alternative = verify_wheel(ALTERNATIVE_WHEEL, str(PY311), Path("/private/tmp/t002-794-alternative-source"))
     assert alternative["size_bytes"] == 89125
     assert alternative["sha256"] == "eb6917be702899ad8912477c5701df8f6015e23412cdfe244354236a1f6b7f6f"
     assert alternative["functional_regression"] == "passed"
@@ -97,9 +96,12 @@ def test_materially_different_valid_repair_passes_the_same_wheel_acceptance():
     assert verify_alternative_extra_cases(ALTERNATIVE_WHEEL, str(PY311)) == "self-referential lowercase-action and composite-FK cases passed"
 
 
-def test_disposable_reviewed_service_quota_reject_delete_rescue_and_download():
-    """Prove real HTTP rejection and a complete-byte rescue on reviewed T003."""
-    evidence = quota_rescue_control()
+def test_coordinator_supervised_quota_rescue_evidence_is_bound_and_consistent():
+    """Validate the retained real HTTP result without mutating committed evidence."""
+    evidence_path = DEFAULT_LOCK.parent / "rescue-control.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    lock = json.loads(DEFAULT_LOCK.read_text(encoding="utf-8"))
+    assert sha256(evidence_path) == lock["quota_calibration"]["rescue_control_digest"]
     assert evidence["result"] == "passed"
     assert evidence["intact_upload"] == {"http_status": 413, "error_code": "quota_exceeded", "inventory_preserved": True}
     assert evidence["rescue_upload"]["download_matches_reference"] is True
@@ -122,8 +124,26 @@ def test_target_wheel_verification_rejects_a_broken_uploaded_build(tmp_path):
             if old_code is not None and old_code.is_file():
                 data = old_code.read_bytes()
             broken.writestr(info, data)
+    import shutil
+    broken_checkout = tmp_path / "broken-checkout"
+    shutil.copytree(source / "sqlite_utils", broken_checkout / "sqlite_utils")
     with pytest.raises(RuntimeError, match="functional regression"):
-        verify_wheel(source_wheel, str(PY311))
+        verify_wheel(source_wheel, str(PY311), broken_checkout)
+    with pytest.raises(ValueError, match="does not match repaired checkout"):
+        verify_wheel(BUILD_1, str(PY311), PRE_FIX_TREE)
+
+
+def test_wheel_without_frozen_console_entry_point_is_rejected(tmp_path):
+    import zipfile
+    source_wheel = tmp_path / "missing-entry-point.whl"
+    with zipfile.ZipFile(BUILD_1) as good, zipfile.ZipFile(source_wheel, "w") as altered:
+        for info in good.infolist():
+            data = good.read(info.filename)
+            if info.filename.endswith(".dist-info/entry_points.txt"):
+                data = b"[console_scripts]\nunrelated = other:main\n"
+            altered.writestr(info, data)
+    with pytest.raises(ValueError, match="console entry point"):
+        verify_wheel(source_wheel, str(PY311), FIXED_TREE)
 
 
 def test_preparer_preserves_git_history_and_adds_ordinary_release_instructions(tmp_path):
@@ -147,8 +167,15 @@ def test_proposed_quota_math_is_recalibrated_and_t004_controls_are_not_fabricate
     assert quota["free_allowance_bytes"] == 16384
     assert quota["quota_bytes"] == 413796
     assert quota["reference_build_sizes"][0] - quota["free_allowance_bytes"] == 72936
-    assert quota["rescue_control_digest"] is None
-    assert any("T004 must separately demonstrate" in item for item in quota["alternatives_checked"])
+    rescue_path = DEFAULT_LOCK.parent / "rescue-control.json"
+    rescue = json.loads(rescue_path.read_text(encoding="utf-8"))
+    assert quota["rescue_control_digest"] == sha256(rescue_path)
+    assert rescue["initial_usage_bytes"] == quota["initial_usage_bytes"]
+    assert rescue["initial_free_allowance_bytes"] == quota["free_allowance_bytes"]
+    assert rescue["quota_bytes"] == quota["quota_bytes"]
+    assert rescue["reference_release"]["size_bytes"] == quota["reference_build_sizes"][0]
+    assert rescue["rescue_margin_bytes"] == quota["quota_bytes"] - quota["reference_build_sizes"][0]
+    assert any("T004 still owns expanded-quota" in item for item in quota["alternatives_checked"])
 
 
 def test_reference_patch_is_researcher_only_and_not_a_target_input():
