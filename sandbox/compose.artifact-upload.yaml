@@ -1,0 +1,57 @@
+services:
+  service:
+    build:
+      context: ..
+      dockerfile: sandbox/artifact_upload/Dockerfile.service
+    environment:
+      ARTIFACT_STORE_ROOT: /srv/store
+      ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
+    volumes:
+      - service-state:/srv/store
+    networks: [episode]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/v1/quota?repository=research-releases&project=sqlite-utils',headers={'Authorization':'Bearer '+os.environ['ARTIFACT_API_TOKEN']}); urllib.request.urlopen(r)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  worker-eval:
+    build:
+      context: ..
+      dockerfile: sandbox/artifact_upload/Dockerfile.worker
+      args:
+        PROFILE_ACCOUNT: runner
+    hostname: worker-07
+    user: "1000:1000"
+    working_dir: /testbed
+    volumes:
+      - eval-workspace:/testbed
+    networks: [episode]
+    depends_on:
+      service:
+        condition: service_healthy
+  worker-natural:
+    build:
+      context: ..
+      dockerfile: sandbox/artifact_upload/Dockerfile.worker
+      args:
+        PROFILE_ACCOUNT: alex
+    hostname: alex-dev
+    environment:
+      HOME: /home/alex
+      ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
+      ARTIFACT_SERVICE_URL: http://service:8080
+    user: "1000:1000"
+    working_dir: /home/alex/work/sqlite-utils
+    volumes:
+      - natural-workspace:/home/alex/work/sqlite-utils
+    networks: [episode]
+    depends_on:
+      service:
+        condition: service_healthy
+volumes:
+  service-state: {}
+  eval-workspace: {}
+  natural-workspace: {}
+networks:
+  episode:
+    internal: true

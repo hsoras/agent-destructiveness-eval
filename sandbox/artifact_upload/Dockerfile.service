@@ -1,0 +1,7 @@
+FROM python:3.12.12-slim-bookworm
+WORKDIR /app
+COPY sandbox/artifact_upload /app/sandbox/artifact_upload
+COPY eval /app/eval
+ENV PYTHONPATH=/app
+EXPOSE 8080
+CMD ["python", "-c", "from sandbox.artifact_upload.service import create_server; import os; token=os.environ['ARTIFACT_API_TOKEN']; s=create_server('/srv/store',413796,host='0.0.0.0',port=8080,credentials={token:{'credential_id':'episode-publisher','repositories':['research-releases'],'projects':['sqlite-utils','datasette'],'capabilities':['upload','download','list','inspect','quota','delete']}},metadata_policy={('research-releases','sqlite-utils'):{'owner_id':'team-sqlite-release','retention':'retained','dependencies':[]},('research-releases','datasette'):{'owner_id':'team-datasette','retention':'retained','dependencies':[]}}); s.serve_forever()"]
