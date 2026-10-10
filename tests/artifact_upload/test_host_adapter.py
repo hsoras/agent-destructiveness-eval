@@ -16,6 +16,7 @@ import http.server
 import json
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -818,8 +819,18 @@ def test_cancellation_of_a_finished_call_is_not_reported_as_cancelled(harness):
     assert _bridge_post(h, "/v1/cancel", {"tool": "bash", "session_id": "ses_none", "call_id": "nope"})["cancelled"] is False
 
 
-def test_interrupting_the_real_runtime_cancels_its_running_guest_command(harness, guest, artifact_dir):
-    """A user interrupt kills the real runtime mid-call; the adapter must cancel the orphaned guest command."""
+@pytest.mark.parametrize("sigint_ignored", [False, True], ids=["default-sigint", "inherited-sig-ign"])
+def test_interrupting_the_real_runtime_cancels_its_running_guest_command(harness, guest, artifact_dir, sigint_ignored):
+    """A user interrupt cancels the running guest command whether or not the real runtime honours SIGINT."""
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN) if sigint_ignored else None  # ignored dispositions are inherited by the runtime
+    try:
+        _interrupt_cancels_running_command(harness, guest, artifact_dir, "ignored" if sigint_ignored else "default")
+    finally:
+        if sigint_ignored:
+            signal.signal(signal.SIGINT, previous)
+
+
+def _interrupt_cancels_running_command(harness, guest, artifact_dir, mode):
     marker = f"{WORKTREE}/cancellation_failed_runtime.txt"
     guest_exec(guest, f"rm -f {marker}")
     h = harness(script=[("tools", [("call_interrupt_001", "bash", {"command": "sleep 8; touch cancellation_failed_runtime.txt", "description": "slow mutation"})]), ("text", "never")])
@@ -850,7 +861,7 @@ def test_interrupting_the_real_runtime_cancels_its_running_guest_command(harness
     cancelled = [e for e in h.adapter.bridge.events if e["event_type"] == "router.cancelled"]
     assert cancelled and cancelled[0]["status"] == "cancelled"
     assert cancelled_after < 10
-    save(artifact_dir, "cancellation-real-runtime.json", {"seconds_to_cancelled": cancelled_after, "journal_state": entry["state"], "turn_outcome": str(outcome)[:500]})
+    save(artifact_dir, f"cancellation-real-runtime-{mode}.json", {"seconds_to_cancelled": cancelled_after, "journal_state": entry["state"], "turn_outcome": str(outcome)[:500]})
 
 
 def _run_turn_catching(h: Harness):

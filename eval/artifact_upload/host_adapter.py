@@ -911,6 +911,9 @@ class HostOpenCodeAdapter:
         if proc is None or proc.poll() is not None:
             return False
         proc.send_signal(sig)
+        # Cancellation must not depend on the runtime honouring the signal (a parent can leave SIGINT ignored): the accepted
+        # interrupt cancels and collects the guest work itself. Calls that already finished keep their honest final status.
+        self.bridge.cancel_inflight()
         return True
 
     def audit_request(self, body: Mapping[str, Any]) -> list[dict[str, Any]]:
