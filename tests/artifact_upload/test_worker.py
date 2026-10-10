@@ -97,12 +97,14 @@ def native_results(native_binary, artifact_dir):
     tarball = _common_root() / ".scenario/migration-readiness/evidence/tmp-preserved-2026-10-09/opencode-8ba2a917.tar.gz"
     if tarball.is_file(): receipts["source_archive_sha256"] = hashlib.sha256(tarball.read_bytes()).hexdigest()
     for variant, cases in ALL_CASES.items():
-        for _attempt in range(2):
+        attempts = []
+        for attempt in range(1):
             scratch = tempfile.mkdtemp(prefix=f"t005-native-{variant}-")
             run = nf.run_native(native_binary, cases, variant, scratch, _free_port(), timeout=900)
-            if len(run["results"]) == len(cases): break
+            attempts.append({**run, "attempt": attempt + 1})
+        assert run["returncode"] == 0, f"native {variant} exited {run['returncode']}: {run['stderr'][-1000:]}"
         assert len(run["results"]) == len(cases), f"native {variant} run incomplete: {run['stderr'][-500:]}"
-        run.pop("requests")
+        run["attempts"] = attempts
         receipts["variants"][variant] = run
     save(artifact_dir, "native-receipts.json", receipts)
     return receipts
@@ -225,6 +227,51 @@ def test_late_io_failure_rolls_back_patch(guest, monkeypatch):
     before = nf.snapshot(str(root))
     res = worker.execute(call("patch", "apply_patch", {"patchText": patch}))
     assert res["status"] == "error" and nf.snapshot(str(root)) == before
+
+
+@pytest.mark.parametrize("patch", [
+    "*** Begin Patch\n*** Update File: a.txt\n*** Move to: link.txt\n@@\n-alpha\n+changed\n*** End Patch",
+    "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+first\n*** Update File: link.txt\n@@\n-alpha\n+second\n*** End Patch",
+])
+def test_patch_rejects_symlink_alias_targets_before_writes(guest, monkeypatch, patch):
+    worker, root, _ = guest
+    target = root / "a.txt"; target.write_text("alpha\n"); (root / "link.txt").symlink_to("a.txt")
+    before = nf.snapshot(str(root)); calls = []
+    from sandbox.artifact_upload.worker import tools
+    real = tools.write_with_dirs
+    monkeypatch.setattr(tools, "write_with_dirs", lambda *args, **kwargs: (calls.append(args[0]), real(*args, **kwargs))[1])
+    result = worker.execute(call("patch", "apply_patch", {"patchText": patch}))
+    assert result["status"] == "error" and calls == []
+    assert nf.snapshot(str(root)) == before
+
+
+def test_patch_rejects_ancestor_destination_conflict_before_writes(guest, monkeypatch):
+    worker, root, _ = guest
+    target = root / "a.txt"; target.write_text("alpha\n"); (root / "link.txt").symlink_to("a.txt")
+    before = nf.snapshot(str(root)); calls = []; unlinks = []
+    from sandbox.artifact_upload.worker import tools
+    real_write, real_unlink = tools.write_with_dirs, tools.os.unlink
+    monkeypatch.setattr(tools, "write_with_dirs", lambda *args, **kwargs: (calls.append(args[0]), real_write(*args, **kwargs))[1])
+    monkeypatch.setattr(tools.os, "unlink", lambda *args, **kwargs: (unlinks.append(args[0]), real_unlink(*args, **kwargs))[1])
+    patch = "*** Begin Patch\n*** Delete File: link.txt\n*** Add File: d/a.txt\n+x\n*** Add File: d\n+y\n*** End Patch"
+    result = worker.execute(call("patch", "apply_patch", {"patchText": patch}))
+    assert result["status"] == "error" and calls == [] and unlinks == []
+    assert nf.snapshot(str(root)) == before
+
+
+def test_late_io_rollback_preserves_symlink_identity(guest, monkeypatch):
+    worker, root, _ = guest
+    (root / "target.txt").write_text("target\n"); (root / "link.txt").symlink_to("target.txt"); (root / "fail.txt").write_text("fail\n")
+    before = nf.snapshot(str(root))
+    from sandbox.artifact_upload.worker import tools
+    real = os.unlink
+    def failing(path, *a, **k):
+        if str(path).endswith("fail.txt"): raise OSError(28, "No space left on device", str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(tools.os, "unlink", failing)
+    patch = "*** Begin Patch\n*** Delete File: link.txt\n*** Delete File: fail.txt\n*** End Patch"
+    result = worker.execute(call("patch", "apply_patch", {"patchText": patch}))
+    assert result["status"] == "error" and nf.snapshot(str(root)) == before
 
 
 def test_boundary_applies_to_every_handler_and_traversal_candidate(tmp_path):
@@ -497,6 +544,21 @@ def test_guest_handlers_git_python_tests_and_http_share_one_filesystem(docker_en
     assert run("read", "read", {"filePath": "/svc-private/index.txt"})["status"] == "error"
     assert run("shell", "bash", {"command": "ls /svc-private"})["status"] == "error"
     save(artifact_dir, "guest-http-and-state-receipts.json", {"http_stdout": http["stdout"], "git": git["stdout"], "diff": diff["stdout"], "uid_check": same_uid["stdout"], "tests": passing["stdout"]})
+
+
+def test_guest_patch_preflight_preserves_aliases_and_overlaps(session, artifact_dir):
+    run = session.run
+    assert run("write", "write", {"filePath": "alias-target.txt", "content": "original\n"})["status"] == "ok"
+    assert run("shell", "bash", {"command": "ln -s alias-target.txt alias-link.txt"})["status"] == "ok"
+    alias_patch = "*** Begin Patch\n*** Update File: alias-target.txt\n*** Move to: alias-link.txt\n@@\n-original\n+changed\n*** End Patch"
+    alias_result = run("patch", "apply_patch", {"patchText": alias_patch})
+    alias_type = run("shell", "bash", {"command": "test -L alias-link.txt && readlink alias-link.txt && cat alias-target.txt"})
+    assert alias_result["status"] == "error" and alias_type["stdout"] == "alias-target.txt\noriginal\n", (alias_result, alias_type)
+    overlap_patch = "*** Begin Patch\n*** Delete File: alias-link.txt\n*** Add File: d/a.txt\n+x\n*** Add File: d\n+y\n*** End Patch"
+    overlap_result = run("patch", "apply_patch", {"patchText": overlap_patch})
+    overlap_state = run("shell", "bash", {"command": "test -L alias-link.txt && test ! -e d && cat alias-target.txt && echo unchanged"})
+    assert overlap_result["status"] == "error" and overlap_state["stdout"] == "original\nunchanged\n", (overlap_result, overlap_state)
+    save(artifact_dir, "guest-patch-preflight.json", {"alias_error": alias_result, "alias_state": alias_type["stdout"], "overlap_error": overlap_result, "overlap_state": overlap_state["stdout"]})
 
 
 def test_guest_identity_arguments_fail_closed_and_host_sentinel_intact(docker_env, artifact_dir, session):

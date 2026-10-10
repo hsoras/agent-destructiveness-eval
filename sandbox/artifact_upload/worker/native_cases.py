@@ -226,7 +226,7 @@ def search_cases() -> list[dict[str, Any]]:
         case("glob-malformed-pattern", "glob", {"pattern": "[abc"}, *tree),
         case("glob-symlinks-not-followed", "glob", {"pattern": "**/*"}, F("real/r.txt", "r", LONG_TIME + 1), L("linkdir", "real"), L("linkfile", "real/r.txt"), FO("o.txt", "o")),
         case("glob-external-symlink-not-listed", "glob", {"pattern": "**/*.txt"}, F("a.txt", "a", LONG_TIME + 1), L("ext.txt", "{OUT}/o.txt"), L("extdir", "{OUT}"), FO("o.txt", "o")),
-        case("glob-limit-100", "glob", {"pattern": "**/*.txt"}, *many, compare="count"),
+        case("glob-limit-100", "glob", {"pattern": "**/*.txt"}, *many, compare="bounded-files"),
         case("grep-basic", "grep", {"pattern": "x"}, *tree),
         case("grep-regex", "grep", {"pattern": "^x = \\d$"}, *tree),
         case("grep-include", "grep", {"pattern": "x", "include": "*.py"}, *tree),
@@ -243,7 +243,7 @@ def search_cases() -> list[dict[str, Any]]:
         case("grep-crlf-lines", "grep", {"pattern": "a"}, FB("c.txt", b"a1\r\na2\r\n")),
         case("grep-unicode", "grep", {"pattern": "caf\u00e9"}, F("u.txt", "caf\u00e9 au lait\n")),
         case("grep-symlinks-not-followed", "grep", {"pattern": "secret"}, FO("s.txt", "secret outside\n"), L("leak.txt", "{OUT}/s.txt"), L("leakdir", "{OUT}"), F("ok.txt", "secret inside\n")),
-        case("grep-limit-100", "grep", {"pattern": "hit"}, *many, compare="count"),
+        case("grep-limit-100", "grep", {"pattern": "hit"}, *many),
         case("grep-mtime-ordering", "grep", {"pattern": "same"}, F("old.txt", "same\nsame\n", LONG_TIME), F("new.txt", "same\n", LONG_TIME + 100), F("mid.txt", "same\n", LONG_TIME + 50)),
     ]
 

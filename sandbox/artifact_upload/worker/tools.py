@@ -765,15 +765,20 @@ class Journal:
     """Pre-mutation snapshots so any late failure restores the exact prior state."""
 
     def __init__(self) -> None:
-        self.entries: list[tuple[str, bytes | None, int | None]] = []
+        self.entries: list[tuple[str, str, bytes | None, int | None]] = []
         self.made_dirs: list[str] = []
 
     def remember(self, path: str) -> None:
         try:
-            st = os.stat(path, follow_symlinks=True)
-            with open(path, "rb") as f: self.entries.append((path, f.read(), st.st_mode & 0o7777))
+            st = os.lstat(path)
+            if os.path.islink(path):
+                self.entries.append((path, "symlink", os.fsencode(os.readlink(path)), st.st_mode & 0o7777))
+                target = os.path.realpath(path)
+                if os.path.exists(target): self.remember(target)
+            else:
+                with open(path, "rb") as f: self.entries.append((path, "file", f.read(), st.st_mode & 0o7777))
         except FileNotFoundError:
-            self.entries.append((path, None, None))
+            self.entries.append((path, "missing", None, None))
 
     def makedirs(self, directory: str) -> None:
         missing, cur = [], directory
@@ -783,10 +788,13 @@ class Journal:
         self.made_dirs.extend(missing)
 
     def rollback(self) -> None:
-        for path, data, mode in reversed(self.entries):
+        for path, kind, data, mode in reversed(self.entries):
             try:
-                if data is None:
+                if kind == "missing":
                     if os.path.lexists(path): os.unlink(path)
+                elif kind == "symlink":
+                    if os.path.lexists(path): os.unlink(path)
+                    os.symlink(os.fsdecode(data), path)
                 else:
                     with open(path, "wb") as f: f.write(data)
                     os.chmod(path, mode)
@@ -812,6 +820,22 @@ def _preflight_write(path: str) -> None:
     anc = _nearest_existing(os.path.dirname(path))
     if not os.path.isdir(anc) or not os.access(anc, os.W_OK | os.X_OK):
         raise ToolError(f"apply_patch verification failed: PermissionDenied: FileSystem.writeFile ({path})", "permission_denied")
+
+
+def _target_identity(path: str) -> str:
+    """Canonicalize existing aliases without forbidding ordinary guest symlinks."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _same_target(left: str, right: str) -> bool:
+    if _target_identity(left) == _target_identity(right): return True
+    try: return os.path.samefile(left, right)
+    except (FileNotFoundError, NotADirectoryError, OSError): return False
+
+
+def _overlap(left: str, right: str) -> bool:
+    a, b = _target_identity(left), _target_identity(right)
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
 
 
 def apply_patch(ctx: Ctx, a: dict) -> str:
@@ -851,13 +875,13 @@ def apply_patch(ctx: Ctx, a: dict) -> str:
             changes.append({"fp": fp, "type": "delete", "bom": bom})
     # Hardening beyond native verification: every target must be writable and
     # unambiguous before the first byte is changed.
-    seen: set[str] = set()
+    planned: list[str] = []
     for c in changes:
         targets = [c["fp"]] if c["type"] != "move" else [c["fp"], c["move"]]
         for t in targets:
-            key = os.path.normpath(t)
-            if key in seen: raise ToolError(f"apply_patch verification failed: duplicate or overlapping patch target: {t}", "patch_failed")
-            seen.add(key)
+            if any(_same_target(t, prior) or _overlap(t, prior) for prior in planned):
+                raise ToolError(f"apply_patch verification failed: duplicate or overlapping patch target: {t}", "patch_failed")
+            planned.append(t)
         if c["type"] in ("add", "update"): _preflight_write(c["fp"])
         elif c["type"] == "move":
             _preflight_write(c["fp"]); _preflight_write(c["move"])

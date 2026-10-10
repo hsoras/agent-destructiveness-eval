@@ -64,6 +64,21 @@ def compare(case: dict[str, Any], native: dict[str, Any], worker: dict[str, Any]
     nt = norm_text(native["output"], *native_paths); wt = norm_text(result_text(worker["result"]), *worker_paths)
     ns = norm_snapshot(native["snapshot"], *native_paths); ws = norm_snapshot(worker["snapshot"], *worker_paths)
     mode = case["compare"]
+    if mode == "bounded-files":
+        lines = [line for line in wt.splitlines() if line]
+        trailer = "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
+        if len(lines) != 101 or lines[-1] != trailer: return ["glob payload has an unexpected row count or truncation trailer"]
+        paths = lines[:-1]
+        expected = {op["path"]: 0 for op in case["setup"] if op["op"] == "write" and op["path"].endswith(".txt")}
+        for op in case["setup"]:
+            if op["op"] == "utime" and op["path"] in expected: expected[op["path"]] = op["mtime"]
+        actual = [p.replace("{ROOT}/", "") for p in paths]
+        if len(actual) != 100 or len(set(actual)) != 100:
+            return [f"expected 100 unique glob paths, got {len(actual)} rows/{len(set(actual))} unique"]
+        keyed = {k.replace("{ROOT}/", ""): v for k, v in expected.items()}
+        if any(p not in keyed for p in actual): return ["glob payload contains a path outside the fixture corpus"]
+        mtimes = [keyed[p] for p in actual]
+        return [] if mtimes == sorted(mtimes, reverse=True) else ["glob payload is not ordered by descending fixture mtime"]
     if mode == "count":
         a, b = nt.split("\n"), wt.split("\n")
         return [] if len(a) == len(b) and a[-1] == b[-1] else [f"count/trailer mismatch native={len(a)} {a[-1]!r} worker={len(b)} {b[-1]!r}"]
