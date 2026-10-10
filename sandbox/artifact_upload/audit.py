@@ -101,6 +101,7 @@ def _need(record: dict, number: int, **kinds) -> None:
 
 def _validate_record(record: dict, number: int) -> None:
     _need(record, number, event_id=_is_text, occurred_at=_is_time)
+    _need(record, number, recorded_at=_is_time)
     kind = record.get("event_type")
     if kind not in KNOWN_EVENT_TYPES:
         raise ValueError(f"unknown audit event type at line {number}")
@@ -116,7 +117,8 @@ def _validate_record(record: dict, number: int) -> None:
     elif kind == "artifact.restoration":
         _need(record, number, object_id=_is_hex64, sha256=_is_hex64,
               original_delete_event_id=_is_text, restore_upload_event_id=_is_text,
-              unavailable_from=_is_time, restored_at=_is_time,
+              original_delete_request_id=_is_text, request_id=_is_text, actor_id=_is_text,
+              original_sha256=_is_hex64, unavailable_from=_is_time, unavailable_until=_is_time, restored_at=_is_time,
               size_bytes=lambda v: _is_int(v) and v >= 0)
     elif kind == "artifact.reservation.acquire":
         _need(record, number, reservation_id=_is_hex32, request_id=_is_text, object_id=_is_hex64,
@@ -306,6 +308,9 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
             problems.append(f"reservation {rid} lacks exactly one acquire event")
             continue
         acq = life["acquire"][0]
+        _need(acq, 0, credential_id=_is_text, object_id=_is_hex64, operation_digest=_is_hex64,
+              key_sha256=_is_hex64, sha256=_is_hex64, request_id=_is_text,
+              size_bytes=lambda v: _is_int(v) and v >= 0)
         if acq["after_reserved"] - acq["before_reserved"] != acq["size_bytes"]:
             raise ValueError("reservation acquire accounting is inconsistent")
         max_reserved = max(max_reserved, acq["after_reserved"])
@@ -319,6 +324,18 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
                 raise ValueError("reservation closed before it was acquired")
             upload_id = terminal[0].get("upload_event_id")
             if upload_id:
+                upload = unique.get(upload_id)
+                if upload is None or upload["event_type"] != "artifact.upload":
+                    raise ValueError("reservation close references missing upload commit")
+                if (upload["request_id"] != acq["request_id"] or upload["object_id"] != acq["object_id"]
+                        or upload["size_bytes"] != acq["size_bytes"] or upload["sha256"] != acq["sha256"]
+                        or upload["actor_id"] != acq["credential_id"]
+                        or upload["operation_digest"] != acq["operation_digest"]):
+                    raise ValueError("reservation lifecycle disagrees with its upload commit")
+                close = terminal[0]
+                for field in ("request_id", "object_id", "size_bytes", "sha256", "credential_id", "operation_digest", "key_sha256"):
+                    if close.get(field) is not None and close[field] != acq.get(field):
+                        raise ValueError(f"reservation close {field} disagrees with acquisition")
                 closed_by_upload[upload_id] = rid
         elif life["release"]:
             state = "release_unknown_awaiting_reconcile"
@@ -364,8 +381,12 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
                 len({delete["sha256"], upload["sha256"], res["sha256"]}) != 1 or \
                 len({delete["size_bytes"], upload["size_bytes"], res["size_bytes"]}) != 1:
             raise ValueError("restoration identity or bytes disagree with referenced commits")
-        if not (delete["occurred_at"] < upload["occurred_at"] <= res["restored_at"]) or \
-                res["unavailable_from"] != delete["occurred_at"]:
+        if (not (delete["occurred_at"] < upload["occurred_at"] <= res["restored_at"])
+                or res["unavailable_from"] != delete["occurred_at"]
+                or res.get("unavailable_until") != upload["occurred_at"]
+                or res.get("original_delete_request_id") != delete["request_id"]
+                or res.get("request_id") != upload["request_id"]
+                or res.get("actor_id") != upload["actor_id"]):
             raise ValueError("restoration timestamps or ordering disagree with referenced commits")
         restored_deletes.add(delete["event_id"])
     transient = []
@@ -412,6 +433,24 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
             continue
         aid = pool[sig].pop(0)
         bound[aid] = op
+        request = attempts[aid].get("proposal") or attempts[aid]["outcome"]
+        if (op.get("actor_id") is not None and op["actor_id"] != request.get("actor_id")
+                and not (op.get("status") in (401, 403) and request.get("actor_id") == "unauthenticated")):
+            raise ValueError("service request actor disagrees with independent receipt")
+        if op["kind"] == "upload" and op.get("project") is not None:
+            for receipt_name, audit_name in (("sha256", "content_sha256"),
+                    ("size_bytes", "content_length"), ("repository", "repository"), ("project", "project"),
+                    ("version", "version"), ("object_path", "object_path")):
+                value = op.get(receipt_name)
+                observed = request.get(audit_name)
+                if value is not None and str(value) != str(observed):
+                    raise ValueError(f"service request {audit_name} disagrees with independent receipt")
+            if op.get("object_id") is not None and op.get("repository") is not None and op.get("project") is not None:
+                derived = derive_object_id(op["repository"], op["project"], op["version"], op["object_path"])
+                if op["object_id"] != derived:
+                    raise ValueError("independent receipt object_id disagrees with its canonical identity")
+        elif op["kind"] == "delete" and op.get("object_id") and not request.get("path", "").endswith("/" + op["object_id"]):
+            raise ValueError("service delete request identity disagrees with independent receipt")
         outcome = attempts[aid].get("outcome")
         if outcome and op["status"] is not None and outcome["status"] != op["status"]:
             raise ValueError("service outcome status disagrees with the retained operation receipt")
@@ -436,6 +475,20 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
         entry = idem.get(key)
         if not isinstance(entry, dict) or entry.get("request_digest") != commit["operation_digest"]:
             raise ValueError("commit operation digest disagrees with storage idempotency identity")
+        if commit["event_type"] == "artifact.upload":
+            rid = closed_by_upload.get(commit["event_id"])
+            acq = lifecycles[rid]["acquire"][0] if rid else None
+            if acq is None:
+                # Missing/unknown close evidence is incomplete, as classified
+                # above; do not turn an unresolved lifecycle into clean success.
+                continue
+            if (op.get("idempotency_key") is not None
+                    and hashlib.sha256(str(op["idempotency_key"]).encode()).hexdigest() != acq["key_sha256"]):
+                raise ValueError("reservation idempotency key disagrees with independent operation")
+            for field, expected in (("repository", op.get("repository")), ("project", op.get("project")),
+                    ("version", op.get("version")), ("object_path", op.get("object_path"))):
+                if expected is not None and acq.get(field) != expected:
+                    raise ValueError(f"reservation {field} disagrees with independent operation")
         for name in ("object_id", "size_bytes", "sha256", "actor_id"):
             if op.get(name) is not None and op[name] != commit[name]:
                 raise ValueError(f"commit {name} disagrees with the retained operation")
@@ -454,9 +507,23 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
             original = key_commit.get(key)
             if original is None:
                 problems.append(f"successful mutation {aid} lacks a matching durable commit")
-            elif op.get("object_id") not in (None, original["object_id"]):
-                raise ValueError("replay references a different committed object")
             else:
+                if op.get("object_id") != original["object_id"]:
+                    raise ValueError("replay references a different committed object")
+                req = attempts[aid].get("proposal") or attempts[aid]["outcome"]
+                original_req = bound.get(original["request_id"])
+                if original_req is None:
+                    raise ValueError("replay original has no independently retained operation")
+                if op.get("actor_id") != original["actor_id"] or req.get("actor_id") != original["actor_id"]:
+                    raise ValueError("replay actor differs from original committed operation")
+                if (op.get("sha256") != original["sha256"] or op.get("size_bytes") != original["size_bytes"]
+                        or op.get("object_id") != original["object_id"]):
+                    raise ValueError("replay bytes or canonical object identity differ from original commit")
+                for field in ("repository", "project", "version", "object_path"):
+                    if op.get(field) != original_req.get(field):
+                        raise ValueError(f"replay canonical identity {field} differs from original operation")
+                if idem.get(key, {}).get("request_digest") != original["operation_digest"]:
+                    raise ValueError("replay storage identity digest differs from original commit")
                 replays.append({"attempt_id": aid, "original_commit": original["event_id"]})
         elif status is None and key in idem and key not in key_commit:
             problems.append(f"dropped request {aid} committed in storage without audit commit")

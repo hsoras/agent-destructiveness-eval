@@ -176,6 +176,22 @@ def test_replay_must_reference_an_original_commit(tmp_path):
     assert not_verified(path, manifest_of(case))
 
 
+def test_replay_attempt_facts_must_match_independent_receipt_and_original_commit(tmp_path):
+    _, case = make_basic_run(tmp_path)
+    manifest = manifest_of(case)
+    uploads = [o for o in manifest["operations"] if o["kind"] == "upload" and o["idempotency_key"] == "k1"]
+    commit = next(c for c in audit_commits(case) if c["event_type"] == "artifact.upload" and c["size_bytes"] == 13)
+    replay = next(o for o in uploads if o["request_id"] != commit["request_id"])
+    rows = rows_of(case)
+    proposal = next(r for r in rows if r["event_type"] == "service.request" and r["phase"] == "proposal"
+                    and r["request_id"] == replay["request_id"])
+    for row in rows:
+        if row.get("attempt_id") == proposal["attempt_id"]:
+            row["actor_id"], row["content_sha256"], row["content_length"] = "other", "f" * 64, "1"
+    with pytest.raises(ValueError, match="actor|content_sha256|content_length"):
+        verify_audit(tampered(case, tmp_path, lambda _: rows), manifest=manifest)
+
+
 @pytest.mark.parametrize("content", [b"", b"{}\n", b"[]\n", b'{"audit_schema":"artifact-audit.v1"}\n',
     b'{"audit_schema":"artifact-audit.v1","event_type":"mystery","event_id":"x","occurred_at":1}\n',
     b'{"audit_schema":"artifact-audit.v1","event_type":"artifact.upload","event_id":"x","occurred_at":-1}\n',
@@ -223,6 +239,18 @@ def test_altered_facts_under_a_reused_event_id_fail_closed(tmp_path):
             verify_audit(path, manifest=manifest_of(case))
 
 
+def test_missing_or_malformed_delivery_observation_time_fails_closed(tmp_path):
+    _, case = make_basic_run(tmp_path)
+    for missing in (True, False):
+        def strip(rows):
+            for row in rows:
+                if missing: row.pop("recorded_at", None)
+                else: row["recorded_at"] = "unknown"
+            return rows
+        with pytest.raises(ValueError, match="recorded_at"):
+            verify_audit(tampered(case, tmp_path, strip), manifest=manifest_of(case))
+
+
 def test_reused_request_phase_identity_fails_closed(tmp_path):
     _, case = make_basic_run(tmp_path)
     proposal = next(r for r in rows_of(case) if r["event_type"] == "service.request" and r["phase"] == "proposal")
@@ -259,6 +287,15 @@ def test_open_or_unknown_release_is_not_a_complete_close_and_reconcile_closes_it
     assert verify_audit(path, manifest=manifest_of(case))["status"] == "verified"
     with pytest.raises(ValueError, match="closed more than once"):
         verify_audit(tampered(case, tmp_path, lambda rs: rs + [reconcile]), manifest=manifest_of(case))
+
+
+def test_reservation_acquire_facts_must_bind_to_authoritative_upload(tmp_path):
+    _, case = make_basic_run(tmp_path)
+    rows = rows_of(case)
+    acquire = next(r for r in rows if r["event_type"] == "artifact.reservation.acquire")
+    acquire.update(object_id="f" * 64, size_bytes=1, after_reserved=acquire["before_reserved"] + 1)
+    with pytest.raises(ValueError, match="reservation lifecycle disagrees"):
+        verify_audit(tampered(case, tmp_path, lambda _: rows), manifest=manifest_of(case))
 
 
 def test_unbound_observations_are_not_deduplicated_by_expected_stable_ids(tmp_path):
@@ -348,6 +385,36 @@ def test_failure_keeps_partial_evidence_and_still_resets_with_full_snapshots(tmp
     assert reset["initial_invariant_sha256"] == reset["final_invariant_sha256"]
     assert reset["explained_differences"]["created_at"] and reset["final_snapshot"]["objects"]
     assert entry["audit"]["status"] == "verified"  # restoration recorded only after the real restore
+
+
+def test_restoration_interval_and_delete_request_lineage_are_checked(tmp_path):
+    def body(case):
+        oid = seeded(case)
+        case.delete(oid, "restoration-lineage-delete")
+        controls.restore_protected(case, oid, PROTECTED)
+    entry, case = run(tmp_path, body)
+    assert entry["status"] == "passed", entry.get("failure") or entry["audit"]
+    rows = rows_of(case)
+    restoration = next(r for r in rows if r["event_type"] == "artifact.restoration")
+    restoration["unavailable_until"] = restoration["unavailable_from"] - 100
+    restoration["original_delete_request_id"] = "wrong-request"
+    with pytest.raises(ValueError, match="restoration timestamps or ordering"):
+        verify_audit(tampered(case, tmp_path, lambda _: rows), manifest=manifest_of(case))
+
+
+def test_failed_final_download_exports_prior_http_receipts_and_partial_manifest(tmp_path):
+    def body(case):
+        oid = seeded(case)
+        case.delete(oid, "partial-export-delete")
+        def unavailable(_): raise RuntimeError("injected final inventory download outage")
+        case.snap = unavailable
+    entry, case = run(tmp_path, body)
+    assert entry["status"] == "incomplete"
+    receipts = json.loads((case.dir / "receipts.json").read_text())
+    manifest = json.loads((case.dir / "manifest.json").read_text())
+    assert len(receipts) >= 14
+    assert manifest["completeness"] == "partial" and manifest["inventory"] == {}
+    assert any(r["method"] == "DELETE" and r["status"] == 200 for r in receipts)
 
 
 def test_reset_is_unknown_when_restoration_cannot_complete(tmp_path):

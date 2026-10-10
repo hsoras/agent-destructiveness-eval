@@ -80,6 +80,10 @@ class ControlFailure(Exception):
 class Receipts(list):
     """Independently retained client-side operation receipts."""
 
+    def __init__(self, on_add=None):
+        super().__init__()
+        self.on_add = on_add
+
     def add(self, method, path, headers, data, status, raw, rheaders, request_id, *, dropped=False):
         kind, oid = "read", None
         if method == "POST" and path == "/v1/objects":
@@ -108,6 +112,10 @@ class Receipts(list):
             receipt["sha256"] = headers.get("Content-SHA256")
             declared = headers.get("Content-Length")
             receipt["size_bytes"] = int(declared) if declared and declared.isdecimal() else None
+            receipt["repository"] = headers.get("X-Repository", REPOSITORY)
+            receipt["project"] = headers.get("X-Project")
+            receipt["version"] = headers.get("X-Version")
+            receipt["object_path"] = headers.get("X-Object-Path")
             receipt["object_id"] = ((body or {}).get("body") or {}).get("object_id") if isinstance(body, dict) else None
             if receipt["object_id"] is None and headers.get("X-Project"):
                 receipt["object_id"] = object_id_of(headers.get("X-Repository", ""), headers["X-Project"],
@@ -115,6 +123,8 @@ class Receipts(list):
         elif kind == "delete":
             receipt["object_id"] = oid
         self.append(receipt)
+        if self.on_add:
+            self.on_add(self)
         return receipt
 
 
@@ -383,13 +393,20 @@ class Case:
         self.label, self.dir, self.quota, self.owner_id, self.entry, self.save = label, directory, quota, owner_id, entry, save
         self.root = directory / "volume"
         self.audit_path = directory / "volume.audit.jsonl"
-        self.receipts = Receipts()
+        self.receipts = Receipts(self.persist_receipts)
         self.settings = service_settings(quota, owner_id)
         self.settings_sha256 = settings_sha(self.settings)
         self.sink = FlakySink(AppendOnlyAudit(self.audit_path)) if flaky else None
         self.handler = handler
         self.server = self.thread = None
         self.errors: list = []
+
+    def persist_receipts(self, receipts=None):
+        """Durably checkpoint client observations as soon as each exchange completes."""
+        path = self.dir / "receipts.json"
+        path.write_text(json.dumps(list(self.receipts if receipts is None else receipts), sort_keys=True, indent=1) + "\n")
+        path.chmod(0o600)
+        self.save()
 
     def start(self):
         self.server, self.thread = new_service(self.root, self.quota, self.owner_id, audit=self.sink, handler=self.handler)
@@ -475,7 +492,8 @@ def live_settings_sha(case):
 
 def build_manifest(case, inventory, storage):
     ops = [{k: r.get(k) for k in ("method", "path", "request_id", "idempotency_key", "status", "kind", "object_id",
-                                  "size_bytes", "sha256", "actor_id", "error_code", "dropped")} for r in case.receipts]
+                                  "size_bytes", "sha256", "actor_id", "repository", "project", "version", "object_path",
+                                  "error_code", "dropped")} for r in case.receipts]
     return {"operations": ops, "storage": {k: storage[k] for k in ("idempotency", "outbox", "reservations", "staging_files", "object_files")},
             "inventory": {oid: {"size_bytes": s["download_size_bytes"], "sha256": s["download_sha256"], "downloaded": True}
                           for oid, s in inventory["objects"].items()}}
@@ -591,6 +609,17 @@ def finalize_audit(case):
     """Quiesce the service, then reconcile audit against independent final inputs."""
     block = case.entry["audit"] = {"status": "unknown"}
     case.save()
+    # Export honest partial independent inputs before inventory/download/reset can fail.
+    try:
+        case.persist_receipts()
+        partial = {"completeness": "partial", "operations": build_manifest(case, {"objects": {}},
+            storage_view(case))["operations"], "storage": {k: storage_view(case)[k] for k in
+            ("idempotency", "outbox", "reservations", "staging_files", "object_files")}, "inventory": {}}
+        mpath = case.dir / "manifest.json"
+        mpath.write_text(json.dumps(partial, sort_keys=True, indent=1) + "\n"); mpath.chmod(0o600)
+        block["partial_manifest_sha256"] = file_sha(mpath)
+    except Exception as exc:
+        block["partial_export_error"] = f"{type(exc).__name__}: {exc}"
     try:
         inv = inventory_snapshot(case) if case.server is not None else None
         case.stop()
@@ -604,6 +633,12 @@ def finalize_audit(case):
         block["receipts_sha256"] = file_sha(case.dir / "receipts.json")
     except Exception as exc:
         block.update({"status": "unknown", "error": f"{type(exc).__name__}: {exc}"})
+        # Keep all completed HTTP exchanges and the partial manifest if final
+        # inventory/download or a later reconciliation step failed.
+        try:
+            case.persist_receipts()
+        except Exception as export_exc:
+            block["receipt_export_error"] = f"{type(export_exc).__name__}: {export_exc}"
     finally:
         case.stop(); case.save()
     return block
