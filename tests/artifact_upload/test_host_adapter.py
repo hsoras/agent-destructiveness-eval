@@ -47,7 +47,6 @@ from eval.artifact_upload.host_adapter import (
 )
 
 REPO = Path(__file__).resolve().parents[2]
-SUFFIX = "t008-sonnet-" + uuid.uuid4().hex[:8]
 WORKTREE = "/testbed"  # eval-looking profile worktree frozen in the instance lock
 GUEST_UID = 1000
 BASE_COMMIT = "750f4480b573dfd3a5e0f4e930c3617136758e35"
@@ -176,64 +175,25 @@ def _docker(*args: str, check: bool = True, timeout: int = 600) -> subprocess.Co
     return proc
 
 
-WORKER_LAYER = """FROM {base}
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/* \\
- && python -m pip install --no-cache-dir --break-system-packages jsonschema==4.26.0
-COPY eval/artifact_upload /opt/worker/eval/artifact_upload
-COPY sandbox/artifact_upload/worker /opt/worker/sandbox/artifact_upload/worker
-RUN printf '' > /opt/worker/eval/__init__.py && printf '' > /opt/worker/sandbox/__init__.py && printf '' > /opt/worker/sandbox/artifact_upload/__init__.py \\
- && chown -R root:root /opt/worker && chmod -R a+rX /opt/worker
-USER runner
-WORKDIR /workspace
-"""
-
-
-def _layers(image: str) -> list[str]:
-    return json.loads(_docker("image", "inspect", image).stdout)[0]["RootFS"]["Layers"]
-
-
 @pytest.fixture(scope="session")
 def guest(artifact_dir):
-    """Start a real T007 eval-looking episode from the lock-pinned image digest plus the T005 worker layer.
-
-    T007's common image has no worker, ripgrep or jsonschema; this fixture adds exactly those as one extra
-    layer on top of the pinned digest (cross-owner change proposed in HANDOFF.md) and proves the pinned layers are
-    an unchanged prefix of the image the episode runs.
-    """
+    """Start the default T007 episode on the exact production image in the lock."""
     assert shutil.which("docker"), "required prerequisite missing: docker CLI"
     lock = json.loads(lifecycle.INSTANCE.read_text())
     profile = next(p for p in lock["guest_profiles"] if p["condition"] == "eval-looking")
     pinned = profile["image_digest"]
-    present = _docker("image", "inspect", pinned, check=False)
-    assert present.returncode == 0, f"locked guest image {pinned} is not present locally; build it with Episode.build_common_image"
-    base_tag, derived = f"artifact-{SUFFIX}-pinned:base", f"artifact-{SUFFIX}-guest:worker"
-    _docker("tag", pinned, base_tag)
-    context = artifact_dir / f"{SUFFIX}-guest-context"
-    shutil.rmtree(context, ignore_errors=True)
-    shutil.copytree(REPO / "eval/artifact_upload", context / "eval/artifact_upload", ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copytree(REPO / "sandbox/artifact_upload/worker", context / "sandbox/artifact_upload/worker", ignore=shutil.ignore_patterns("__pycache__"))
-    (context / "Dockerfile").write_text(WORKER_LAYER.format(base=base_tag))
-    proc = subprocess.run(["docker", "build", "--tag", derived, str(context)], capture_output=True, text=True, timeout=1800)
-    save(artifact_dir, "docker-build.log", proc.stdout + "\n" + proc.stderr)
-    assert proc.returncode == 0, proc.stderr[-3000:]
-    shutil.rmtree(context, ignore_errors=True)
-    pinned_layers = _layers(pinned)
-    assert _layers(derived)[: len(pinned_layers)] == pinned_layers, "the worker layer must sit on top of the unchanged pinned digest"
-    episode = lifecycle.Episode("eval-looking", "t008-" + uuid.uuid4().hex[:10], artifact_dir / "t007-episode", common_image=derived)
+    episode = lifecycle.Episode("eval-looking", "t008-" + uuid.uuid4().hex[:10], artifact_dir / "t007-episode")
     try:
         resources = episode.start()
         name = resources["worker_container"]
+        assert resources["common_image"]["id"] == pinned
+        assert resources["common_image"]["frozen_pin_completed"] is True
         assert resources["worker_identity"]["uid"] == GUEST_UID and resources["worker_identity"]["worktree"] == WORKTREE
-        _docker("exec", name, "sh", "-c", f"mkdir -p src && printf 'def answer():\\n    return 41\\n' > src/app.py && printf 'alpha\\nbeta\\ngamma\\n' > notes.txt")
-        save(artifact_dir, "guest-profile.json", {"pinned_digest": pinned, "derived_image": derived, "derived_id": json.loads(_docker("image", "inspect", derived).stdout)[0]["Id"],
-                                                  "project": episode.project, "profile": resources["profile_manifest"], "worker_identity": resources["worker_identity"]})
+        _docker("exec", name, "sh", "-c", "mkdir -p src && printf 'def answer():\\n    return 41\\n' > src/app.py && printf 'alpha\\nbeta\\ngamma\\n' > notes.txt")
+        save(artifact_dir, "guest-profile.json", resources)
         yield {"name": name, "profile": resources["profile_manifest"], "episode": episode, "pinned_digest": pinned}
     finally:
-        try:
-            episode.cleanup()
-        finally:
-            _docker("rmi", f"{episode.project}-service:latest", derived, base_tag, check=False)
+        episode.cleanup()
 
 
 def guest_exec(guest, command: str) -> subprocess.CompletedProcess:
@@ -333,9 +293,11 @@ def test_core_routes_run_in_guest_before_native_execution_and_host_sentinels_unt
             ("call_read_001", "read", {"filePath": f"{WORKTREE}/notes.txt", "offset": 2, "limit": 1}),
             ("call_edit_001", "edit", {"filePath": f"{WORKTREE}/src/app.py", "oldString": "return 41", "newString": "return 42"}),
             ("call_glob_001", "glob", {"pattern": "src/**/*.py"}),
-            ("call_grep_001", "grep", {"pattern": "return 4", "path": f"{WORKTREE}/src"}),
             ("call_todo_001", "todowrite", {"todos": [{"content": "finish", "status": "pending", "priority": "high"}]}),
         ]),
+        # Calls within one provider response may run concurrently. Read the edited
+        # file only in the next tool round, after the edit result has returned.
+        ("tools", [("call_grep_001", "grep", {"pattern": "return 4", "path": f"{WORKTREE}/src"})]),
         ("text", "CORE_DONE"),
     ]
     h = harness(script=script)
