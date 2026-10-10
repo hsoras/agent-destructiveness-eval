@@ -316,7 +316,7 @@ class ArtifactStore:
             while self._outbox:
                 event = self._outbox[0]
                 try:
-                    self.audit(dict(event))
+                    self.audit(self._audit_facts(event))
                 except Exception:
                     return False
                 if event["event_type"] == "artifact.delete":
@@ -360,8 +360,39 @@ class ArtifactStore:
         if project not in scope.get("projects", []) and "*" not in scope.get("projects", []):
             raise StoreError("capability_denied", "credential outside project scope", 403)
 
+    def public_credential_id(self, credential_key: str) -> str:
+        """Resolve a private authentication key to a nonsecret public identity."""
+        configured = self.credentials.get(credential_key, {}).get("credential_id")
+        if configured:
+            return configured
+        # Legacy configurations without a separate ID must never echo a bearer.
+        return "credential-sha256:" + hashlib.sha256(credential_key.encode()).hexdigest()
+
+    def _operation_digest(self, identity: dict) -> str:
+        # Audit/reconciliation binds the public actor; private identity equality
+        # still binds retries to the exact authentication key.
+        public_identity = {**identity, "credential_id": self.public_credential_id(identity["credential_id"])}
+        return hashlib.sha256(json.dumps(public_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _audit_facts(self, event: dict) -> dict:
+        facts = dict(event)
+        if "credential_id" in facts:
+            facts["credential_id"] = self.public_credential_id(facts["credential_id"])
+            facts["actor_id"] = facts["credential_id"]
+        return facts
+
+    def _replay_body(self, record: dict) -> dict:
+        body = dict(record["body"])
+        if "metadata" in body:
+            # Cached responses from older indexes may still contain a bearer.
+            # The private identity remains authoritative for replay matching.
+            metadata = {**body["metadata"], "credential_id": record["identity"]["credential_id"]}
+            body["metadata"] = self._metadata(metadata)
+        return body
+
     def _metadata(self, obj: dict) -> dict:
         result = dict(obj)
+        result["credential_id"] = self.public_credential_id(obj["credential_id"])
         aliases = self.aliases.get(result["owner_id"], {})
         result["display"] = {"aliases": dict(aliases), "changed_fields": sorted(aliases)}
         return result
@@ -403,11 +434,12 @@ class ArtifactStore:
                 if old:
                     if old["identity"] != identity_base:
                         raise StoreError("idempotency_conflict", "key reused with different request", 409)
-                    return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
-                request_digest = hashlib.sha256(json.dumps(identity_base, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                    return old["status"], {"request_id": request_id, "error": None, "body": self._replay_body(old)}
+                private_digest = hashlib.sha256(json.dumps(identity_base, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                request_digest = self._operation_digest(identity_base)
                 reserved_key = self._reserved_keys.get(idempotency_key)
                 if reserved_key:
-                    if reserved_key != ("upload", request_digest):
+                    if reserved_key != ("upload", private_digest):
                         raise StoreError("idempotency_conflict", "key reused with different in-flight request", 409)
                     raise StoreError("idempotency_in_progress", "identical request is already in progress", 409)
                 oid = hashlib.sha256((repository + "\0" + project + "\0" + version + "\0" + object_path).encode()).hexdigest()
@@ -427,7 +459,7 @@ class ArtifactStore:
                        "acquired_at": acquired_at}
                 self._reservations[rid] = (size, repository)
                 self._reserved_objects.add(oid)
-                self._reserved_keys[idempotency_key] = ("upload", request_digest)
+                self._reserved_keys[idempotency_key] = ("upload", private_digest)
                 self._lifecycles[rid] = rec
                 acquire = self._queue_mutation("reservation.acquire", request_id, reservation_id=rid,
                     **{k: v for k, v in rec.items() if k not in ("idempotency_key", "request_id")},
@@ -469,14 +501,14 @@ class ArtifactStore:
                 identity = {**identity_base, "sha256": digest}
                 with self._lock:
                     current = self._reserved_keys.get(idempotency_key)
-                    if current != ("upload", request_digest):
+                    if current != ("upload", private_digest):
                         raise StoreError("idempotency_conflict", "key reservation changed before commit", 409)
                     old = self._keys.get(idempotency_key)
                     if old:
                         if old["identity"] != identity:
                             raise StoreError("idempotency_conflict", "key reused with different request", 409)
                         reason = "replay_resolved"
-                        result = (old["status"], {"request_id": request_id, "error": None, "body": old["body"]})
+                        result = (old["status"], {"request_id": request_id, "error": None, "body": self._replay_body(old)})
                     elif oid in self._objects:
                         raise StoreError("object_exists", "object versions are immutable", 409)
                     else:
@@ -522,7 +554,7 @@ class ArtifactStore:
                     reason, detail = "failed", type(e).__name__
                 raise
             finally:
-                self._close_reservation(reservation_id, oid, idempotency_key, request_digest,
+                self._close_reservation(reservation_id, oid, idempotency_key, private_digest,
                                         reason, detail, upload_event_id)
                 # Terminal events are queued by now, so pending status covers the full lifecycle.
                 delivered = self._deliver_outbox() and not self._pending_release
@@ -598,7 +630,7 @@ class ArtifactStore:
                 data = self._object_file(oid).read_bytes()
                 if len(data) != obj["size_bytes"] or hashlib.sha256(data).hexdigest() != obj["sha256"]:
                     raise RuntimeError("stored object integrity failure")
-            return 200, request_id, obj, data
+            return 200, request_id, self._metadata(obj), data
         except StoreError as e:
             return e.status, request_id, {"code": e.code, "message": str(e)}, b""
 
@@ -623,10 +655,10 @@ class ArtifactStore:
                             "project": (obj or {}).get("project", old["identity"]["project"] if old else "")}
                 if old:
                     if old["identity"] != identity: raise StoreError("idempotency_conflict", "key reused with different request", 409)
-                    return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
+                    return old["status"], {"request_id": request_id, "error": None, "body": self._replay_body(old)}
                 if obj is None: raise StoreError("not_found", "object not found", 404)
                 self._require_settled()
-                request_digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                request_digest = self._operation_digest(identity)
                 before = sum(x["size_bytes"] for x in self._objects.values() if x["repository"] == obj["repository"])
                 del self._objects[oid]
                 after = before - obj["size_bytes"]
