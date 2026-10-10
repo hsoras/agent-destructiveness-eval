@@ -183,7 +183,13 @@ class ExecutionBroker:
         with self._lock:
             entry = self.journal.get(key)
             if entry is None or entry["state"] != "running":
-                return self.reconcile(call)
+                result = self.reconcile(call)
+                # Reconciliation may recover a live execution after a lost
+                # acknowledgement. Carry this cancellation through that state
+                # change instead of requiring the caller to cancel again.
+                entry = self.journal.get(key)
+                if entry["state"] != "running":
+                    return result
             if not self.worker.cancel(key, how=how):
                 return self.reconcile(call)
         deadline = time.monotonic() + 5

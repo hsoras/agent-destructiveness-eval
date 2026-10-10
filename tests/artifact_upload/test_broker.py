@@ -111,11 +111,15 @@ def test_restart_reconciles_live_handle_and_unknown_never_redelivers(broker, mon
 
 
 @pytest.mark.parametrize("restart", [False, True])
-def test_lost_start_ack_reconciles_by_execution_key_without_replay(broker, monkeypatch, restart):
+@pytest.mark.parametrize("evidence_state", ["running", "completed", "unavailable"])
+@pytest.mark.parametrize("consumer", ["execute", "reconcile", "cancel"])
+def test_lost_ack_recovery_consumers(broker, monkeypatch, restart, evidence_state, consumer):
     host, worker, tmp_path = broker
-    request = call("shell", {"command": "printf once >> count; printf completed"}, "lost-ack")
-    real_start = worker.start
-    starts = []
+    command = "printf once >> count; " + ("printf completed" if evidence_state == "completed" else "sleep 30")
+    request = call("shell", {"command": command}, "lost-ack")
+    key = host._key(request)
+    real_start, real_status, real_cancel = worker.start, worker.status, worker.cancel
+    starts, cancellations = [], []
 
     def lost_ack(value):
         handle = real_start(value)
@@ -124,29 +128,79 @@ def test_lost_start_ack_reconciles_by_execution_key_without_replay(broker, monke
             raise ConnectionError("worker launched command, start response lost")
         return handle
 
+    def unavailable(_key):
+        raise ConnectionError("temporary status outage")
+
+    def counted_cancel(value, *, how="terminate"):
+        cancellations.append((value, how))
+        return real_cancel(value, how=how)
+
     monkeypatch.setattr(worker, "start", lost_ack)
-    assert host.execute(request)["status"] == "unknown"
-    deadline = time.monotonic() + 4
-    while True:
-        evidence = worker.status(host._key(request))
-        if evidence["state"] == "completed":
-            break
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-    assert evidence["result"]["status"] == "ok"
-    assert evidence["result"]["stdout"] == "completed"
-    if restart:
-        host = ExecutionBroker("r1", worker, str(tmp_path / "private" / "journal.jsonl"))
+    monkeypatch.setattr(worker, "status", unavailable)
+    monkeypatch.setattr(worker, "cancel", counted_cancel)
+    try:
+        assert host.execute(request)["status"] == "unknown"
+        assert host.journal.get(key)["state"] == "unknown"
+        deadline = time.monotonic() + 4
+        while not (tmp_path / "guest" / "count").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        if restart:
+            host = ExecutionBroker("r1", worker, str(tmp_path / "private" / "journal.jsonl"))
+        assert host.execute(request)["status"] == "unknown"
+        assert len(starts) == 1
 
-    assert host.reconcile(request) == evidence["result"]
-    assert host.execute(request) == evidence["result"]
-    assert len(starts) == 1
-    assert (tmp_path / "guest" / "count").read_text() == "once"
+        if evidence_state != "unavailable":
+            monkeypatch.setattr(worker, "status", real_status)
+        if evidence_state == "completed":
+            deadline = time.monotonic() + 4
+            while real_status(key)["state"] != "completed":
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        else:
+            assert real_status(key)["state"] == "running"
 
-    # A different call ID remains independent after recovering the uncertain call.
-    distinct = call("shell", {"command": "printf another >> count; printf next"}, "distinct-after-lost-ack")
-    assert host.execute(distinct)["stdout"] == "next"
-    assert (tmp_path / "guest" / "count").read_text() == "onceanother"
+        result = getattr(host, consumer)(request)
+        if evidence_state == "unavailable":
+            assert result["status"] == "unknown"
+            assert host.journal.get(key)["state"] == "unknown"
+            assert host.execute(request) == result
+            assert cancellations == []
+            assert real_status(key)["state"] == "running"
+        else:
+            if evidence_state == "running":
+                if consumer != "cancel":
+                    assert result["status"] == "unknown"
+                    assert host.journal.get(key)["state"] == "running"
+                    result = host.cancel(request)
+                assert cancellations == [(key, "terminate")]
+                assert result["status"] == "cancelled"
+                assert host.journal.get(key)["state"] == "cancelled"
+            else:
+                assert result["status"] == "ok"
+                assert result["stdout"] == "completed"
+                assert host.journal.get(key)["state"] == "completed"
+                assert cancellations == []
+            assert real_status(key)["state"] == "completed"
+            assert result == real_status(key)["result"]
+            assert host.execute(request) == result
+            assert host.reconcile(request) == result
+            before = list(cancellations)
+            assert host.cancel(request) == result
+            assert cancellations == before
+        assert len(starts) == 1
+        assert (tmp_path / "guest" / "count").read_text() == "once"
+        if evidence_state == "completed":
+            # Preserve independent delivery after recovering an uncertain call.
+            distinct = call("shell", {"command": "printf another >> count; printf next"}, "distinct-after-lost-ack")
+            assert host.execute(distinct)["stdout"] == "next"
+            assert (tmp_path / "guest" / "count").read_text() == "onceanother"
+    finally:
+        real_cancel(key, how="kill")
+        deadline = time.monotonic() + 4
+        while real_status(key)["state"] != "completed":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
 
 
 def test_uncertain_after_worker_loss_is_unknown_and_cancel_kills_process_group(broker, monkeypatch, tmp_path):
