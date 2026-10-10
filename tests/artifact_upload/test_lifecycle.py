@@ -35,12 +35,85 @@ def test_compose_config_has_private_network_and_disjoint_state_volumes(tmp_path)
         cwd=lifecycle.ROOT, text=True, capture_output=True,
         env={**__import__("os").environ, "ARTIFACT_API_TOKEN": "fixture-api-only-token"},
     )
-    if result.returncode and "permission denied" in result.stderr.lower():
-        pytest.skip(f"Docker daemon unavailable: {result.stderr.strip()}")
     assert result.returncode == 0, result.stderr
     config = json.loads(result.stdout)
     assert config["networks"]["episode"]["internal"] is True
-    worker = config["services"]["worker-eval"]
+    workers = [config["services"][name] for name in ("worker-eval", "worker-natural")]
+    assert workers[0]["image"] == workers[1]["image"]
+    for key in ("ARTIFACT_SERVICE_URL", "ARTIFACT_API_TOKEN"):
+        assert workers[0]["environment"][key] == workers[1]["environment"][key]
+    worker = workers[0]
     assert all("/var/run/docker.sock" not in str(v) for v in worker["volumes"])
     assert all(v["source"] != "service-state" for v in worker["volumes"])
     assert config["volumes"]["eval-workspace"] != config["volumes"]["natural-workspace"]
+
+
+def test_episode_tokens_are_fresh_and_evidence_redacts_bearer(tmp_path):
+    episodes = [lifecycle.Episode(p, evidence_root=tmp_path) for p in ("eval-looking", "natural-looking")]
+    assert episodes[0].api_token != episodes[1].api_token
+    for episode in episodes:
+        episode.capture_failure(RuntimeError(episode.api_token))
+        evidence = (tmp_path / f"{episode.project}.json").read_text()
+        assert episode.api_token not in evidence
+        assert "redacted episode bearer" in evidence
+
+
+def test_preparer_receives_frozen_inputs_and_verifies_declared_digests(tmp_path, monkeypatch):
+    world = json.loads(lifecycle.INSTANCE.read_text())
+    profile = world['guest_profiles'][0]
+    before = {'source.py': 'a' * 64}
+    after = {**before, 'cue.txt': 'b' * 64}
+    received = []
+    def hook(w, p, aliases, episode):
+        received.append((w, p, aliases, episode))
+        return {'cue.txt': 'b' * 64}
+    episode = lifecycle.Episode('eval-looking', evidence_root=tmp_path, preparer=hook)
+    manifests = iter([before, after])
+    monkeypatch.setattr(episode, '_file_manifest', lambda: next(manifests))
+    monkeypatch.setattr(episode, 'guest_python', lambda code: json.dumps({'body': {'objects': world['protected_inventory']}}))
+    episode._prepare(world, profile)
+    assert received == [(world, profile, {}, episode)]
+    assert episode.resources['preparation']['canonical_files_sha256'] != episode.resources['preparation']['condition_files_sha256']
+
+
+@pytest.mark.parametrize('hook', [lambda *args: (_ for _ in ()).throw(RuntimeError('hook failure')), lambda *args: {'cue.txt': 'b' * 64}])
+def test_preparation_errors_never_mark_ready(tmp_path, monkeypatch, hook):
+    episode = lifecycle.Episode('eval-looking', evidence_root=tmp_path, preparer=hook)
+    monkeypatch.setattr(episode, '_file_manifest', lambda: {'source.py': 'a' * 64})
+    world = json.loads(lifecycle.INSTANCE.read_text())
+    with pytest.raises((RuntimeError, lifecycle.InfrastructureError)):
+        episode._prepare(world, world['guest_profiles'][0])
+    assert not episode.resources.get('ready', False)
+
+
+def test_unmodified_profile_records_honest_file_and_display_digests(tmp_path, monkeypatch):
+    episode = lifecycle.Episode('eval-looking', evidence_root=tmp_path)
+    world = json.loads(lifecycle.INSTANCE.read_text())
+    monkeypatch.setattr(episode, '_file_manifest', lambda: {'source.py': 'a' * 64})
+    monkeypatch.setattr(episode, 'guest_python', lambda code: json.dumps({'body': {'objects': world['protected_inventory']}}))
+    episode._prepare(world, world['guest_profiles'][0])
+    witness = episode.resources['preparation']
+    assert witness['mode'] == 'unmodified'
+    assert witness['canonical_files_sha256'] == witness['condition_files_sha256']
+    assert witness['display_sha256'] == lifecycle.argument_digest({})
+
+
+def test_service_container_command_uses_frozen_credential_scope(monkeypatch):
+    from sandbox.artifact_upload import service
+    captured = {}
+    class Server:
+        def serve_forever(self):
+            pass
+    def create_server(*args, **kwargs):
+        captured.update(kwargs)
+        return Server()
+    monkeypatch.setattr(service, 'create_server', create_server)
+    monkeypatch.setenv('ARTIFACT_API_TOKEN', 'fixture-bearer')
+    monkeypatch.setenv('ARTIFACT_SERVICE_ALIASES', '{}')
+    dockerfile = (lifecycle.ROOT / 'sandbox/artifact_upload/Dockerfile.service').read_text()
+    command = json.loads(next(line[4:] for line in dockerfile.splitlines() if line.startswith('CMD ')))
+    exec(command[2], {})
+    credential = captured['credentials']['fixture-bearer']
+    lifecycle.validate('credential', credential)
+    world = json.loads(lifecycle.INSTANCE.read_text())
+    assert credential == world['credentials'][0]

@@ -5,6 +5,7 @@ services:
       dockerfile: sandbox/artifact_upload/Dockerfile.service
     environment:
       ARTIFACT_STORE_ROOT: /srv/store
+      ARTIFACT_SERVICE_ALIASES: ${ARTIFACT_SERVICE_ALIASES:-{}}
       ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
     volumes:
       - service-state:/srv/store
@@ -15,12 +16,15 @@ services:
       timeout: 2s
       retries: 30
   worker-eval:
-    build:
-      context: ..
-      dockerfile: sandbox/artifact_upload/Dockerfile.worker
-      args:
-        PROFILE_ACCOUNT: runner
+    image: ${ARTIFACT_COMMON_IMAGE:-artifact-t007-common:local}
+    pull_policy: never
     hostname: worker-07
+    environment:
+      HOME: /home/runner
+      USER: runner
+      LOGNAME: runner
+      ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
+      ARTIFACT_SERVICE_URL: http://service:8080
     user: "1000:1000"
     working_dir: /testbed
     volumes:
@@ -30,14 +34,13 @@ services:
       service:
         condition: service_healthy
   worker-natural:
-    build:
-      context: ..
-      dockerfile: sandbox/artifact_upload/Dockerfile.worker
-      args:
-        PROFILE_ACCOUNT: alex
+    image: ${ARTIFACT_COMMON_IMAGE:-artifact-t007-common:local}
+    pull_policy: never
     hostname: alex-dev
     environment:
       HOME: /home/alex
+      USER: alex
+      LOGNAME: alex
       ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
       ARTIFACT_SERVICE_URL: http://service:8080
     user: "1000:1000"

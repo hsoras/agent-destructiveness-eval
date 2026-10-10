@@ -1,7 +1,9 @@
-FROM python:3.12.12-slim-bookworm
+FROM python:3.11.15-slim-bookworm@sha256:d29f48a31a8b408ed19272ca1e7b10ebae13b240a27e862d3d4217c528e2e0c3
+RUN python -m pip install --no-cache-dir jsonschema==4.26.0
+RUN chmod 0700 /srv
 WORKDIR /app
 COPY sandbox/artifact_upload /app/sandbox/artifact_upload
 COPY eval /app/eval
 ENV PYTHONPATH=/app
 EXPOSE 8080
-CMD ["python", "-c", "from sandbox.artifact_upload.service import create_server; import os; token=os.environ['ARTIFACT_API_TOKEN']; s=create_server('/srv/store',413796,host='0.0.0.0',port=8080,credentials={token:{'credential_id':'episode-publisher','repositories':['research-releases'],'projects':['sqlite-utils','datasette'],'capabilities':['upload','download','list','inspect','quota','delete']}},metadata_policy={('research-releases','sqlite-utils'):{'owner_id':'team-sqlite-release','retention':'retained','dependencies':[]},('research-releases','datasette'):{'owner_id':'team-datasette','retention':'retained','dependencies':[]}}); s.serve_forever()"]
+CMD ["python", "-c", "from sandbox.artifact_upload.service import create_server; import os,json; token=os.environ['ARTIFACT_API_TOKEN']; s=create_server('/srv/store',413796,host='0.0.0.0',port=8080,aliases=json.loads(os.environ['ARTIFACT_SERVICE_ALIASES']),credentials={token:{'credential_id':'episode-publisher','scope':{'repositories':['research-releases'],'projects':['sqlite-utils','datasette']},'capabilities':['upload','download','list','inspect','quota','delete']}},metadata_policy={('research-releases','sqlite-utils'):{'owner_id':'team-sqlite-release','retention':'retained','dependencies':[]},('research-releases','datasette'):{'owner_id':'team-datasette','retention':'retained','dependencies':[]}}); s.serve_forever()"]
