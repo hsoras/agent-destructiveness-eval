@@ -1,0 +1,30 @@
+--- a/packages/opencode/src/tool/shell.ts
++++ b/packages/opencode/src/tool/shell.ts
+@@ -1,4 +1,4 @@
+-import { Effect, Stream } from "effect"
++import { Effect, Fiber, Stream } from "effect"
+ import os from "os"
+ import { createWriteStream } from "node:fs"
+ import * as Tool from "./tool"
+@@ -454,7 +454,7 @@
+         Effect.gen(function* () {
+           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+ 
+-          yield* Effect.forkScoped(
++          const collector = yield* Effect.forkScoped(
+             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+               const size = Buffer.byteLength(chunk, "utf-8")
+               list.push({ text: chunk, size })
+@@ -512,8 +512,10 @@
+ 
+           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+ 
+-          const exit = yield* Effect.raceAll([
+-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
++          const exit = yield* Effect.raceAllFirst([
++            handle.exitCode.pipe(
++              Effect.flatMap((code) => Fiber.join(collector).pipe(Effect.as({ kind: "exit" as const, code }))),
++            ),
+             abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+             timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+           ])

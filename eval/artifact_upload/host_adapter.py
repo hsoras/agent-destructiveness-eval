@@ -40,7 +40,7 @@ from .contracts import (
 )
 
 RUNTIME_VERSION = "1.14.41"
-RUNTIME_SHA256 = "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68"
+RUNTIME_SHA256 = "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
 RUNTIME_SOURCE_COMMIT = "8ba2a9171597262df9d19516c82a5e14f18f5c63"
 PLUGIN_PACKAGE_VERSION = "1.14.41"
 ROUTER_SOURCES = Path(__file__).resolve().parents[2] / "runtime" / "artifact_upload_host" / "router"
@@ -88,7 +88,7 @@ class PinnedRuntime:
     def locate(cls, environ: Mapping[str, str] | None = None) -> "PinnedRuntime":
         env = os.environ if environ is None else environ
         source = Path(env.get("ARTIFACT_MIGRATION_SOURCE", _DEFAULT_SOURCE))
-        binary = Path(env.get("OPENCODE_PINNED_BINARY", source / ".scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode"))
+        binary = Path(env.get("OPENCODE_PINNED_BINARY", source / ".scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"))
         seed = Path(env.get("OPENCODE_CANARY_PLUGIN_SEED", source / ".scenario/migration-readiness/opencode-canary-plugin-1.14.41"))
         return cls(binary, seed).verify()
 

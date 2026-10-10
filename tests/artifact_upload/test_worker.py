@@ -31,6 +31,8 @@ from sandbox.artifact_upload.worker.core import group_members
 
 REPO = Path(__file__).resolve().parents[2]
 PIN_VERSION = "1.14.41"
+DERIVED_BINARY = ".scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"
+DERIVED_BINARY_SHA256 = "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
 ALL_CASES = nc.all_cases()
 CASE_INDEX = {c["id"]: c for v in ALL_CASES.values() for c in v}
 TOOL_OPS = {"bash": "shell", "read": "read", "write": "write", "edit": "edit", "apply_patch": "patch", "glob": "find", "grep": "grep"}
@@ -81,9 +83,10 @@ def guest(tmp_path):
 @pytest.fixture(scope="session")
 def native_binary():
     explicit = os.environ.get("OPENCODE_NATIVE_BINARY")
-    candidates = [Path(explicit)] if explicit else sorted((_common_root() / ".scenario/migration-readiness/opencode-host-1.14.41/node_modules").glob("opencode-*/bin/opencode"))
+    candidates = [Path(explicit) if explicit else _common_root() / DERIVED_BINARY]
     assert candidates and candidates[0].is_file(), "required prerequisite missing: pinned OpenCode 1.14.41 executable (set OPENCODE_NATIVE_BINARY)"
     binary = str(candidates[0])
+    assert hashlib.sha256(candidates[0].read_bytes()).hexdigest() == DERIVED_BINARY_SHA256, "native executable is not the activated derived build"
     version = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=60).stdout.strip()
     assert version == PIN_VERSION, f"native executable is {version!r}, expected pinned {PIN_VERSION}"
     return binary
@@ -96,6 +99,7 @@ def native_results(native_binary, artifact_dir):
     receipts = {"binary": native_binary, "binary_sha256": hashlib.sha256(Path(native_binary).read_bytes()).hexdigest(), "version": PIN_VERSION, "variants": {}}
     tarball = _common_root() / ".scenario/migration-readiness/evidence/tmp-preserved-2026-10-09/opencode-8ba2a917.tar.gz"
     if tarball.is_file(): receipts["source_archive_sha256"] = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    receipts.update(derived_runtime_manifest="runtime/artifact_upload_host/native_patch/build-manifest.json", derived_source_archive_sha256="474edc2b546ba90e2e3d02a95af34a68394e87af0089dd8cfe1f0aa6e30eb3c8", derived_source_full_tree_sha256="3336169452bba05ada8b7eb17951e408304e491e3351b9d040e77b9d6a989add")
     for variant, cases in ALL_CASES.items():
         scratch = tempfile.mkdtemp(prefix=f"t005-native-{variant}-")
         attempt = {"attempt": 1, "scratch": scratch, "variant": variant}

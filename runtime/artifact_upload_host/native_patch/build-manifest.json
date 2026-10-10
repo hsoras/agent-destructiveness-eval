@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "status": "validated-candidate-not-active-pending-owner-integration",
+  "upstream_base": {
+    "base_source_commit": "8ba2a9171597262df9d19516c82a5e14f18f5c63",
+    "base_source_archive_sha256": "e8ad49328a79947855d3d6b6b3a7f40554c4037eab947246ae5dc144304ec84d",
+    "base_source_full_tree_sha256": "4be4862ac664888b3c4d408db8b9211d2dfc24fee582c24ef4eb9ded7256e04e",
+    "base_binary": {
+      "path": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode",
+      "sha256": "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68",
+      "preserved": true
+    }
+  },
+  "native_patch": {
+    "path": "native-stdout-drain.patch",
+    "sha256": "9ad18efc1ad57ca37a550def6895591d760b5b29e92065942338abef18e549a9",
+    "source_members": [
+      "packages/opencode/src/tool/shell.ts"
+    ]
+  },
+  "build_input_repair": {
+    "path": "build-input-repair.patch",
+    "sha256": "c2c50002875d88feea4f3372daff1396e12feafd0f39378bf2381ef11af95022",
+    "cause": "Bun 1.3.13 re-resolves GitHub main at install; original lock has 20bd361 while current main resolves 6e24d04",
+    "changes": [
+      "packages/app/package.json: ghostty-web github:anomalyco/ghostty-web#main -> #20bd361",
+      "bun.lock workspaces.packages/app.dependencies.ghostty-web: same manifest pin"
+    ],
+    "package_resolutions_unchanged": true,
+    "integrity_hashes_unchanged": true,
+    "catalog_unchanged": true,
+    "original_lock_sha256": "1910c582e9e4f0f988bccdaeb851100047dcffab7972bf0a585d5585ae697674",
+    "repaired_lock_sha256": "f0741f41c785a1e49415426ca6834caf3f925c07f2526dc6f466c54c4d621a34"
+  },
+  "toolchain": {
+    "version": "1.3.13",
+    "binary_sha256": "fc0b4cae13a911098f0c61d13b7d9fd6b640bdb9f6b6a0b78bdb9d778c12bc3f",
+    "distribution_sha256": "5467e3f65dba526b9fea98f0cce04efafc0c63e169733ec27b876a3ad32da190"
+  },
+  "derived_runtime": {
+    "status": "validated-candidate-not-active-pending-owner-integration",
+    "base_version": "1.14.41",
+    "base_source_commit": "8ba2a9171597262df9d19516c82a5e14f18f5c63",
+    "binary": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode",
+    "binary_sha256": "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6",
+    "version": "1.14.41",
+    "channel": "latest",
+    "repaired_archive": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/repaired-patched-source.tar.gz",
+    "repaired_archive_sha256": "474edc2b546ba90e2e3d02a95af34a68394e87af0089dd8cfe1f0aa6e30eb3c8",
+    "build_input_patch_sha256": "c2c50002875d88feea4f3372daff1396e12feafd0f39378bf2381ef11af95022",
+    "models_snapshot": {
+      "url": "https://models.dev/api.json",
+      "sha256": "a27f4b90d9e293b72bb954b017eccf72d53c82e0f57836acd39aca13900bbc87",
+      "retrieved_at": "2026-10-10; exact command/log retained",
+      "original_release_snapshot_reproducibility": false
+    },
+    "original_pins_preserved": true,
+    "repaired_source_full_tree_sha256": "3336169452bba05ada8b7eb17951e408304e491e3351b9d040e77b9d6a989add",
+    "repaired_opencode_subtree_sha256": "85343d94a8b3f98ba77481d1b1b6e3651b9cfeea65e4c7ec711faa979d35e212",
+    "base_source_verification": {
+      "archive_sha256": "e8ad49328a79947855d3d6b6b3a7f40554c4037eab947246ae5dc144304ec84d",
+      "full_tree_sha256": "4be4862ac664888b3c4d408db8b9211d2dfc24fee582c24ef4eb9ded7256e04e",
+      "full_tree_files": 4474,
+      "full_tree_symlinks": 62,
+      "opencode_subtree_sha256": "b370fb50940e5acb427f30f816c31083429444d9c12dacf7ff5272621df7b430",
+      "opencode_subtree_files": 899,
+      "opencode_subtree_symlinks": 1
+    },
+    "changed_archive_members": [
+      "anomalyco-opencode-8ba2a91/bun.lock",
+      "anomalyco-opencode-8ba2a91/packages/app/package.json",
+      "anomalyco-opencode-8ba2a91/packages/opencode/src/tool/shell.ts"
+    ]
+  },
+  "build": {
+    "cwd": "repaired source root",
+    "command": [
+      "bun",
+      "run",
+      "--cwd",
+      "packages/opencode",
+      "script/build.ts",
+      "--single",
+      "--skip-install"
+    ],
+    "env": {
+      "MODELS_DEV_API_JSON": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/models-dev-api.json",
+      "OPENCODE_VERSION": "1.14.41",
+      "OPENCODE_CHANNEL": "latest",
+      "OPENCODE_RELEASE": null
+    },
+    "embedded_web_ui": true,
+    "byte_reproducibility_claimed": false,
+    "generated_source_receipt": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/build-generated-source.json"
+  },
+  "evidence_root": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010",
+  "validation": {
+    "frozen_install": {
+      "exit": 0,
+      "lock_unchanged": true
+    },
+    "native_typecheck": {
+      "exit": 0
+    },
+    "native_shell_suite": {
+      "exit": 0,
+      "passed": 22,
+      "failed_initial_sandbox_attempt": "FSEvents stream unavailable; preserved native-shell-tests.log"
+    },
+    "production_spawner": {
+      "exit": 0,
+      "assertion_cases": 14,
+      "adapter": "probe/extractions placed in packages/opencode; unchanged native functions; actual CrossSpawnSpawner; explicit queue/truncation/error adapters"
+    },
+    "initial_channel": {
+      "binary_sha256": "b4d5fdd6d9ec63cad2bc91eabba323ba130d2313af53ac1b89752c4ca8f3c451",
+      "t005_passed": 206,
+      "t008_passed": 31,
+      "t008_failed": 1,
+      "cause_receipt": "channel-cause.json",
+      "status": "superseded; binary and raw attempts retained"
+    },
+    "t005-production-channel": {
+      "exit": 0,
+      "tests": 206,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "log": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/t005-production-channel.log",
+      "xml": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/t005-production-channel.xml"
+    },
+    "t008-production-channel": {
+      "exit": 0,
+      "tests": 32,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "log": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/t008-production-channel.log",
+      "xml": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/t008-production-channel.xml"
+    },
+    "compiled-canary-production-channel": {
+      "exit": 0,
+      "pin_binding": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/canary-pin-binding-production-channel.json"
+    }
+  },
+  "activation": "cross-owner consumer changes must be coordinated and independently reviewed; no shared integration edit"
+}
