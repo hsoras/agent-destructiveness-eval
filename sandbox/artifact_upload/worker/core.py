@@ -1,301 +1,394 @@
-"""Python 3.11 guest compatibility handlers for artifact-upload.v1."""
+"""Python guest reimplementation of the pinned OpenCode core handlers.
+
+This module is installed only in the disposable guest.  Calls are data; the only
+subprocess entry points are the guest shell started with argv (never a host
+shell string) and ripgrep started with argv.  File handlers live in ``tools.py``
+and port the pinned OpenCode 1.14.41 semantics; this module owns the call
+contract, the declared path boundary and process lifetime ownership.
+"""
 from __future__ import annotations
 
 import base64
-import fnmatch
 import hashlib
 import os
-import re
+import queue
+import shutil
 import signal
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from eval.artifact_upload.contracts import (
-    CONTRACT_VERSION, TOOL_OPERATIONS, argument_digest, validate,
-)
+from eval.artifact_upload.contracts import CONTRACT_VERSION, TOOL_OPERATIONS, validate
+
+from . import tools
+from .tools import Ctx, ToolError
+
+DEFAULT_SHELL_TIMEOUT_MS = 2 * 60 * 1000  # native tool/shell.ts DEFAULT_TIMEOUT
+KEY_FIELDS = ("run_id", "session_id", "call_id", "argument_digest")
+DISABLED_FEATURES = tools.DISABLED_FEATURES
 
 
 class WorkerError(Exception):
     def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+        super().__init__(message); self.code = code
+
+
+def _proc_table() -> list[tuple[int, int, int, str, str]]:
+    """(pid, ppid, pgid, state, start-marker) for every visible process."""
+    rows: list[tuple[int, int, int, str, str]] = []
+    if os.path.isdir("/proc/self"):
+        for name in os.listdir("/proc"):
+            if not name.isdigit(): continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as f: raw = f.read().decode("utf-8", "replace")
+                rest = raw[raw.rindex(")") + 2:].split()
+                rows.append((int(name), int(rest[1]), int(rest[2]), rest[0], rest[19]))
+            except (OSError, ValueError, IndexError):
+                continue
+        return rows
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return rows
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3], ""))
+    return rows
+
+
+def group_members(pgid: int) -> list[int]:
+    return [pid for pid, _pp, pg, st, _s in _proc_table() if pg == pgid and not st.startswith("Z")]
+
+
+def select_shell() -> str:
+    env_shell = os.environ.get("SHELL")
+    if env_shell and os.path.exists(env_shell) and os.path.basename(env_shell) not in ("fish", "nu"):
+        return env_shell
+    return shutil.which("bash") or "/bin/sh"
+
+
+class _Stream:
+    """Bounded byte accumulation with a full-output spool, per stream."""
+
+    def __init__(self, spool_dir: str):
+        self.tail = bytearray(); self.total = 0; self.cut = False; self.spool_dir = spool_dir
+        self.sink = None; self.path = ""
+
+    def _open_spool(self, initial: bytes) -> None:
+        os.makedirs(self.spool_dir, exist_ok=True)
+        self.path = os.path.join(self.spool_dir, "tool_" + uuid.uuid4().hex)
+        self.sink = open(self.path, "wb"); self.sink.write(initial)
+
+    def feed(self, data: bytes) -> None:
+        self.total += len(data)
+        if self.sink is not None:
+            self.sink.write(data)
+        elif self.total > tools.MAX_BYTES:
+            self._open_spool(bytes(self.tail) + data); self.cut = True
+        self.tail += data
+        keep = tools.MAX_BYTES * 2
+        if len(self.tail) > keep:
+            del self.tail[: len(self.tail) - keep]; self.cut = True
+
+    def close(self) -> None:
+        if self.sink is not None:
+            self.sink.close(); self.sink = None
+
+    def render(self) -> bytes:
+        raw = bytes(self.tail)
+        text = raw
+        lines = raw.split(b"\n")
+        if not (len(lines) <= tools.MAX_LINES and len(raw) <= tools.MAX_BYTES):
+            out: list[bytes] = []; size = 0
+            for i in range(len(lines) - 1, -1, -1):
+                if len(out) >= tools.MAX_LINES: break
+                add = len(lines[i]) + (1 if out else 0)
+                if size + add > tools.MAX_BYTES:
+                    if not out:
+                        start = max(len(lines[i]) - tools.MAX_BYTES, 0)
+                        while start < len(lines[i]) and (lines[i][start] & 0xC0) == 0x80: start += 1
+                        out.insert(0, lines[i][start:])
+                    break
+                out.insert(0, lines[i]); size += add
+            text = b"\n".join(out); self.cut = True
+            if not self.path:
+                self._open_spool(raw); self.close()
+        if self.cut and self.path:
+            text = b"...output truncated...\n\nFull output saved to: " + self.path.encode() + b"\n\n" + text
+        return text
+
+
+class _Execution:
+    def __init__(self, key: tuple[str, str, str, str], proc: Any, worker_id: str, stream: bool, spool_dir: str):
+        self.key, self.proc, self.pgid = key, proc, proc.pid
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.handle = {"worker_id": worker_id, "process_id": str(proc.pid), "process_group_id": str(proc.pid), "started_at": self.started_at}
+        self.events: queue.Queue[dict[str, Any]] | None = queue.Queue(maxsize=4096) if stream else None
+        self.dropped = 0
+        self.out, self.err = _Stream(spool_dir), _Stream(spool_dir)
+        self.cancel_signal: int | None = None; self.cancel_at = 0.0
+        self.expired = False; self.done = threading.Event(); self.result: dict[str, Any] | None = None
+        self.tracked: dict[int, str] = {}
+
+    def emit(self, event: dict[str, Any]) -> None:
+        if self.events is None: return
+        try: self.events.put_nowait(event)
+        except queue.Full: self.dropped += 1
+
+
+class _NoProc:
+    """Popen stand-in for an execution that was rejected before spawning."""
+    pid = 0
+    returncode = 1
 
 
 class GuestWorker:
-    """Execute contract calls against one fixed guest worktree.
+    """Handlers sharing one guest filesystem and one fixed worker identity."""
 
-    `root` and `worker_id` are provisioned by the container launcher; neither
-    is exposed as an operation argument. This class does not create isolation:
-    it must only be instantiated in the guest container.
-    """
-
-    def __init__(self, root: str | os.PathLike[str], *, worker_id: str = "guest-worker"):
+    def __init__(self, root: str | os.PathLike[str], *, worker_id: str = "guest-worker", protected_paths: tuple[str, ...] | list[str] = (),
+                 output_dir: str | os.PathLike[str] | None = None, kill_grace: float = 3.0):
         self.root = Path(root).resolve(strict=True)
-        if not self.root.is_dir():
-            raise ValueError("guest root must be a directory")
+        if not self.root.is_dir(): raise ValueError("guest root must be a directory")
         self.worker_id = worker_id
-        self._processes: dict[str, subprocess.Popen[bytes]] = {}
-        self._cancelled: set[str] = set()
-        self._lock = threading.Lock()
+        self.kill_grace = kill_grace
+        self.output_dir = str(output_dir) if output_dir else os.path.join(tempfile.gettempdir(), f"artifact-worker-output-{os.getuid()}")
+        self.protected = tuple(os.path.realpath(p) for p in protected_paths)
+        self.rg = shutil.which("rg")
+        self._lock = threading.RLock()
+        self._execs: dict[tuple[str, str, str, str], _Execution] = {}
+        self._finished: set[tuple[str, str, str, str]] = set()
 
+    # ------------------------------------------------------------ identity
     @property
     def digest(self) -> str:
-        """Digest implementation source files for result lineage."""
-        digest = hashlib.sha256()
-        for source in sorted(Path(__file__).parent.glob("*.py")):
-            digest.update(source.name.encode())
-            digest.update(b"\0")
-            digest.update(hashlib.sha256(source.read_bytes()).digest())
-        return digest.hexdigest()
+        h = hashlib.sha256()
+        for p in sorted(Path(__file__).parent.glob("*.py")):
+            h.update(p.name.encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest())
+        return h.hexdigest()
 
-    def _path(self, name: str, *, create: bool = False) -> Path:
-        if name.startswith("tool-output://"):
-            raise WorkerError("unsupported_output_uri", "logical output references require the broker output resolver")
-        raw = Path(name)
-        candidate = raw if raw.is_absolute() else self.root / raw
-        # Resolve existing symlinks with normal guest semantics, but prevent a
-        # caller from escaping the fixed worktree through a path or symlink.
-        resolved = candidate.resolve(strict=not create)
-        try:
-            resolved.relative_to(self.root)
-        except ValueError as exc:
-            raise WorkerError("path_outside_guest", "path resolves outside the guest worktree") from exc
-        return resolved
+    def capabilities(self) -> dict[str, Any]:
+        return {"operations": sorted(TOOL_OPERATIONS.values()), "disabled": list(DISABLED_FEATURES), "persistent_sessions": False, "background_jobs": False}
 
     @staticmethod
-    def _text(path: Path) -> str:
-        try:
-            return path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            raise WorkerError("binary_file", "file is not valid UTF-8 text; use shell for binary data")
+    def _key(c: dict[str, Any]) -> tuple[str, str, str, str]:
+        return c["run_id"], c["session_id"], c["call_id"], c["argument_digest"]
 
     @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".artifact-worker-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temp_name, path.stat().st_mode & 0o777 if path.exists() else 0o644)
-            os.replace(temp_name, path)
-        finally:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
+    def _exec_key(k: Any) -> tuple[str, str, str, str]:
+        if not isinstance(k, dict) or set(k) != set(KEY_FIELDS) or any(not isinstance(k[f], str) or not k[f] for f in KEY_FIELDS):
+            raise WorkerError("invalid_execution_key", "complete execution_key (run_id, session_id, call_id, argument_digest) is required")
+        return tuple(k[f] for f in KEY_FIELDS)  # type: ignore[return-value]
 
+    # ------------------------------------------------------------ boundary
+    def check_path(self, path: str) -> None:
+        """Reject any path whose real target lies in a protected guest location.
+
+        Applied to every handler path argument and to every traversal candidate
+        returned by glob/grep, after symlink resolution.
+        """
+        real = os.path.realpath(path)
+        for p in self.protected:
+            if real == p or real.startswith(p.rstrip(os.sep) + os.sep):
+                raise ToolError(f"path is outside the guest boundary: {path}", "boundary_violation")
+
+    def _ctx(self) -> Ctx:
+        return Ctx(str(self.root), self.check_path, self.output_dir, self.rg)
+
+    # ------------------------------------------------------------- execute
     def execute(self, call: dict[str, Any]) -> dict[str, Any]:
-        """Validate and execute one v1 call, returning its correlated result."""
-        try:
-            validate("call", call)
-        except Exception as exc:
-            raise WorkerError("invalid_call", str(exc)) from exc
-        operation = call["operation"]
-        if TOOL_OPERATIONS.get(call["tool_name"]) != operation:
-            raise WorkerError("invalid_call", "tool and operation do not match")
-        try:
-            if operation == "shell":
-                out, err, code, encoding = self._shell(call)
-                if call["call_id"] in self._cancelled:
-                    status, error = "cancelled", "cancelled"
-                    self._cancelled.discard(call["call_id"])
-                else:
-                    status, error = ("ok", None) if code == 0 else ("error", "command_failed")
-            else:
-                out = self._dispatch(operation, call["arguments"])
-                err, code, status, error = "", 0, "ok", None
-                encoding = "utf-8"
-        except WorkerError as exc:
-            out, err, code, status, error, encoding = "", str(exc), 1, "error", exc.code, "utf-8"
-        except OSError as exc:
-            out, err, code, status, error, encoding = "", str(exc), 1, "error", "filesystem_error", "utf-8"
-        return {
-            "contract_version": CONTRACT_VERSION, "run_id": call["run_id"],
-            "session_id": call["session_id"], "call_id": call["call_id"],
-            "argument_digest": call["argument_digest"], "status": status,
-            "exit_code": code, "stdout": out, "stderr": err,
-            "encoding": encoding, "error_code": error, "output_uri": None,
-            "display_fields": {"aliases": {}, "changed_fields": []},
-            "worker_digest": self.digest,
-        }
-
-    def cancel(self, call_id: str, *, how: str = "terminate") -> bool:
-        """Signal the process group for a running shell call."""
-        signals = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}
-        if how not in signals:
-            raise ValueError("signal must be interrupt, terminate, or kill")
-        with self._lock:
-            proc = self._processes.get(call_id)
-        if proc is None or proc.poll() is not None:
-            return False
-        try:
-            os.killpg(proc.pid, signals[how])
-        except ProcessLookupError:
-            return False
-        with self._lock:
-            self._cancelled.add(call_id)
-        return True
-
-    def _shell(self, call: dict[str, Any]) -> tuple[str, str, int, str]:
-        args = call["arguments"]
-        cwd = self._path(args.get("workdir", "."))
-        if not cwd.is_dir():
-            raise WorkerError("not_a_directory", f"not a directory: {args.get('workdir', '.')}")
-        env = os.environ.copy()
-        env.update(args.get("env", {}))
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", args["command"]], cwd=cwd, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        with self._lock:
-            self._processes[call["call_id"]] = proc
-        try:
-            timeout = args.get("timeout")
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    stdout, stderr = proc.communicate(timeout=1)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    stdout, stderr = proc.communicate()
-                raise WorkerError("timeout", "command timed out")
-        finally:
+        op = self._validated(call)
+        if op == "shell":
+            ex = self._launch(call, stream=False)
+            ex.done.wait()
+            assert ex.result is not None
             with self._lock:
-                self._processes.pop(call["call_id"], None)
+                self._execs.pop(ex.key, None); self._finished.add(ex.key)
+            return ex.result
         try:
-            return stdout.decode("utf-8"), stderr.decode("utf-8"), proc.returncode, "utf-8"
-        except UnicodeDecodeError:
-            # Preserve arbitrary process output without corrupting bytes.
-            return base64.b64encode(stdout).decode(), base64.b64encode(stderr).decode(), proc.returncode, "base64"
+            out = self._dispatch(op, call["arguments"])
+            return self._result(call, "ok", 0, out, "", "utf-8", None)
+        except ToolError as e:
+            return self._result(call, "unsupported" if e.code == "unsupported_attachment" else "error", 1, "", str(e), "utf-8", e.code)
+        except OSError as e:
+            return self._result(call, "error", 1, "", str(e), "utf-8", "filesystem_error")
+
+    def _validated(self, call: dict[str, Any]) -> str:
+        try: validate("call", call)
+        except Exception as e: raise WorkerError("invalid_call", str(e)) from e
+        op = call["operation"]
+        if TOOL_OPERATIONS.get(call["tool_name"]) != op: raise WorkerError("invalid_call", "tool and operation do not match")
+        return op
+
+    def _result(self, call, status, code, out, err, enc, error) -> dict[str, Any]:
+        return {"contract_version": CONTRACT_VERSION, "run_id": call["run_id"], "session_id": call["session_id"], "call_id": call["call_id"],
+                "argument_digest": call["argument_digest"], "status": status, "exit_code": code, "stdout": out, "stderr": err, "encoding": enc,
+                "error_code": error, "output_uri": None, "display_fields": {"aliases": {}, "changed_fields": []}, "worker_digest": self.digest}
 
     def _dispatch(self, op: str, a: dict[str, Any]) -> str:
-        if op == "read":
-            path = self._path(a["filePath"])
-            data = path.read_bytes()
-            try:
-                text = data.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                raise WorkerError("binary_file", "file is not valid UTF-8 text; use shell for binary data")
-            lines = text.splitlines(keepends=True)
-            start = a.get("offset", 0)
-            selected = lines[start:] if "limit" not in a else lines[start:start + a["limit"]]
-            return "".join(selected)
-        if op == "write":
-            path = self._path(a["filePath"], create=True)
-            self._atomic_write(path, a["content"].encode("utf-8"))
-            return ""
-        if op == "edit":
-            path = self._path(a["filePath"])
-            old, new = a["oldString"], a["newString"]
-            if not old:
-                raise WorkerError("edit_failed", "oldString must not be empty")
-            data = self._text(path)
-            count = data.count(old)
-            replace_all = a.get("replaceAll", False)
-            if count == 0 or (count > 1 and not replace_all):
-                raise WorkerError("edit_failed", f"expected one occurrence of oldString; found {count}")
-            changed = data.replace(old, new) if replace_all else data.replace(old, new, 1)
-            self._atomic_write(path, changed.encode("utf-8"))
-            return ""
-        if op == "patch":
-            return self._patch(a["patchText"])
-        if op == "find":
-            base = self._path(a.get("path", "."))
-            if base.is_file():
-                candidates = [base]
-            else:
-                candidates = sorted(p for p in base.rglob("*") if p.is_file())
-            return "\n".join(str(p.relative_to(self.root)) for p in candidates
-                             if fnmatch.fnmatch(p.name, a["pattern"]))
-        if op == "grep":
-            base = self._path(a.get("path", "."))
-            candidates = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file())
-            include = a.get("include", "*")
-            try:
-                pattern = re.compile(a["pattern"])
-            except re.error as exc:
-                raise WorkerError("invalid_pattern", str(exc)) from exc
-            matches = []
-            for path in candidates:
-                if not fnmatch.fnmatch(path.name, include):
-                    continue
-                try:
-                    contents = path.read_text(encoding="utf-8-sig")
-                except (UnicodeDecodeError, OSError):
-                    continue
-                for number, line in enumerate(contents.splitlines(), 1):
-                    if pattern.search(line):
-                        matches.append(f"{path.relative_to(self.root)}:{number}:{line}")
-            return "\n".join(matches)
-        raise WorkerError("unsupported_operation", f"unsupported operation: {op}")
+        ctx = self._ctx()
+        table = {"read": tools.read, "write": tools.write, "edit": tools.edit, "patch": tools.apply_patch, "find": tools.glob, "grep": tools.grep}
+        if op not in table: raise WorkerError("unsupported_operation", f"unsupported operation: {op}")
+        out = table[op](ctx, a)
+        return out if op == "read" else tools.truncate_output(ctx, out)
 
-    def _patch(self, patch: str) -> str:
-        """Apply the OpenAI-style Begin/End Patch subset atomically per file."""
-        lines = patch.splitlines()
-        if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
-            raise WorkerError("patch_failed", "invalid patch: expected Begin Patch / End Patch")
-        changes: list[tuple[Path, bytes]] = []
-        i = 1
-        while i < len(lines) - 1:
-            head = lines[i]
-            if head.startswith("*** Update File: "):
-                path = self._path(head[len("*** Update File: "):])
-                i += 1
-                original_bytes = path.read_bytes()
-                try:
-                    current = original_bytes.decode("utf-8-sig")
-                except UnicodeDecodeError:
-                    raise WorkerError("patch_failed", f"binary file cannot be patched: {path.name}")
-                hunks = []
-                while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                    if lines[i].startswith("@@"):
-                        i += 1
-                        chunk = []
-                        while i < len(lines) - 1 and not lines[i].startswith(("@@", "*** ")):
-                            chunk.append(lines[i]); i += 1
-                        hunks.append(chunk)
-                    else:
-                        raise WorkerError("patch_failed", f"unexpected patch line: {lines[i]}")
-                for chunk in hunks:
-                    before = "\n".join(x[1:] for x in chunk if x.startswith((" ", "-")))
-                    after = "\n".join(x[1:] for x in chunk if x.startswith((" ", "+")))
-                    if not before or before not in current:
-                        raise WorkerError("patch_failed", "patch context did not match")
-                    if current.count(before) != 1:
-                        raise WorkerError("patch_failed", "patch context is ambiguous")
-                    current = current.replace(before, after, 1)
-                changes.append((path, current.encode("utf-8")))
-            elif head.startswith("*** Delete File: "):
-                path = self._path(head[len("*** Delete File: "):])
-                changes.append((path, b""))
-                i += 1
-            elif head.startswith("*** Add File: "):
-                path = self._path(head[len("*** Add File: "):], create=True)
-                i += 1; added = []
-                while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                    if not lines[i].startswith("+"):
-                        raise WorkerError("patch_failed", "added file lines must start with +")
-                    added.append(lines[i][1:]); i += 1
-                if path.exists():
-                    raise WorkerError("patch_failed", f"file already exists: {path.name}")
-                changes.append((path, ("\n".join(added) + "\n").encode()))
-            else:
-                raise WorkerError("patch_failed", f"unsupported patch directive: {head}")
-        # Validate the entire patch before any filesystem mutation.
-        for path, _ in changes:
-            if path.exists() and not os.access(path, os.W_OK):
-                raise WorkerError("permission_denied", f"permission denied: {path.name}")
-        for path, contents in changes:
-            if contents == b"" and path.exists() and any(x.startswith("*** Delete File: " + str(path.relative_to(self.root))) for x in lines):
-                path.unlink()
-            else:
-                self._atomic_write(path, contents)
-        return ""
+    # ----------------------------------------------------- process handles
+    def process_handle(self, call: dict[str, Any]) -> dict[str, str] | None:
+        """Handle for this exact execution key until its stream/result is consumed."""
+        with self._lock:
+            ex = self._execs.get(self._key(call))
+            return dict(ex.handle) if ex else None
+
+    def start(self, call: dict[str, Any]) -> dict[str, str]:
+        """Start a shell execution; the handle is published before returning."""
+        if self._validated(call) != "shell": raise WorkerError("unsupported_operation", "only shell has a process handle")
+        return dict(self._launch(call, stream=True).handle)
+
+    def stream(self, execution_key: dict[str, str]) -> Iterator[dict[str, Any]]:
+        """Yield stdout/stderr chunk events in arrival order, then one result event."""
+        key = self._exec_key(execution_key)
+        with self._lock: ex = self._execs.get(key)
+        if ex is None or ex.events is None: raise WorkerError("unknown_execution", "execution is not active")
+        while True:
+            item = ex.events.get()
+            yield item
+            if item["type"] == "result":
+                with self._lock:
+                    self._execs.pop(key, None); self._finished.add(key)
+                return
+
+    def status(self, execution_key: dict[str, str]) -> dict[str, Any]:
+        key = self._exec_key(execution_key)
+        with self._lock: ex = self._execs.get(key)
+        if ex is None: raise WorkerError("unknown_execution", "execution is not active")
+        return {"state": "completed" if ex.done.is_set() else "running", "result": ex.result, "process": dict(ex.handle)}
+
+    def cancel(self, execution_key: dict[str, str] | str, *, how: str = "terminate") -> bool:
+        """Signal the whole process group of the exact execution; False if not active."""
+        key = self._exec_key(execution_key)
+        sig = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}.get(how)
+        if sig is None: raise ValueError("signal must be interrupt, terminate, or kill")
+        with self._lock: ex = self._execs.get(key)
+        if ex is None or ex.done.is_set(): return False
+        ex.cancel_signal = sig; ex.cancel_at = time.monotonic()
+        self._signal_group(ex, sig)
+        return True
+
+    # ------------------------------------------------------------- shell
+    def _launch(self, call: dict[str, Any], *, stream: bool) -> _Execution:
+        a = call["arguments"]; key = self._key(call)
+        cwd = os.path.normpath(os.path.join(str(self.root), a["workdir"])) if a.get("workdir") else str(self.root)
+        try: self.check_path(cwd)
+        except ToolError as e: return self._failed(call, key, str(e), e.code, stream)
+        if not os.path.isdir(cwd): return self._failed(call, key, f"not a directory: {a.get('workdir', '.')}", "not_a_directory", stream)
+        env = os.environ.copy(); env.update(a.get("env", {}))
+        with self._lock:
+            if key in self._execs or key in self._finished: raise WorkerError("duplicate_execution", "execution key was already used")
+            proc = subprocess.Popen([select_shell(), "-c", a["command"]], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            ex = _Execution(key, proc, self.worker_id, stream, self.output_dir)
+            self._execs[key] = ex
+        threading.Thread(target=self._supervise, args=(call, ex, a.get("timeout", DEFAULT_SHELL_TIMEOUT_MS)), name="artifact-worker-shell", daemon=True).start()
+        return ex
+
+    def _failed(self, call, key, message, code, stream) -> _Execution:
+        with self._lock:
+            if key in self._execs or key in self._finished: raise WorkerError("duplicate_execution", "execution key was already used")
+            ex = _Execution(key, _NoProc(), self.worker_id, stream, self.output_dir)
+            ex.result = self._result(call, "error", 1, "", message, "utf-8", code)
+            ex.done.set(); self._execs[key] = ex
+        ex.emit({"type": "result", "result": ex.result})
+        return ex
+
+    def _supervise(self, call: dict[str, Any], ex: _Execution, timeout_ms: int) -> None:
+        proc = ex.proc
+
+        def drain(name: str, sink: _Stream, pipe) -> None:
+            fd = pipe.fileno()
+            while True:
+                try: data = os.read(fd, 65536)
+                except OSError: break
+                if not data: break
+                sink.feed(data)
+                ex.emit({"type": name, "data_base64": base64.b64encode(data).decode("ascii")})
+
+        readers = [threading.Thread(target=drain, args=("stdout", ex.out, proc.stdout), daemon=True), threading.Thread(target=drain, args=("stderr", ex.err, proc.stderr), daemon=True)]
+        for r in readers: r.start()
+        deadline = time.monotonic() + (timeout_ms + 100) / 1000
+        term_at = 0.0; escalated = False
+        try:
+            while proc.poll() is None:
+                now = time.monotonic()
+                self._track(ex)
+                if not ex.expired and now >= deadline:
+                    ex.expired = True; term_at = now
+                    self._signal_group(ex, signal.SIGTERM)
+                if not term_at and ex.cancel_signal is not None and ex.cancel_signal != signal.SIGKILL:
+                    term_at = ex.cancel_at
+                if term_at and not escalated and now - term_at >= self.kill_grace:
+                    escalated = True; self._signal_group(ex, signal.SIGKILL)
+                time.sleep(0.02)
+            # The shell has exited: its group (and descendants that left the group)
+            # must not outlive it.  Sessions/background jobs are disabled by design.
+            self._reap_group(ex)
+            for r in readers: r.join(5)
+            for pipe in (proc.stdout, proc.stderr):
+                try: pipe.close()
+                except OSError: pass
+        finally:
+            ex.out.close(); ex.err.close()
+        ex.result = self._finish(call, ex)
+        ex.done.set()
+        if ex.dropped: ex.emit({"type": "dropped", "count": ex.dropped})
+        if ex.events is not None: ex.events.put({"type": "result", "result": ex.result})
+
+    @staticmethod
+    def _signal_group(ex: _Execution, sig: int) -> None:
+        if ex.pgid <= 1: return
+        try: os.killpg(ex.pgid, sig)
+        except ProcessLookupError: pass
+
+    def _track(self, ex: _Execution) -> None:
+        table = _proc_table(); children: dict[int, list[tuple[int, str]]] = {}
+        for pid, ppid, _pg, _st, start in table: children.setdefault(ppid, []).append((pid, start))
+        todo = [ex.pgid]
+        while todo:
+            for pid, start in children.get(todo.pop(), []):
+                if pid not in ex.tracked: ex.tracked[pid] = start; todo.append(pid)
+
+    def _reap_group(self, ex: _Execution) -> None:
+        for sig, wait in ((signal.SIGTERM, 0.3), (signal.SIGKILL, 5.0)):
+            self._signal_group(ex, sig)
+            for pid in self._tracked_alive(ex):
+                try: os.kill(pid, sig)
+                except ProcessLookupError: pass
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                if not group_members(ex.pgid) and not self._tracked_alive(ex): return
+                time.sleep(0.02)
+
+    @staticmethod
+    def _tracked_alive(ex: _Execution) -> list[int]:
+        alive = {pid: start for pid, _pp, _pg, st, start in _proc_table() if not st.startswith("Z")}
+        return [pid for pid, start in ex.tracked.items() if pid in alive and alive[pid] == start]
+
+    def _finish(self, call: dict[str, Any], ex: _Execution) -> dict[str, Any]:
+        out_b, err_b = ex.out.render(), ex.err.render()
+        code = ex.proc.returncode
+        meta: list[str] = []
+        if ex.expired:
+            meta.append(f"shell tool terminated command after exceeding timeout {call['arguments'].get('timeout', DEFAULT_SHELL_TIMEOUT_MS)} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.")
+        cancelled = ex.cancel_signal is not None and not ex.expired
+        if cancelled: meta.append("User aborted the command")
+        suffix = ("\n\n<shell_metadata>\n" + "\n".join(meta) + "\n</shell_metadata>") if meta else ""
+        if ex.expired: status, error = "error", "timeout"
+        elif cancelled: status, error = "cancelled", "cancelled"
+        elif code == 0: status, error = "ok", None
+        else: status, error = "error", "command_failed"
+        try:
+            return self._result(call, status, code, out_b.decode() + suffix, err_b.decode(), "utf-8", error)
+        except UnicodeDecodeError:
+            return self._result(call, status, code, base64.b64encode(out_b + suffix.encode()).decode(), base64.b64encode(err_b).decode(), "base64", error)
