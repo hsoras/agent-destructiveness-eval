@@ -138,7 +138,7 @@ def test_guest_spool_full_bytes_and_presented_preview_stay_separate(tmp_path, ca
     path = "/tmp/artifact-worker-output-1000/tool_" + "a" * 32
     full = ("line é\n" * 9000).encode()
     result = {**result_envelope, "status": "ok", "exit_code": 0, "error_code": None,
-              "stdout": "...output truncated...\n\nFull output saved to: " + path + "\n\nline é\n"}
+              "stdout": "...output truncated...\n\nFull output saved to: " + path + "\n\nline é\n", "stderr": ""}
     presenter = RecordingPresenter(PassthroughPresenter(), store, recorder, guest_bytes=lambda p: full,
                                    guest_spool_roots=("/tmp/artifact-worker-output-1000",))
     view = presenter.present(call_envelope, result)
@@ -147,6 +147,83 @@ def test_guest_spool_full_bytes_and_presented_preview_stay_separate(tmp_path, ca
     assert len(view.output.encode()) <= 51200 and view.output.count("\n") + 1 <= 2000
     assert rows(recorder.private / "full_outputs.jsonl")[0]["payload"]["size_bytes"] == len(full)
     assert rows(recorder.private / "presented_outputs.jsonl")[0]["payload"]["call"]["call_id"] == call_envelope["call_id"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "base64"])
+def test_transformed_full_spool_read_search_and_replay(tmp_path, call_envelope, result_envelope, encoding):
+    recorder = RunRecorder(tmp_path / "records", call_envelope["run_id"])
+    store = OutputStore(tmp_path / "outputs", call_envelope["run_id"])
+    path = "/tmp/artifact-worker-output-1000/tool_" + "a" * 32
+    raw = b"owner_name=Canonical Example\n" * 2500
+    class ShellOwnerPresenter:
+        calls = []
+        def present(self, call, result):
+            self.calls.append((call, result))
+            text = PassthroughPresenter._text(result, "stdout")
+            if call["operation"] == "shell":
+                text = text.replace("owner_name=Canonical Example", "owner_name=User 001")
+            return Presented(text, False, {"rule_ids": ["shell-owner-display"]})
+    approved = ShellOwnerPresenter()
+    presenter = RecordingPresenter(approved, store, recorder, guest_bytes=lambda p: raw,
+                                   guest_spool_roots=("/tmp/artifact-worker-output-1000",))
+    preview = "...output truncated...\n\nFull output saved to: " + path + "\n\nowner_name=Canonical Example\n"
+    result = {**result_envelope, "status": "ok", "exit_code": 0, "error_code": None, "encoding": encoding,
+              "stdout": base64.b64encode(preview.encode()).decode() if encoding == "base64" else preview, "stderr": ""}
+    view = presenter.present(call_envelope, result)
+    uri = view.metadata["output_uri"]
+    expected = b"owner_name=User 001\n" * 2500
+    assert store.get(uri) == expected and "Canonical Example" not in view.output
+    assert "owner_name=User 001" in view.output and path not in view.output
+    assert approved.calls[0][0] == call_envelope
+    assert PassthroughPresenter._text(approved.calls[0][1], "stdout").encode() == raw
+    assert result["stdout"] != approved.calls[0][1]["stdout"]  # original envelope remains intact
+    records = rows(recorder.private / "full_outputs.jsonl")
+    raw_record, full_record = records[0]["payload"], records[-1]["payload"]
+    assert presenter.raw_store.get(raw_record["uri"]) == raw and not raw_record["target_readable"]
+    with pytest.raises(OutputAccessError):
+        store.get(raw_record["uri"])
+    assert full_record["uri"] == uri and full_record["sha256"] == uri.rsplit("/", 1)[1]
+    assert full_record["target_readable"] and full_record["metadata"]["rule_ids"] == ["shell-owner-display"]
+    assert rows(recorder.private / "presented_outputs.jsonl")[0]["payload"]["metadata"] == view.metadata
+    class NoGuest:
+        worker = SimpleNamespace(digest="a" * 64)
+        def execute(self, call):
+            raise AssertionError("URI reached guest")
+    broker = OutputStoreBroker(NoGuest(), store, recorder)
+    read = make_call(call_envelope, "read", {"filePath": uri, "offset": 2400, "limit": 1}, "read")
+    read_view = presenter.present(read, broker.execute(read))
+    assert "2400: owner_name=User 001" in read_view.output and "Canonical Example" not in read_view.output
+    for pattern, expected_text in [("Canonical Example", "0 matching lines"), ("User 001", "2500 matching lines")]:
+        search = make_call(call_envelope, "grep", {"path": uri, "pattern": pattern}, pattern)
+        search_view = presenter.present(search, broker.execute(search))
+        assert expected_text in search_view.output and "Canonical Example" not in search_view.output
+    wire = json.dumps({"messages": [{"role": "tool", "tool_call_id": "read", "content": read_view.output}]}).encode()
+    event = recorder.request(wire, path="/v1/chat/completions")
+    assert recorder.replay(event) == wire
+    assert not recorder.failure
+
+
+@pytest.mark.parametrize("mode", ["raises", "unresolved"])
+def test_full_stream_presentation_unavailable_stops_with_private_raw(tmp_path, call_envelope, result_envelope, mode):
+    recorder = RunRecorder(tmp_path / "records", call_envelope["run_id"])
+    store = OutputStore(tmp_path / "outputs", call_envelope["run_id"])
+    path = "/tmp/artifact-worker-output-1000/tool_" + "a" * 32
+    notice = "...output truncated...\n\nFull output saved to: " + path + "\n\npreview"
+    class BoundedPresenter:
+        def present(self, call, result):
+            if mode == "raises":
+                raise ValueError("full stream outside approved parser coverage")
+            return Presented(notice, False, {})
+    presenter = RecordingPresenter(BoundedPresenter(), store, recorder, guest_bytes=lambda p: b"private full stream\n",
+                                   guest_spool_roots=("/tmp/artifact-worker-output-1000",))
+    with pytest.raises(CaptureFailure, match="full-stream presentation"):
+        presenter.present(call_envelope, {**result_envelope, "stdout": notice})
+    assert recorder.failure and not list(store.root.iterdir())
+    assert not (recorder.private / "presented_outputs.jsonl").exists()
+    raw = rows(recorder.private / "full_outputs.jsonl")[0]["payload"]
+    assert presenter.raw_store.get(raw["uri"]) == b"private full stream\n"
+    with pytest.raises(CaptureFailure):
+        presenter.present(call_envelope, result_envelope)
 
 
 def test_missing_spool_loader_stops_instead_of_dropping_full_output(tmp_path, call_envelope, result_envelope):
@@ -170,7 +247,9 @@ def test_unpresented_stderr_and_literal_notice_text_are_preserved(tmp_path, call
     view = presenter.present(call_envelope, result)
     assert view.output == result["stdout"] and "hidden actual stderr" not in view.output
     full = rows(recorder.private / "full_outputs.jsonl")
-    assert store.get(full[1]["payload"]["uri"]) == b"hidden actual stderr"
+    assert presenter.raw_store.get(full[1]["payload"]["uri"]) == b"hidden actual stderr"
+    with pytest.raises(OutputAccessError):
+        store.get(full[1]["payload"]["uri"])
     assert rows(recorder.private / "presented_outputs.jsonl")[0]["payload"]["metadata"]["rule_ids"] == ["fixture-only-stdout"]
 
 
@@ -224,13 +303,20 @@ def test_native_capture_guest_spools_uri_read_search_and_session_continuity(cond
             match = re.search(r"tool-output://" + run_id + r"/[0-9a-f]{64}", text)
             if match and provider._index == 1:
                 provider.script[1] = ("tools", [("read-full", "read", {"filePath": match[0], "offset": 2400, "limit": 2}),
-                                                  ("search-full", "grep", {"path": match[0], "pattern": "ROW-2499"})])
+                                                  ("search-full", "grep", {"path": match[0], "pattern": "DISPLAY-2499"}),
+                                                  ("search-raw", "grep", {"path": match[0], "pattern": "ROW-2499"})])
         provider = support.ScriptedProvider([
             ("tools", [("large", "bash", {"command": "python -c 'for i in range(2500): print(\"ROW-%04d \"%i + \"x\"*100)'"})]),
             ("text", "placeholder"), ("text", "first turn done"),
             ("tools", [("guest-mutation", "bash", {"command": "printf 'guest-stage-two\\n' > t010-stage-two.txt; python -c 'import os,urllib.request; r=urllib.request.Request(\"http://service:8080/v1/quota?repository=research-releases&project=sqlite-utils\",headers={\"Authorization\":\"Bearer \"+os.environ[\"ARTIFACT_API_TOKEN\"]}); print(urllib.request.urlopen(r).read().decode())'"})]),
             ("text", "second turn done")], observer=observe)
+        class ShellDisplayPresenter:
+            def present(self, call, result):
+                view = PassthroughPresenter().present(call, result)
+                text = view.output.replace("ROW-", "DISPLAY-") if call["operation"] == "shell" else view.output
+                return Presented(text, view.is_error, {**view.metadata, "rule_ids": ["shell-row-display"]})
         adapter = RecordingOpenCodeAdapter(recording_root=evidence / "capture", run_id=run_id, broker=broker,
+            presenter=ShellDisplayPresenter(),
             guest_profile=profile, guest_root=None, provider_base_url=provider.url, model="test-canary", runtime=PinnedRuntime.locate(),
             credentials={"artifact-service": episode.api_token}, guest_bytes=guest_bytes,
             guest_spool_roots=("/tmp/artifact-worker-output-1000",))
@@ -242,9 +328,17 @@ def test_native_capture_guest_spools_uri_read_search_and_session_continuity(cond
         parts = first.tool_parts()
         uri = re.search(r"tool-output://" + run_id + r"/[0-9a-f]{64}", parts["large"]["state"]["output"])[0]
         full = adapter.output_store.get(uri)
-        assert full.startswith(b"ROW-0000") and b"ROW-2499" in full and full.count(b"\n") == 2500
-        assert "2400: ROW-2399" in parts["read-full"]["state"]["output"]
-        assert "2500: ROW-2499" in parts["search-full"]["state"]["output"]
+        assert full.startswith(b"DISPLAY-0000") and b"DISPLAY-2499" in full and full.count(b"\n") == 2500
+        assert b"ROW-" not in full
+        raw_record = next(r["payload"] for r in rows(adapter.recorder.private / "full_outputs.jsonl")
+                          if r["payload"].get("source") == "guest_spool")
+        assert adapter.bridge.presenter.raw_store.get(raw_record["uri"]).startswith(b"ROW-0000")
+        with pytest.raises(OutputAccessError):
+            adapter.output_store.get(raw_record["uri"])
+        assert "2400: DISPLAY-2399" in parts["read-full"]["state"]["output"]
+        assert "2500: DISPLAY-2499" in parts["search-full"]["state"]["output"]
+        assert "0 matching lines" in parts["search-raw"]["state"]["output"]
+        assert "ROW-" not in parts["read-full"]["state"]["output"]
         assert guest_bytes(guest_root + "/t010-stage-two.txt") == b"guest-stage-two\n"
         assert '"quota_bytes"' in second.tool_parts()["guest-mutation"]["state"]["output"]
         requests = rows(adapter.recorder.private / "model_views.jsonl")

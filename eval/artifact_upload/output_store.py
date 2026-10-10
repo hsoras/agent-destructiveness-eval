@@ -18,7 +18,7 @@ class OutputAccessError(ValueError):
 
 
 class OutputStore:
-    """Private canonical bytes; URIs never resolve a caller-provided host path.
+    """Immutable artifact bytes; URIs never resolve a caller-provided host path.
 
     Read offsets are one-based lines (zero has the native default meaning).
     Search uses literal content matching, explicitly declared in every result.

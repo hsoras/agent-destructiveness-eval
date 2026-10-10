@@ -196,16 +196,16 @@ class RecordingPresenter:
                  guest_spool_roots: tuple[str, ...]):
         self.presenter, self.store, self.recorder = presenter, store, recorder
         self.guest_bytes, self.guest_spool_roots = guest_bytes, guest_spool_roots
+        # Raw evidence is never registered with the target's read/search broker.
+        self.raw_store = OutputStore(recorder.private / "raw-outputs", store.run_id)
 
     def present(self, call: dict[str, Any], result: dict[str, Any]) -> Presented:
         self.recorder.check()
-        presented = self.presenter.present(call, result)
-        text = presented.output
-        uri = None
         try:
-            # Each original stream is captured independently, including stderr
-            # when the presenter only exposes stdout. Recognize the existing
-            # native notice shapes, not an arbitrary occurrence in project text.
+            full_result = dict(result)
+            expanded = False
+            # Reconstruct the original operation's full result before applying
+            # its approved Presenter. A later read/grep cannot reapply shell rules.
             for field in ("stdout", "stderr"):
                 data = base64.b64decode(result[field]) if result["encoding"] == "base64" else result[field].encode()
                 stream_text = data.decode("utf-8", errors="replace")
@@ -216,23 +216,33 @@ class RecordingPresenter:
                     if not self.guest_bytes or ".." in pure.parts or not any(pure.parent == PurePosixPath(root) for root in self.guest_spool_roots) or not re.fullmatch(r"tool_[0-9a-f]{32}", pure.name):
                         self.recorder.fail("unresolvable guest full-output spool")
                     data = self.guest_bytes(path)
-                stream_uri = self.store.put(data)
-                # Researcher full-output sidecars include sanitized text, canonical bytes remain in store.
+                    expanded = True
+                stream_uri = self.raw_store.put(data)
                 self.recorder.append("full_outputs", {"call_id": call["call_id"], "session_id": call["session_id"], "uri": stream_uri,
                                                      "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data),
                                                      "text": data.decode("utf-8", errors="replace"), "source": "guest_spool" if path else "raw_stream",
-                                                     "stream": field})
-                if path and path in text:
-                    uri = stream_uri
-                    text = text.replace(path, stream_uri)
-            full_uri = self.store.put(presented.output.encode())
+                                                     "stream": field, "target_readable": False})
+                full_result[field] = base64.b64encode(data).decode() if result["encoding"] == "base64" else data.decode("utf-8", errors="replace")
+            try:
+                presented = self.presenter.present(call, full_result)
+            except Exception:
+                self.recorder.fail("full-stream presentation unavailable")
+            # A presenter that still advertises a guest spool has not established
+            # a self-contained presented continuation. Stop rather than expose raw.
+            if expanded and (_GUEST_HEAD_NOTICE.match(presented.output) or _GUEST_TAIL_NOTICE.search(presented.output)):
+                self.recorder.fail("full-stream presentation unresolved")
+            full_data = presented.output.encode()
+            full_uri = self.store.put(full_data)
             self.recorder.append("full_outputs", {"call_id": call["call_id"], "session_id": call["session_id"], "uri": full_uri,
-                                                 "size_bytes": len(presented.output.encode()), "text": presented.output, "source": "presenter_full"})
-            output, mediated_uri = self.store.preview(text, force_uri=uri)
+                                                 "sha256": hashlib.sha256(full_data).hexdigest(), "size_bytes": len(full_data),
+                                                 "text": presented.output, "source": "presenter_full", "target_readable": True,
+                                                 "metadata": presented.metadata})
+            output, mediated_uri = self.store.preview(presented.output, force_uri=full_uri if expanded else None)
+            metadata = {**presented.metadata, "output_uri": mediated_uri or full_uri}
             self.recorder.append("presented_outputs", {"call": call, "output": output, "is_error": presented.is_error,
-                                                       "metadata": presented.metadata, "output_uri": mediated_uri,
+                                                       "metadata": metadata, "output_uri": metadata["output_uri"],
                                                        "capability_difference": "immutable broker URI; literal search; no shell projection"})
-            return Presented(output, presented.is_error, {**presented.metadata, "output_uri": mediated_uri or full_uri})
+            return Presented(output, presented.is_error, metadata)
         except CaptureFailure:
             raise
         except Exception:
