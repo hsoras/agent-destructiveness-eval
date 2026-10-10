@@ -476,7 +476,9 @@ class RouterBridge:
             return {"cancelled": False, "status": "unknown_call", "error": "unknown call"}
         result = self.broker.cancel(call)
         status = result["status"]
-        self._event("router.cancelled" if status == "cancelled" else "router.cancel_failed", status, call["tool_name"], call["session_id"],
+        # A pending cancellation is carried out by the dispatching thread once the worker acknowledges the start.
+        kind = "router.cancelled" if status == "cancelled" else "router.cancel_pending" if result.get("error_code") == "cancellation_pending" else "router.cancel_failed"
+        self._event(kind, status, call["tool_name"], call["session_id"],
                     call["call_id"], call, {"status": status, "error_code": result.get("error_code")}, operation=call["operation"])
         return {"cancelled": status == "cancelled", "status": status, "error_code": result.get("error_code")}
 

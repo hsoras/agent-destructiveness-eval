@@ -864,6 +864,46 @@ def _interrupt_cancels_running_command(harness, guest, artifact_dir, mode):
     save(artifact_dir, f"cancellation-real-runtime-{mode}.json", {"seconds_to_cancelled": cancelled_after, "journal_state": entry["state"], "turn_outcome": str(outcome)[:500]})
 
 
+def test_interrupting_a_registered_pending_dispatch_cancels_before_the_guest_mutates(harness, guest, artifact_dir):
+    """An interrupt accepted after registration/dispatch but before the worker knows the execution is not lost."""
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)  # the runtime cannot cancel its own tool call
+    marker = f"{WORKTREE}/cancellation_failed_pending.txt"
+    guest_exec(guest, f"rm -f {marker}")
+    h = harness(script=[("tools", [("call_pending_001", "bash", {"command": "sleep 2; touch cancellation_failed_pending.txt", "description": "pending mutation"})]), ("text", "never")])
+    entered, release = threading.Event(), threading.Event()
+    real_start = h.transport.start
+
+    def gated_start(call):  # schedules the unchanged call later; the real worker still runs it
+        entered.set()
+        if not release.wait(20):
+            raise RuntimeError("dispatch gate timed out")
+        return real_start(call)
+
+    h.transport.start = gated_start
+    outcome: list[Any] = []
+    turn = threading.Thread(target=lambda: outcome.append(_run_turn_catching(h)))
+    try:
+        turn.start()
+        assert entered.wait(90), "the runtime never reached dispatch"
+        sid = next(sid for sid, cid in h.adapter.bridge._inflight if cid == "call_pending_001")
+        assert h.broker.journal.by_call(h.run_id, sid, "call_pending_001")["state"] == "dispatched"
+        assert h.adapter.interrupt()
+        pending = [e for e in h.adapter.bridge.events if e["call_id"] == "call_pending_001" and e["event_type"].startswith("router.cancel")]
+        assert [e["event_type"] for e in pending] == ["router.cancel_pending"], pending
+        release.set()
+        turn.join(timeout=60)
+        assert not turn.is_alive()
+        entry = h.broker.journal.by_call(h.run_id, sid, "call_pending_001")
+        time.sleep(3)  # past the point where the abandoned command would have mutated the guest
+        assert guest_exec(guest, f"test -e {marker}").returncode != 0, "accepted interrupt let the pending command mutate the guest"
+        assert entry["state"] == "cancelled" and entry["result"]["status"] == "cancelled", entry
+        save(artifact_dir, "cancellation-pending-dispatch.json", {"journal": entry, "turn_outcome": str(outcome)[:500]})
+    finally:
+        release.set()
+        turn.join(timeout=60)
+        signal.signal(signal.SIGINT, previous)
+
+
 def _run_turn_catching(h: Harness):
     try:
         return h.turn("run a slow command")

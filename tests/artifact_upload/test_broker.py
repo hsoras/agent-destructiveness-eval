@@ -234,3 +234,117 @@ def test_uncertain_after_worker_loss_is_unknown_and_cancel_kills_process_group(b
     assert not host.invalidate_filesystem_facts(read)
     for event in host.events:
         validate("event", event)
+
+
+@pytest.mark.parametrize("phase", ["registered", "dispatched", "lost_ack", "running", "completed"])
+def test_cancellation_intent_survives_every_dispatch_phase(broker, monkeypatch, phase):
+    """An accepted cancel is never lost between registration, dispatch, start acknowledgement and collection."""
+    host, worker, tmp_path = broker
+    marker = tmp_path / "guest" / "mutated"
+    request = call("shell", {"command": "printf done" if phase == "completed" else "sleep 1; touch mutated"}, f"phase-{phase}")
+    key = {name: request[name] for name in ("run_id", "session_id", "call_id", "argument_digest")}
+    real_start, starts = worker.start, []
+    entered, release = threading.Event(), threading.Event()
+
+    def gated_start(value):
+        starts.append(value["call_id"])
+        entered.set()
+        assert release.wait(10)
+        handle = real_start(value)
+        if phase == "lost_ack":
+            raise ConnectionError("start acknowledgement lost after crossing the worker boundary")
+        return handle
+
+    if phase == "registered":
+        cancelled = host.cancel(request)
+        assert cancelled["status"] == "cancelled" and cancelled["error_code"] == "cancelled_before_dispatch"
+        assert host.execute(request) == cancelled
+        assert starts == [] and host.journal.get(key)["state"] == "cancelled"
+        return
+    if phase == "completed":
+        done = host.execute(request)
+        assert host.cancel(request) == done and done["status"] == "ok"
+        assert host.journal.get(key)["state"] == "completed"
+        return
+    if phase in {"dispatched", "lost_ack"}:
+        monkeypatch.setattr(worker, "start", gated_start)
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.setdefault("result", host.execute(request)))
+    thread.start()
+    try:
+        if phase == "running":
+            deadline = time.monotonic() + 4
+            while (host.journal.get(key) or {}).get("state") != "running":
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert host.cancel(request)["status"] == "cancelled"
+        else:
+            assert entered.wait(4)
+            assert host.journal.get(key)["state"] == "dispatched"
+            pending = host.cancel(request)
+            # The worker does not know the execution yet: report the truth, keep the intent.
+            assert pending["status"] == "unknown" and pending["error_code"] == "cancellation_pending"
+            release.set()
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert outcome["result"]["status"] == "cancelled", outcome
+    assert host.journal.get(key)["state"] == "cancelled"
+    time.sleep(1.5)  # past the point where the abandoned command would have mutated the guest
+    assert not marker.exists(), "accepted cancellation let the command mutate the guest"
+    for event in host.events:
+        validate("event", event)
+
+
+def test_cancel_reconciliation_never_overwrites_the_collected_terminal_result(broker, monkeypatch):
+    """The worker's collected cancellation wins over a concurrent reconcile that lost the worker's record."""
+    host, worker, _ = broker
+    request = call("shell", {"command": "sleep 5"}, "race")
+    key = {name: request[name] for name in ("run_id", "session_id", "call_id", "argument_digest")}
+    real_stream = worker.stream
+    queried, delivered = threading.Event(), threading.Event()
+
+    def stream(value):
+        for event in real_stream(value):
+            if event["type"] == "result":
+                # Hold the terminal result until cancel's reconciliation has read the running entry.
+                assert queried.wait(5)
+                delivered.set()
+            yield event
+
+    def status_after_delivery(value):
+        # As observed on the real session transport, the worker has no record once the result was delivered.
+        if queried.is_set():
+            raise ConnectionError("worker dropped the delivered execution")
+        queried.set()
+        assert delivered.wait(5)
+        # Let an unserialised terminal write land first (the observed interleaving). A serialised
+        # broker blocks that write behind this reconcile, so the bounded wait simply expires.
+        deadline = time.monotonic() + 1
+        while host.journal.get(key)["state"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise ConnectionError("worker dropped the delivered execution")
+
+    monkeypatch.setattr(worker, "stream", stream)
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.setdefault("result", host.execute(request)))
+    thread.start()
+    deadline = time.monotonic() + 4
+    while (host.journal.get(key) or {}).get("state") != "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    real_cancel = worker.cancel
+
+    def cancel_then_lose_record(value, *, how="terminate"):
+        sent = real_cancel(value, how=how)
+        monkeypatch.setattr(worker, "status", status_after_delivery)
+        return sent
+
+    monkeypatch.setattr(worker, "cancel", cancel_then_lose_record)
+    final = host.cancel(request)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert outcome["result"]["status"] == "cancelled"
+    assert host.journal.get(key)["state"] == "cancelled", host.journal.get(key)
+    assert final["status"] == "cancelled", final
