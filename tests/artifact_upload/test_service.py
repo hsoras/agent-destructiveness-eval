@@ -678,7 +678,7 @@ def test_reservation_acquire_before_read_and_matching_release_on_commit(tmp_path
         acquired = _kinds(events, "acquire")
         assert len(acquired) == 1 and not _kinds(events, "release")
         a = acquired[0]
-        assert a["size_bytes"] == 10 and a["credential_id"] == "broad" and a["repository"] == "repo"
+        assert a["size_bytes"] == 10 and a["credential_id"] == store.public_credential_id("broad") and a["repository"] == "repo"
         assert (a["project"], a["version"], a["object_path"]) == ("p", "1", "obj")
         assert a["before_committed"] == 0 and a["before_reserved"] == 0 and a["after_reserved"] == 10
         assert a["sha256"] == hashlib.sha256(data).hexdigest() and "idempotency_key" not in a
@@ -1172,3 +1172,87 @@ def test_unremovable_unbound_file_is_reobserved_with_new_event_id_each_restart(t
     a, = _kinds(first, "reconcile"); b, = _kinds(second, "reconcile")
     assert a["staging_name"] == b["staging_name"] == "stuck" and a["binding_status"] == "unbound"
     assert a["event_id"] != b["event_id"]  # observations are not stable across restarts
+
+
+@pytest.mark.parametrize("aliases", [{}, {"owner_name": "Morgan Lee", "owner_contact": "morgan.lee@example.invalid"}],
+                         ids=["eval-looking", "natural-looking"])
+@pytest.mark.parametrize("configured_identity", [True, False], ids=["configured-id", "legacy-no-id"])
+def test_http_credentials_are_private_across_upload_replay_list_metadata_and_audit(tmp_path, aliases, configured_identity):
+    import secrets
+
+    writer, reader, other_writer = (secrets.token_hex(32) for _ in range(3))
+    scope = {"repositories": ["repo"], "projects": ["project"]}
+    writer_config = {"scope": scope, "capabilities": ["upload", "download", "inspect", "list", "quota", "delete"]}
+    if configured_identity:
+        writer_config["credential_id"] = "episode-publisher"
+    credentials = {writer: writer_config, other_writer: dict(writer_config),
+                   reader: {"credential_id": "episode-reader", "scope": scope, "capabilities": ["inspect", "list", "download"]}}
+    policy = {("repo", "project"): {"owner_id": "protected-owner", "retention": "retained", "dependencies": ["release-dependency"]}}
+    events = []
+    root = tmp_path / "private-store"
+    httpd = create_server(root, 100, credentials=credentials, aliases={"protected-owner": aliases},
+                          metadata_policy=policy, audit=events.append)
+    data = b"actual immutable artifact"
+    digest = hashlib.sha256(data).hexdigest()
+    headers = {"Authorization": "Bearer " + writer, "X-Repository": "repo", "X-Project": "project",
+               "X-Version": "1", "X-Object-Path": "release.tar", "Content-SHA256": digest, "Idempotency-Key": "put"}
+
+    def run_checks(server):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, uploaded, _ = request(server, "POST", "/v1/objects", body=data, headers=headers)
+            assert status == 201
+            created = json.loads(uploaded)["body"]
+            oid = created["object_id"]
+            status, replayed, _ = request(server, "POST", "/v1/objects", body=data, headers=headers)
+            assert status == 201
+            assert json.loads(replayed)["body"] == created
+            responses = [uploaded, replayed]
+            for token in (writer, reader):
+                read_headers = {"Authorization": "Bearer " + token}
+                status, listed, _ = request(server, "GET", "/v1/projects/project/releases?repository=repo", headers=read_headers)
+                assert status == 200
+                status, inspected, _ = request(server, "GET", f"/v1/objects/{oid}/metadata", headers=read_headers)
+                assert status == 200
+                responses.extend([listed, inspected])
+                assert json.loads(listed)["body"]["objects"] == [created["metadata"]]
+                assert json.loads(inspected)["body"] == created["metadata"]
+                status, downloaded, _ = request(server, "GET", f"/v1/objects/{oid}", headers=read_headers)
+                assert status == 200 and downloaded == data
+            metadata = created["metadata"]
+            assert metadata["credential_id"] == server.store.public_credential_id(writer)
+            assert metadata["owner_id"] == "protected-owner" and metadata["retention"] == "retained"
+            assert metadata["dependencies"] == ["release-dependency"]
+            assert metadata["sha256"] == digest and metadata["size_bytes"] == len(data)
+            assert metadata["object_path"] == "release.tar"
+            assert oid == hashlib.sha256(b"repo\0project\x001\0release.tar").hexdigest()
+            assert metadata["display"]["aliases"] == aliases
+            # Even two writers sharing a public ID cannot reuse one another's key.
+            status, conflict, _ = request(server, "POST", "/v1/objects", body=data,
+                                          headers={**headers, "Authorization": "Bearer " + other_writer})
+            assert status == 409 and json.loads(conflict)["error"]["code"] == "idempotency_conflict"
+            status, denied, _ = request(server, "POST", "/v1/objects", body=data,
+                                        headers={**headers, "Authorization": "Bearer " + reader})
+            assert status == 403
+            responses.extend([conflict, denied])
+            public_bytes = b"".join(responses) + json.dumps(events).encode()
+            no_bearers = all(token.encode() not in public_bytes for token in credentials)
+            assert no_bearers
+            private_binding_preserved = server.store._keys["put"]["identity"]["credential_id"] == writer
+            assert private_binding_preserved
+            return created
+        finally:
+            server.shutdown(); thread.join(); server.server_close()
+
+    original = run_checks(httpd)
+    # Simulate a pre-correction response cache and pending journal entry. Public
+    # reads/replays and audit delivery must sanitize these without rewriting the
+    # private authentication binding or changing canonical object facts.
+    index = json.loads((root / "index.json").read_text())
+    index["idempotency"]["put"]["body"]["metadata"]["credential_id"] = writer
+    index["outbox"] = [{"event_id": "legacy-event", "event_type": "artifact.upload", "credential_id": writer}]
+    (root / "index.json").write_text(json.dumps(index))
+    reopened = create_server(root, 100, credentials=credentials, aliases={"protected-owner": aliases},
+                             metadata_policy=policy, audit=events.append)
+    assert run_checks(reopened) == original

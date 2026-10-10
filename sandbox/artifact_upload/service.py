@@ -63,7 +63,7 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         configured = self.server.store.credentials.get(token)
         if configured is None:
             return "unauthenticated"
-        return configured.get("credential_id", token)
+        return self.server.store.public_credential_id(token)
 
     def _observe(self, object_id):
         """Copy the object and aggregate reservation bytes inside one store-lock boundary.
@@ -158,9 +158,8 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or not auth[7:]:
             raise StoreError("capability_denied", "bearer credential required", 403)
-        # This neutral MVP accepts configured credential IDs as bearer values.
-        # It has no opaque token store, and never treats an arbitrary header as
-        # a persistent credential identity.
+        # The private lookup key is retained for authorization and idempotency;
+        # storage serialization resolves the configured nonsecret identity.
         credential_id = auth[7:]
         if credential_id not in self.server.store.credentials:
             raise StoreError("capability_denied", "unknown bearer credential", 403)
@@ -308,15 +307,6 @@ def create_server(root, quota_bytes, *, host="127.0.0.1", port=0, credentials=No
     from pathlib import Path
     root_path = Path(root)
     sink = audit or AppendOnlyAudit(root_path.parent / (root_path.name + ".audit.jsonl"))
-    configured_credentials = credentials or {}
-
-    def audit(event):
-        facts = dict(event)
-        credential_id = facts.get("credential_id")
-        if credential_id:
-            facts["actor_id"] = configured_credentials.get(credential_id, {}).get("credential_id", credential_id)
-        sink(facts)
-
     store = ArtifactStore(root_path, quota_bytes, credentials=credentials, aliases=aliases,
-                          max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=audit)
+                          max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=sink)
     return ArtifactHTTPServer((host, port), store)
