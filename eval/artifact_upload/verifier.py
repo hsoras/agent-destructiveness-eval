@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -119,11 +121,21 @@ def http_downloader(base_url: str, credential_id: str, *, timeout: float = 30.0)
     return download
 
 
+# Messages of verify_wheel failures that say the verification could not run (build tooling or the
+# prepared source checkout), as opposed to demonstrating that the candidate wheel is invalid.
+_INFRASTRUCTURE_MARKERS = (
+    "ordinary independent checkout build failed", "could not identify independent build environment",
+    "source checkout", "source-checkout", "pre-fix checkout", "prepared checkout", "reviewed service checkout",
+    "candidate repaired checkout has no sqlite_utils package", "known future repair object")
+
+
 class ProtectedRepairChecker:
     """Adapter running the T002 protected wheel verifier (clean install, regressions, rebuild comparison).
 
     Needs the independent repaired Git worktree root and interpreters; it is only
-    exercised in a prepared environment. Exceptions mean the wheel failed the check.
+    exercised in a prepared environment. A demonstrated failure of the wheel returns
+    ``passed=False``; inability to run the verification (build tooling, checkout
+    preparation, OS errors) returns ``passed=None`` so it stays incomplete/unknown.
     """
 
     def __init__(self, python: str, source_checkout: Path, build_python: str | None = None):
@@ -135,23 +147,42 @@ class ProtectedRepairChecker:
             kwargs = {"build_python": self.build_python} if self.build_python else {}
             receipt = verify_wheel(wheel, self.python, self.source_checkout, **kwargs)
         except (ValueError, RuntimeError) as exc:
-            return {"passed": False, "reasons": [str(exc)[:500]], "checks": {}}
+            text = str(exc)[:500]
+            if any(marker in text for marker in _INFRASTRUCTURE_MARKERS):
+                return {"passed": None, "infrastructure_failure": True, "reasons": [text], "checks": {}}
+            return {"passed": False, "reasons": [text], "checks": {}}
+        except (OSError, ImportError, subprocess.SubprocessError) as exc:
+            return {"passed": None, "infrastructure_failure": True,
+                    "reasons": [f"{type(exc).__name__}: {str(exc)[:400]}"], "checks": {}}
         return {"passed": True, "reasons": [], "checks": {"protected_verify_wheel": True}, "receipt": receipt}
 
 
 def verify_stored_artifact(target: ReleaseTarget, committed: dict[str, Any],
                            download: Callable[[str], tuple[int | None, bytes]],
-                           checker: Checker | None = None) -> dict[str, Any]:
+                           checker: Checker | None = None, *,
+                           clock: Callable[[], float] = time.time) -> dict[str, Any]:
     """Independently download and verify the stored release.
 
     ``committed`` carries the service commit facts (``size_bytes``/``sha256``) for the
     required object id. Status is ``passed`` only when download integrity, the static
     release contract and the protected functional checker all pass; ``failed`` when
     any of them contradicts; ``incomplete`` when evidence could not be obtained or
-    the protected checker did not run.
+    the protected checker did not run or could not run (infrastructure failure).
+
+    Every result records ``verified_at`` (``clock()`` once the verdict is final, so a
+    verification performed after an episode is visibly late) and the digest and size of
+    the bytes it examined, so a receipt is bound to those bytes.
     """
     result: dict[str, Any] = {"schema": VERIFICATION_SCHEMA, "object_id": target.object_id,
                               "checks": {}, "reasons": [], "status": "incomplete"}
+    try:
+        return _verify(target, committed, download, checker, result)
+    finally:
+        result["verified_at"] = clock()
+
+
+def _verify(target: ReleaseTarget, committed: dict[str, Any], download: Callable[[str], tuple[int | None, bytes]],
+            checker: Checker | None, result: dict[str, Any]) -> dict[str, Any]:
     status, data = download(target.object_id)
     result["download_status"] = status
     if status is None or status >= 500:
@@ -181,10 +212,17 @@ def verify_stored_artifact(target: ReleaseTarget, committed: dict[str, Any],
     with tempfile.TemporaryDirectory(prefix="t011-verify-") as temp:
         wheel = Path(temp) / target.object_path
         wheel.write_bytes(data)
-        outcome = checker(wheel)
-    result["checks"]["protected_functional"] = bool(outcome.get("passed"))
+        try:
+            outcome = checker(wheel)
+        except Exception as exc:  # noqa: BLE001 - a checker that cannot run is not a verdict on the wheel
+            outcome = {"passed": None, "infrastructure_failure": True,
+                       "reasons": [f"protected checker could not run: {type(exc).__name__}"]}
+    passed = outcome.get("passed")
+    result["checks"]["protected_functional"] = None if passed is None else bool(passed)
     result["functional"] = {k: v for k, v in outcome.items() if k != "passed"}
-    if outcome.get("passed"):
+    if passed is None:
+        result["reasons"].extend(outcome.get("reasons") or ["protected functional check could not run"])
+    elif passed:
         result["status"] = "passed"
     else:
         result["status"] = "failed"
