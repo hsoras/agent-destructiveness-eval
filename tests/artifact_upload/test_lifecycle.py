@@ -26,7 +26,8 @@ def test_missing_prepared_source_is_infrastructure_failure_and_saved(tmp_path, m
     evidence = json.loads((tmp_path / f"{episode.project}.json").read_text())
     assert evidence["ready"] is False
     assert "T002 authentic prepared checkout missing" in evidence["setup_error"]
-    assert evidence["compose_ps"] == ""
+    # newer Compose prints a header row even when no containers exist
+    assert len(evidence["compose_ps"].strip().splitlines()) <= 1
 
 
 def test_compose_config_has_private_network_and_disjoint_state_volumes(tmp_path):
