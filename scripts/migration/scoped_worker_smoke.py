@@ -82,6 +82,7 @@ def smoke(directory, machine):
     root=Path(directory).resolve() if directory else Path(tempfile.mkdtemp(prefix='gemini-scoped-smoke-'))
     if directory: root.mkdir(parents=True,exist_ok=False)
     repo,config=fixture(root)
+    (repo/'.gitignore').write_text('/.scenario/worker-tmp/\n')
     (repo/'AGENTS.md').write_text('Disposable implementation fixture. Only probe.py may change. '
         'Keep tests, Makefile, configuration and Git metadata unchanged. Use only supplied development commands. '
         'The trusted coordinator creates the commit after checking source, scope, and tests.\n')
@@ -137,7 +138,7 @@ def smoke(directory, machine):
         docker_guest=dict(machine=machine,files=['probe.py','test_probe.py'],base_image='python:3.11-slim'))
     git(repo,'add','.');git(repo,'commit','-m','scoped Python and Docker fixture')
     baseline=snapshot(repo)
-    immutable={p:hashlib.sha256((repo/p).read_bytes()).hexdigest() for p in ('test_probe.py','test_boundary.py','Makefile','AGENTS.md')}
+    immutable={p:hashlib.sha256((repo/p).read_bytes()).hexdigest() for p in ('test_probe.py','test_boundary.py','Makefile','AGENTS.md','.gitignore')}
     atomic(root/'config.json',config);atomic(root/'providers.json',routing)
     tasks=[t for t in read_graph(repo) if t['id']=='T001']
     task=tasks[0]
