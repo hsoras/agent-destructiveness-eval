@@ -43,11 +43,26 @@ class ExecutionBroker:
         self.run_id, self.worker = run_id, worker
         self.journal = ExecutionJournal(journal_path)
         self._lock = threading.RLock()
+        # Cancellations accepted while a shell start may still be crossing the
+        # worker boundary. The dispatching thread owns carrying them out.
+        self._cancel_intent: set[tuple[str, ...]] = set()
         self.events: list[dict[str, Any]] = []
 
     @staticmethod
     def _key(call: dict[str, Any]) -> dict[str, str]:
         return {name: call[name] for name in ("run_id", "session_id", "call_id", "argument_digest")}
+
+    @staticmethod
+    def _intent_key(key: dict[str, str]) -> tuple[str, ...]:
+        return tuple(key[name] for name in ("run_id", "session_id", "call_id", "argument_digest"))
+
+    def _take_intent(self, key: dict[str, str]) -> bool:
+        with self._lock:
+            intent = self._intent_key(key)
+            if intent not in self._cancel_intent:
+                return False
+            self._cancel_intent.discard(intent)
+            return True
 
     def _event(self, call: dict[str, Any], kind: str, status: str, raw: Any, presented: Any) -> None:
         event = {"event_id": uuid.uuid4().hex,
@@ -83,15 +98,28 @@ class ExecutionBroker:
 
             self.journal.put(key, "accepted")
             self._event(call, "tool.accepted", "ok", call, {"state": "accepted"})
+        with self._lock:
+            # Commit dispatch only if no cancellation won the race to this point.
+            entry = self.journal.get(key)
+            if entry["state"] == "cancelled":
+                return entry["result"]
+            self.journal.put(key, "dispatched")
         try:
             if call["operation"] == "shell":
-                self.journal.put(key, "dispatched")
                 handle = self.worker.start(call)
-                self.journal.put(key, "running", process=handle)
+                with self._lock:
+                    self.journal.put(key, "running", process=handle)
+                    cancel_now = self._take_intent(key)
                 self._event(call, "tool.running", "ok", handle, {"state": "running"})
+                if cancel_now:
+                    # The interrupt arrived while start() was crossing the boundary;
+                    # stop the process group and collect its final status below.
+                    try:
+                        self.worker.cancel(key, how="terminate")
+                    except Exception:
+                        pass
                 result = self._collect(call)
             else:
-                self.journal.put(key, "dispatched")
                 result = self.worker.execute(call)
             validate_result_for_call(call, result)
         except Exception as exc:
@@ -108,13 +136,27 @@ class ExecutionBroker:
                         process = self.worker.process_handle(call)
                     except Exception:
                         process = None
-                    if process is not None:
-                        entry = self.journal.put(key, "running", process=process)
                 # A dropped acknowledgement or stream is not evidence that the
                 # worker lost its execution record. Query by stable key even
-                # when no process handle could be recovered.
+                # when no process handle could be recovered (the production
+                # session never returns one).
                 try:
-                    return self.reconcile(call)
+                    with self._lock:
+                        if process is not None:
+                            self.journal.put(key, "running", process=process)
+                            recovered = None
+                        else:
+                            recovered = self.reconcile(call)
+                        # Recovery to a live execution carries the dispatch
+                        # owner's accepted cancellation; a terminal outcome
+                        # settles it; unavailable evidence leaves it pending.
+                        state = self.journal.get(key)["state"]
+                        cancel_now = state == "running" and self._take_intent(key)
+                        if state not in {"running", "unknown"}:
+                            self._take_intent(key)
+                    if cancel_now:
+                        return self.cancel(call)
+                    return recovered or self.reconcile(call)
                 except Exception:
                     pass
                 result = self._unknown(call, "worker_outcome_unknown", str(exc))
@@ -126,8 +168,11 @@ class ExecutionBroker:
             return result
 
         state = {"ok": "completed", "cancelled": "cancelled", "unknown": "unknown"}.get(result["status"], "failed")
-        self.journal.put(key, state, result=result)
-        self._event(call, "tool." + state, result["status"], result, result)
+        with self._lock:
+            # A concurrent cancel's reconciliation holds this lock across its read and write, so the
+            # worker's terminal result is never overwritten by a stale "unknown".
+            self.journal.put(key, state, result=result)
+            self._event(call, "tool." + state, result["status"], result, result)
         return result
 
     def _collect(self, call: dict[str, Any]) -> dict[str, Any]:
@@ -182,6 +227,25 @@ class ExecutionBroker:
         key = self._validate_call(call)
         with self._lock:
             entry = self.journal.get(key)
+            if entry is None or entry["state"] == "accepted":
+                # Dispatch is not committed yet: suppress it with a terminal result.
+                result = self._unknown(call, "cancelled_before_dispatch", "cancelled before the worker started",
+                                       status="cancelled")
+                self.journal.put(key, "cancelled", result=result)
+                self._event(call, "tool.cancelled", "cancelled", {"state": "before_dispatch"}, result)
+                return result
+            if entry["state"] == "dispatched" and entry["process"] is None and call["operation"] == "shell":
+                try:
+                    status = self.worker.status(key)
+                except Exception:
+                    status = None
+                if not status or status.get("state") not in {"running", "completed"}:
+                    # start() may still cross the worker boundary. Its dispatching
+                    # thread cancels and collects once the start is acknowledged.
+                    self._cancel_intent.add(self._intent_key(key))
+                    result = self._unknown(call, "cancellation_pending", "cancellation is pending worker start acknowledgement")
+                    self._event(call, "tool.cancel_requested", "unknown", {"state": "dispatched"}, result)
+                    return result
             if entry is None or entry["state"] != "running":
                 result = self.reconcile(call)
                 # Reconciliation may recover a live execution after a lost

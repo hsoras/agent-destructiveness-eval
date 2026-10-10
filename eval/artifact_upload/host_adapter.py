@@ -40,7 +40,7 @@ from .contracts import (
 )
 
 RUNTIME_VERSION = "1.14.41"
-RUNTIME_SHA256 = "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68"
+RUNTIME_SHA256 = "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
 RUNTIME_SOURCE_COMMIT = "8ba2a9171597262df9d19516c82a5e14f18f5c63"
 PLUGIN_PACKAGE_VERSION = "1.14.41"
 ROUTER_SOURCES = Path(__file__).resolve().parents[2] / "runtime" / "artifact_upload_host" / "router"
@@ -88,7 +88,7 @@ class PinnedRuntime:
     def locate(cls, environ: Mapping[str, str] | None = None) -> "PinnedRuntime":
         env = os.environ if environ is None else environ
         source = Path(env.get("ARTIFACT_MIGRATION_SOURCE", _DEFAULT_SOURCE))
-        binary = Path(env.get("OPENCODE_PINNED_BINARY", source / ".scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode"))
+        binary = Path(env.get("OPENCODE_PINNED_BINARY", source / ".scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"))
         seed = Path(env.get("OPENCODE_CANARY_PLUGIN_SEED", source / ".scenario/migration-readiness/opencode-canary-plugin-1.14.41"))
         return cls(binary, seed).verify()
 
@@ -476,7 +476,9 @@ class RouterBridge:
             return {"cancelled": False, "status": "unknown_call", "error": "unknown call"}
         result = self.broker.cancel(call)
         status = result["status"]
-        self._event("router.cancelled" if status == "cancelled" else "router.cancel_failed", status, call["tool_name"], call["session_id"],
+        # A pending cancellation is carried out by the dispatching thread once the worker acknowledges the start.
+        kind = "router.cancelled" if status == "cancelled" else "router.cancel_pending" if result.get("error_code") == "cancellation_pending" else "router.cancel_failed"
+        self._event(kind, status, call["tool_name"], call["session_id"],
                     call["call_id"], call, {"status": status, "error_code": result.get("error_code")}, operation=call["operation"])
         return {"cancelled": status == "cancelled", "status": status, "error_code": result.get("error_code")}
 
@@ -911,6 +913,9 @@ class HostOpenCodeAdapter:
         if proc is None or proc.poll() is not None:
             return False
         proc.send_signal(sig)
+        # Cancellation must not depend on the runtime honouring the signal (a parent can leave SIGINT ignored): the accepted
+        # interrupt cancels and collects the guest work itself. Calls that already finished keep their honest final status.
+        self.bridge.cancel_inflight()
         return True
 
     def audit_request(self, body: Mapping[str, Any]) -> list[dict[str, Any]]:

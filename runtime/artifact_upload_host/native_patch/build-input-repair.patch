@@ -1,0 +1,22 @@
+--- a/packages/app/package.json
++++ b/packages/app/package.json
+@@ -64,7 +64,7 @@
+     "diff": "catalog:",
+     "effect": "catalog:",
+     "fuzzysort": "catalog:",
+-    "ghostty-web": "github:anomalyco/ghostty-web#main",
++    "ghostty-web": "github:anomalyco/ghostty-web#20bd361",
+     "luxon": "catalog:",
+     "marked": "catalog:",
+     "marked-shiki": "catalog:",
+--- a/bun.lock
++++ b/bun.lock
+@@ -55,7 +55,7 @@
+         "diff": "catalog:",
+         "effect": "catalog:",
+         "fuzzysort": "catalog:",
+-        "ghostty-web": "github:anomalyco/ghostty-web#main",
++        "ghostty-web": "github:anomalyco/ghostty-web#20bd361",
+         "luxon": "catalog:",
+         "marked": "catalog:",
+         "marked-shiki": "catalog:",

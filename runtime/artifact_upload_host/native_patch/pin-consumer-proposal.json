@@ -1,0 +1,100 @@
+{
+  "status": "exact-cross-owner-proposal-not-applied",
+  "activation_requires": [
+    "independent review of this commit and failed-attempt/correction receipts",
+    "coordinator applies all consumer changes together in approved integration",
+    "merged checkpoint against activated runtime"
+  ],
+  "derived_manifest": "runtime/artifact_upload_host/native_patch/build-manifest.json",
+  "changes": [
+    {
+      "path": "eval/artifact_upload/host_adapter.py",
+      "owner": "T008",
+      "replacements": {
+        "RUNTIME_SHA256": {
+          "before": "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68",
+          "after": "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
+        },
+        "PinnedRuntime.locate default binary relative to source": {
+          "before": ".scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode",
+          "after": ".scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"
+        }
+      },
+      "preserve": [
+        "PinnedRuntime.verify SHA/version checks",
+        "RUNTIME_SOURCE_COMMIT as base upstream revision",
+        "all router behavior"
+      ]
+    },
+    {
+      "path": "project/artifact-upload/instance.lock.json",
+      "owner": "coordinator/T007 frozen pin owner",
+      "json_pointer_replacements": {
+        "/runtime/binary_sha256": {
+          "before": "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68",
+          "after": "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
+        },
+        "/runtime/source_tree_sha256": {
+          "before": "4be4862ac664888b3c4d408db8b9211d2dfc24fee582c24ef4eb9ded7256e04e",
+          "after": "3336169452bba05ada8b7eb17951e408304e491e3351b9d040e77b9d6a989add"
+        }
+      },
+      "preserve": [
+        "/runtime/version = 1.14.41",
+        "/runtime/source_commit = base upstream revision 8ba2a9171597262df9d19516c82a5e14f18f5c63",
+        "original archive/tree/binary receipts in build-manifest.json upstream_base",
+        "existing WORLD schema; no additional contract fields required"
+      ],
+      "association": "The companion build-manifest.json identifies native patch, build-input repair, repaired archive/tree, models snapshot and derived executable explicitly; base upstream commit is not an unpatched-source assertion."
+    },
+    {
+      "path": "runtime/artifact_upload_host/canary/opencode_runtime.py",
+      "owner": "T001; defer until coordinated activation",
+      "replacements": {
+        "BINARY relative to SOURCE": {
+          "before": ".scenario/migration-readiness/opencode-host-1.14.41/node_modules/opencode-darwin-arm64/bin/opencode",
+          "after": ".scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"
+        },
+        "BINARY_DIGEST": {
+          "before": "7c3c2ccc7824e4933d0b030314c9ecc4fdb2d0d113dab586e3e2e6db7df2dd68",
+          "after": "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
+        },
+        "receipt.source_binary_association": {
+          "before": "official source revision and local binary are independently identified; reproducible build association is unproven",
+          "after": "derived native build identified by runtime/artifact_upload_host/native_patch/build-manifest.json; original source independently verified; published-binary byte reproducibility is unproven"
+        }
+      },
+      "preserve": [
+        "SOURCE_ARCHIVE verifies original upstream archive with source_digest.verify",
+        "all interception/unsupported/sentinel/version/digest assertions"
+      ],
+      "candidate_validation_executed": "evidence run_compiled_canary_production_channel.py binds the exact candidate path/SHA while keeping all original checks"
+    },
+    {
+      "path": "tests/artifact_upload/test_worker.py",
+      "owner": "T005",
+      "execution_env": {
+        "OPENCODE_NATIVE_BINARY": "/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode"
+      },
+      "receipt_addition": {
+        "derived_runtime_manifest": "runtime/artifact_upload_host/native_patch/build-manifest.json",
+        "derived_source_archive_sha256": "474edc2b546ba90e2e3d02a95af34a68394e87af0089dd8cfe1f0aa6e30eb3c8",
+        "derived_source_full_tree_sha256": "3336169452bba05ada8b7eb17951e408304e491e3351b9d040e77b9d6a989add"
+      },
+      "preserve": [
+        "existing source_archive_sha256 as ORIGINAL independent receipt",
+        "comparison oracles/commands/expectations; no normalization or retries"
+      ]
+    },
+    {
+      "path": "runtime/artifact_upload_host/canary/source_digest.py",
+      "owner": "T001",
+      "action": "retain original constants and verify behavior unchanged; derived hashes live in companion build manifest"
+    },
+    {
+      "path": "tests/artifact_upload/conftest.py",
+      "owner": "T001",
+      "action": "no change required; synthetic contract examples remain synthetic and are not runtime activation pins"
+    }
+  ]
+}
