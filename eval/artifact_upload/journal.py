@@ -16,9 +16,12 @@ class ExecutionJournal:
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
+        self.event_path = self.path.with_name("tool_events.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(mode=0o600, exist_ok=True)
+        self.event_path.touch(mode=0o600, exist_ok=True)
         os.chmod(self.path, 0o600)
+        os.chmod(self.event_path, 0o600)
         self._lock = threading.RLock()
         self._records: dict[tuple[str, ...], dict[str, Any]] = {}
         with self.path.open(encoding="utf-8") as stream:
@@ -28,6 +31,16 @@ class ExecutionJournal:
                 item = json.loads(line)
                 validate("journal", item)
                 self._records[self._key(item["execution_key"])] = item
+
+    def append_event(self, event: dict[str, Any]) -> None:
+        """Durably append a validated contracted tool event outside guest storage."""
+        validate("event", event)
+        with self._lock:
+            with self.event_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(self.event_path, 0o600)
 
     @staticmethod
     def _key(key: dict[str, str]) -> tuple[str, ...]:

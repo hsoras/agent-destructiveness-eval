@@ -45,6 +45,9 @@ def test_duplicate_terminal_conflict_and_distinct_calls_are_real_worker_executio
     assert len(host.events) >= 6
     assert all(validate("event", event) is None for event in host.events)
     assert (tmp_path / "private" / "journal.jsonl").stat().st_mode & 0o777 == 0o600
+    persisted = [json.loads(line) for line in (tmp_path / "private" / "tool_events.jsonl").read_text().splitlines()]
+    assert persisted == host.events
+    assert (tmp_path / "private" / "tool_events.jsonl").stat().st_mode & 0o777 == 0o600
 
 
 def test_journal_cannot_be_created_in_target_workspace(broker):

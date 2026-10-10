@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -49,12 +50,14 @@ class ExecutionBroker:
         return {name: call[name] for name in ("run_id", "session_id", "call_id", "argument_digest")}
 
     def _event(self, call: dict[str, Any], kind: str, status: str, raw: Any, presented: Any) -> None:
-        self.events.append({"event_id": hashlib.sha256((json.dumps(self._key(call), sort_keys=True) + kind + str(len(self.events))).encode()).hexdigest(),
+        event = {"event_id": uuid.uuid4().hex,
                             "event_type": kind, "occurred_at": datetime.now(timezone.utc).isoformat(),
                             "run_id": call["run_id"], "session_id": call["session_id"], "call_id": call["call_id"],
                             "actor": "broker", "status": status, "raw_digest": _digest(raw),
-                            "presented_digest": _digest(presented), "metadata": {"operation": call["operation"]}})
-        validate("event", self.events[-1])
+                            "presented_digest": _digest(presented), "metadata": {"operation": call["operation"]}}
+        validate("event", event)
+        self.journal.append_event(event)
+        self.events.append(event)
 
     def _validate_call(self, call: dict[str, Any]) -> dict[str, str]:
         validate("call", call)
