@@ -97,17 +97,67 @@ def native_results(native_binary, artifact_dir):
     tarball = _common_root() / ".scenario/migration-readiness/evidence/tmp-preserved-2026-10-09/opencode-8ba2a917.tar.gz"
     if tarball.is_file(): receipts["source_archive_sha256"] = hashlib.sha256(tarball.read_bytes()).hexdigest()
     for variant, cases in ALL_CASES.items():
-        attempts = []
-        for attempt in range(1):
-            scratch = tempfile.mkdtemp(prefix=f"t005-native-{variant}-")
+        scratch = tempfile.mkdtemp(prefix=f"t005-native-{variant}-")
+        attempt = {"attempt": 1, "scratch": scratch, "variant": variant}
+        receipts["variants"][variant] = {"attempts": [attempt]}
+        save(artifact_dir, "native-receipts.json", receipts)
+        try:
             run = nf.run_native(native_binary, cases, variant, scratch, _free_port(), timeout=900)
-            attempts.append({**run, "attempt": attempt + 1})
+        except Exception as exc:
+            # Preserve transport diagnostics, including raw subprocess output,
+            # before propagating. No automatic retry of an undiagnosed failure.
+            def diagnostic(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+            attempt.update({"exception_type": type(exc).__name__, "exception": str(exc),
+                            "stdout": diagnostic(getattr(exc, "stdout", None)),
+                            "stderr": diagnostic(getattr(exc, "stderr", None)),
+                            "returncode": getattr(exc, "returncode", None)})
+            save(artifact_dir, "native-receipts.json", receipts)
+            raise
+        attempt.update(run)
+        receipts["variants"][variant] = {**run, "attempts": [attempt]}
+        save(artifact_dir, "native-receipts.json", receipts)
         assert run["returncode"] == 0, f"native {variant} exited {run['returncode']}: {run['stderr'][-1000:]}"
         assert len(run["results"]) == len(cases), f"native {variant} run incomplete: {run['stderr'][-500:]}"
-        run["attempts"] = attempts
-        receipts["variants"][variant] = run
-    save(artifact_dir, "native-receipts.json", receipts)
     return receipts
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "nonzero", "later_variant", "transport"])
+def test_native_failed_attempt_receipts_are_durable(tmp_path, monkeypatch, failure, artifact_dir):
+    binary = tmp_path / "binary"; binary.write_bytes(b"fixture-only")
+    variants = {"edit": [{"id": "one"}], "patch": [{"id": "two"}]}
+    monkeypatch.setitem(globals(), "ALL_CASES", variants)
+    monkeypatch.setattr(shutil, "which", lambda _: "/fixture/rg")
+    monkeypatch.setitem(globals(), "_free_port", lambda: 12345)
+    calls = []
+
+    def run(*args, **kwargs):
+        variant = args[2]; calls.append(variant)
+        # The earlier variant must already be durable before another executes.
+        retained = json.loads((tmp_path / "native-receipts.json").read_text())
+        if variant == "patch":
+            assert retained["variants"]["edit"]["stdout"] == "SUCCESS_RAW"
+            assert retained["variants"]["edit"]["attempts"][0]["returncode"] == 0
+        if failure == "transport":
+            raise subprocess.CalledProcessError(9, ["fixture"], output=b"TRANSPORT_RAW", stderr=b"transport diagnostic")
+        success = failure == "later_variant" and variant == "edit"
+        return {"returncode": 0 if success or failure == "incomplete" else 7,
+                "stdout": "SUCCESS_RAW" if success else "FAILURE_RAW",
+                "stderr": "raw diagnostic", "results": [{}] if success else []}
+
+    monkeypatch.setattr(nf, "run_native", run)
+    with pytest.raises(subprocess.CalledProcessError if failure == "transport" else AssertionError):
+        native_results.__wrapped__(str(binary), tmp_path)
+    retained = json.loads((tmp_path / "native-receipts.json").read_text())
+    failed_variant = "patch" if failure == "later_variant" else "edit"
+    attempt = retained["variants"][failed_variant]["attempts"][0]
+    assert attempt["attempt"] == 1 and Path(attempt["scratch"]).is_dir()
+    assert attempt["stdout"] == ("TRANSPORT_RAW" if failure == "transport" else "FAILURE_RAW")
+    assert attempt["stderr"] == ("transport diagnostic" if failure == "transport" else "raw diagnostic")
+    assert attempt["returncode"] == (9 if failure == "transport" else 0 if failure == "incomplete" else 7)
+    if failure == "transport": assert attempt["exception_type"] == "CalledProcessError"
+    assert calls == (["edit", "patch"] if failure == "later_variant" else ["edit"])
+    save(artifact_dir, f"fixture-failure-{failure}.json", retained)
 
 
 def test_native_pin_and_tool_inventory(native_results, artifact_dir):
@@ -227,6 +277,51 @@ def test_late_io_failure_rolls_back_patch(guest, monkeypatch):
     before = nf.snapshot(str(root))
     res = worker.execute(call("patch", "apply_patch", {"patchText": patch}))
     assert res["status"] == "error" and nf.snapshot(str(root)) == before
+
+
+@pytest.mark.parametrize("operation", ["delete", "move"])
+def test_patch_hardlink_unlink_rejected_without_mutation(guest, monkeypatch, operation):
+    worker, root, _ = guest
+    (root / "a").write_text("alpha\n"); (root / "a").chmod(0o640)
+    os.link(root / "a", root / "alias")
+    (root / "fail").write_text("failure\n")
+    before = nf.snapshot(str(root)); writes = []; unlinks = []
+    from sandbox.artifact_upload.worker import tools
+    real_write, real_unlink = tools.write_with_dirs, tools.os.unlink
+    monkeypatch.setattr(tools, "write_with_dirs", lambda *a, **k: (writes.append(a[0]), real_write(*a, **k))[1])
+    def unlink(path, *a, **k):
+        unlinks.append(str(path))
+        if str(path) == str((root / "fail").resolve()): raise OSError(28, "late ENOSPC", str(path))
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(tools.os, "unlink", unlink)
+    first = "*** Delete File: a" if operation == "delete" else "*** Update File: a\n*** Move to: moved\n@@\n-alpha\n+one"
+    result = worker.execute(call("patch", "apply_patch", {"patchText": f"*** Begin Patch\n{first}\n*** Delete File: fail\n*** End Patch"}))
+    assert result["status"] == "error" and "multiply linked" in result["stderr"]
+    assert not writes and not unlinks and nf.snapshot(str(root)) == before
+    assert os.path.samefile(root / "a", root / "alias")
+    (root / "a").write_text("later\n")
+    assert (root / "alias").read_text() == "later\n"
+
+
+def test_patch_hardlink_update_late_rollback_and_valid_symlink_delete(guest, monkeypatch):
+    worker, root, _ = guest
+    (root / "a").write_text("alpha\n"); os.link(root / "a", root / "alias")
+    (root / "link").symlink_to("a"); (root / "fail").write_text("failure\n")
+    from sandbox.artifact_upload.worker import tools
+    real = tools.os.unlink
+    def unlink(path, *a, **k):
+        if str(path) == str((root / "fail").resolve()): raise OSError(28, "late ENOSPC", str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(tools.os, "unlink", unlink)
+    before = nf.snapshot(str(root))
+    patch = "*** Begin Patch\n*** Update File: a\n@@\n-alpha\n+one\n*** Delete File: fail\n*** End Patch"
+    assert worker.execute(call("patch", "apply_patch", {"patchText": patch}))["status"] == "error"
+    assert nf.snapshot(str(root)) == before
+    (root / "a").write_text("later\n"); assert (root / "alias").read_text() == "later\n"
+    patch = "*** Begin Patch\n*** Delete File: link\n*** Add File: nested/new\n+new\n*** End Patch"
+    assert worker.execute(call("patch", "apply_patch", {"patchText": patch}))["status"] == "ok"
+    assert not (root / "link").is_symlink() and os.path.samefile(root / "a", root / "alias")
+    assert (root / "nested/new").read_text() == "new\n"
 
 
 @pytest.mark.parametrize("patch", [
@@ -559,6 +654,23 @@ def test_guest_patch_preflight_preserves_aliases_and_overlaps(session, artifact_
     overlap_state = run("shell", "bash", {"command": "test -L alias-link.txt && test ! -e d && cat alias-target.txt && echo unchanged"})
     assert overlap_result["status"] == "error" and overlap_state["stdout"] == "original\nunchanged\n", (overlap_result, overlap_state)
     save(artifact_dir, "guest-patch-preflight.json", {"alias_error": alias_result, "alias_state": alias_type["stdout"], "overlap_error": overlap_result, "overlap_state": overlap_state["stdout"]})
+
+
+@pytest.mark.parametrize("operation", ["delete", "move"])
+def test_guest_hardlink_patch_rejection_preserves_write_relationship(session, artifact_dir, operation):
+    run = session.run
+    setup = run("shell", "bash", {"command": "rm -f hard-a hard-alias hard-moved hard-fail; printf 'alpha\\n' > hard-a; chmod 640 hard-a; ln hard-a hard-alias; printf 'failure\\n' > hard-fail"})
+    assert setup["exit_code"] == 0
+    inspect = "python -c \"import os,json; from pathlib import Path; print(json.dumps({p: [Path(p).read_text(),os.stat(p).st_mode,os.stat(p).st_nlink] for p in ['hard-a','hard-alias','hard-fail']},sort_keys=True))\""
+    before = run("shell", "bash", {"command": inspect})
+    first = "*** Delete File: hard-a" if operation == "delete" else "*** Update File: hard-a\n*** Move to: hard-moved\n@@\n-alpha\n+one"
+    result = run("patch", "apply_patch", {"patchText": f"*** Begin Patch\n{first}\n*** Delete File: hard-fail\n*** End Patch"})
+    after = run("shell", "bash", {"command": inspect})
+    assert result["status"] == "error" and "multiply linked" in result["stderr"]
+    assert before["stdout"] == after["stdout"]
+    followup = run("shell", "bash", {"command": "test ! -e hard-moved && printf 'later\\n' > hard-a && cat hard-alias"})
+    assert followup["exit_code"] == 0 and followup["stdout"] == "later\n"
+    save(artifact_dir, f"guest-hardlink-{operation}.json", {"before": before, "error": result, "after": after, "followup": followup})
 
 
 def test_guest_identity_arguments_fail_closed_and_host_sentinel_intact(docker_env, artifact_dir, session):

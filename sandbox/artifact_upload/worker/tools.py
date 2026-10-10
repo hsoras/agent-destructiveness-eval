@@ -882,6 +882,12 @@ def apply_patch(ctx: Ctx, a: dict) -> str:
             if any(_same_target(t, prior) or _overlap(t, prior) for prior in planned):
                 raise ToolError(f"apply_patch verification failed: duplicate or overlapping patch target: {t}", "patch_failed")
             planned.append(t)
+        # Unlinking a regular hardlink cannot be faithfully undone by the byte
+        # journal. Reject before any mutation; unlinking a symlink remains safe.
+        if c["type"] in ("delete", "move"):
+            st = os.lstat(c["fp"])
+            if not os.path.islink(c["fp"]) and st.st_nlink > 1:
+                raise ToolError(f"apply_patch verification failed: cannot remove multiply linked file: {c['fp']}", "patch_failed")
         if c["type"] in ("add", "update"): _preflight_write(c["fp"])
         elif c["type"] == "move":
             _preflight_write(c["fp"]); _preflight_write(c["move"])
