@@ -3,13 +3,15 @@
 Required prerequisites (the pinned OpenCode runtime and its offline plugin seed,
 Docker, node) are asserted, never skipped: a missing prerequisite fails the run.
 No test makes a provider-backed model call; a deterministic local mock provider
-drives the real pinned host runtime. Evidence is retained under
+drives the real pinned host runtime. The guest is a real T007 episode (Compose worker container built from the
+image digest frozen in ``project/artifact-upload/instance.lock.json``). Evidence is retained under
 ``MIGRATION_ARTIFACT_DIR`` (default: a timestamped directory below the common
 repository root's ``.scenario/migration-readiness/evidence``).
 """
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -17,6 +19,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -24,10 +28,16 @@ from typing import Any
 import pytest
 
 from eval.artifact_upload.broker import ExecutionBroker
+from eval.artifact_upload import lifecycle
 from eval.artifact_upload.contracts import argument_digest, resolve_disposition, validate
 from eval.artifact_upload.host_adapter import (
     DEFAULT_ROUTES,
+    RUNTIME_MAX_BYTES,
+    RUNTIME_MAX_LINES,
+    fit_for_runtime,
+    GuestWorkerSession,
     HostOpenCodeAdapter,
+    ProviderGuard,
     OperationRegistry,
     PinnedRuntime,
     RouterCoverageError,
@@ -38,7 +48,8 @@ from eval.artifact_upload.host_adapter import (
 
 REPO = Path(__file__).resolve().parents[2]
 SUFFIX = "t008-sonnet-" + uuid.uuid4().hex[:8]
-WORKTREE = "/home/dev/work"
+WORKTREE = "/testbed"  # eval-looking profile worktree frozen in the instance lock
+GUEST_UID = 1000
 BASE_COMMIT = "750f4480b573dfd3a5e0f4e930c3617136758e35"
 CORE_TOOLS = {"bash", "read", "glob", "grep", "edit", "write", "apply_patch"}
 
@@ -156,7 +167,7 @@ class ScriptedProvider:
 
 
 # ---------------------------------------------------------------------------
-# Real Docker guest, reached through the T005 line-delimited worker session
+# Real T007 episode guest, reached through the T005 worker session (GuestWorkerSession)
 # ---------------------------------------------------------------------------
 def _docker(*args: str, check: bool = True, timeout: int = 600) -> subprocess.CompletedProcess:
     proc = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
@@ -165,74 +176,64 @@ def _docker(*args: str, check: bool = True, timeout: int = 600) -> subprocess.Co
     return proc
 
 
-class DockerGuestTransport:
-    """Worker facade (execute/start/stream/status/cancel) over ``docker exec -i ... guest_session``."""
+WORKER_LAYER = """FROM {base}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/* \\
+ && python -m pip install --no-cache-dir --break-system-packages jsonschema==4.26.0
+COPY eval/artifact_upload /opt/worker/eval/artifact_upload
+COPY sandbox/artifact_upload/worker /opt/worker/sandbox/artifact_upload/worker
+RUN printf '' > /opt/worker/eval/__init__.py && printf '' > /opt/worker/sandbox/__init__.py && printf '' > /opt/worker/sandbox/artifact_upload/__init__.py \\
+ && chown -R root:root /opt/worker && chmod -R a+rX /opt/worker
+USER runner
+WORKDIR /workspace
+"""
 
-    def __init__(self, container: str, run_id: str):
-        self._lock = threading.Lock()
-        self._proc = subprocess.Popen(
-            ["docker", "exec", "-i", "-e", f"ARTIFACT_RUN_ID={run_id}", container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        self.digest = self._rpc({"op": "capabilities"})["worker_digest"]
 
-    def _rpc(self, request: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            self._proc.stdin.write(json.dumps(request) + "\n")
-            self._proc.stdin.flush()
-            reply = json.loads(self._proc.stdout.readline())
-        if "error" in reply:
-            raise RuntimeError(f"worker error: {reply['error']}")
-        return reply
-
-    def execute(self, call):
-        return self._rpc({"op": "execute", "call": call})["result"]
-
-    def start(self, call):
-        return self._rpc({"op": "start", "call": call})["handle"]
-
-    def stream(self, key):
-        yield from self._rpc({"op": "collect", "execution_key": key})["events"]
-
-    def status(self, key):
-        return self._rpc({"op": "status", "execution_key": key})["status"]
-
-    def cancel(self, key, *, how="terminate"):
-        return self._rpc({"op": "cancel", "execution_key": key, "how": how})["cancelled"]
-
-    def process_handle(self, call):
-        return None
-
-    def close(self) -> None:
-        self._proc.stdin.close()
-        self._proc.wait(timeout=20)
+def _layers(image: str) -> list[str]:
+    return json.loads(_docker("image", "inspect", image).stdout)[0]["RootFS"]["Layers"]
 
 
 @pytest.fixture(scope="session")
 def guest(artifact_dir):
-    """Build the current T005 worker image and keep one disposable guest container for the session."""
+    """Start a real T007 eval-looking episode from the lock-pinned image digest plus the T005 worker layer.
+
+    T007's common image has no worker, ripgrep or jsonschema; this fixture adds exactly those as one extra
+    layer on top of the pinned digest (cross-owner change proposed in HANDOFF.md) and proves the pinned layers are
+    an unchanged prefix of the image the episode runs.
+    """
     assert shutil.which("docker"), "required prerequisite missing: docker CLI"
-    info = _docker("info", "--format", "{{.ServerVersion}} {{.OSType}}/{{.Architecture}}").stdout.strip()
-    image, name = f"artifact-upload-{SUFFIX}:guest", f"{SUFFIX}-guest"
-    proc = subprocess.run(["docker", "build", "--file", "sandbox/artifact_upload/worker/Dockerfile", "--tag", image, "."], cwd=REPO, capture_output=True, text=True, timeout=1800)
+    lock = json.loads(lifecycle.INSTANCE.read_text())
+    profile = next(p for p in lock["guest_profiles"] if p["condition"] == "eval-looking")
+    pinned = profile["image_digest"]
+    present = _docker("image", "inspect", pinned, check=False)
+    assert present.returncode == 0, f"locked guest image {pinned} is not present locally; build it with Episode.build_common_image"
+    base_tag, derived = f"artifact-{SUFFIX}-pinned:base", f"artifact-{SUFFIX}-guest:worker"
+    _docker("tag", pinned, base_tag)
+    context = artifact_dir / f"{SUFFIX}-guest-context"
+    shutil.rmtree(context, ignore_errors=True)
+    shutil.copytree(REPO / "eval/artifact_upload", context / "eval/artifact_upload", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(REPO / "sandbox/artifact_upload/worker", context / "sandbox/artifact_upload/worker", ignore=shutil.ignore_patterns("__pycache__"))
+    (context / "Dockerfile").write_text(WORKER_LAYER.format(base=base_tag))
+    proc = subprocess.run(["docker", "build", "--tag", derived, str(context)], capture_output=True, text=True, timeout=1800)
     save(artifact_dir, "docker-build.log", proc.stdout + "\n" + proc.stderr)
     assert proc.returncode == 0, proc.stderr[-3000:]
-    created = False
+    shutil.rmtree(context, ignore_errors=True)
+    pinned_layers = _layers(pinned)
+    assert _layers(derived)[: len(pinned_layers)] == pinned_layers, "the worker layer must sit on top of the unchanged pinned digest"
+    episode = lifecycle.Episode("eval-looking", "t008-" + uuid.uuid4().hex[:10], artifact_dir / "t007-episode", common_image=derived)
     try:
-        _docker("run", "-d", "--init", "--name", name, "--cap-drop=ALL", "--security-opt", "no-new-privileges", image, "sleep", "3600")
-        created = True
-        _docker("exec", name, "sh", "-c", f"cd {WORKTREE} && mkdir -p src && printf 'def answer():\\n    return 41\\n' > src/app.py && printf 'alpha\\nbeta\\ngamma\\n' > notes.txt && git init -q")
-        image_id = json.loads(_docker("image", "inspect", image).stdout)[0]["Id"]
-        profile = {"profile_id": "eval-t008", "condition": "eval-looking", "account": "dev", "uid": 10001, "gid": 10001,
-                   "hostname": _docker("exec", name, "hostname").stdout.strip(), "home": "/home/dev", "worktree": WORKTREE,
-                   "image_digest": image_id, "packages_digest": hashlib.sha256(image_id.encode()).hexdigest(),
-                   "differences": ["account", "home", "worktree"], "invariants": ["source", "uid", "gid"]}
-        validate("profile_manifest", profile)
-        save(artifact_dir, "guest-profile.json", {"docker": info, "image": image, "image_id": image_id, "profile": profile})
-        yield {"name": name, "profile": profile, "image": image}
+        resources = episode.start()
+        name = resources["worker_container"]
+        assert resources["worker_identity"]["uid"] == GUEST_UID and resources["worker_identity"]["worktree"] == WORKTREE
+        _docker("exec", name, "sh", "-c", f"mkdir -p src && printf 'def answer():\\n    return 41\\n' > src/app.py && printf 'alpha\\nbeta\\ngamma\\n' > notes.txt")
+        save(artifact_dir, "guest-profile.json", {"pinned_digest": pinned, "derived_image": derived, "derived_id": json.loads(_docker("image", "inspect", derived).stdout)[0]["Id"],
+                                                  "project": episode.project, "profile": resources["profile_manifest"], "worker_identity": resources["worker_identity"]})
+        yield {"name": name, "profile": resources["profile_manifest"], "episode": episode, "pinned_digest": pinned}
     finally:
-        if created:
-            _docker("rm", "-f", name, check=False)
-        _docker("rmi", image, check=False)
+        try:
+            episode.cleanup()
+        finally:
+            _docker("rmi", f"{episode.project}-service:latest", derived, base_tag, check=False)
 
 
 def guest_exec(guest, command: str) -> subprocess.CompletedProcess:
@@ -262,13 +263,13 @@ class Harness:
 
     def __init__(self, guest, runtime, tmp_path, native_cache, *, model="test-canary", script=(), routes=None, **adapter_kwargs):
         self.run_id = "run-" + uuid.uuid4().hex[:8]
-        self.transport = DockerGuestTransport(guest["name"], self.run_id)
+        self.transport = GuestWorkerSession(guest["name"], self.run_id, guest_root=WORKTREE)
         self.broker = ExecutionBroker(self.run_id, self.transport, str(tmp_path / f"journal-{self.run_id}" / "executions.jsonl"))
         self.registry = OperationRegistry(routes) if routes is not None else OperationRegistry()
         self.adapter = HostOpenCodeAdapter(
             run_id=self.run_id, broker=self.broker, guest_profile=guest["profile"], guest_root=None, provider_base_url="",
             model=model, stage_root=tmp_path / f"stage-{self.run_id}", runtime=runtime, registry=self.registry, today="Fri Oct 09 2026", **adapter_kwargs)
-        self.provider = ScriptedProvider(list(script), observer=self.adapter.audit_request)
+        self.provider = ScriptedProvider(list(script))
         self.adapter.base_url = self.provider.url
         if model in native_cache:
             self.adapter.native_tools = native_cache[model]
@@ -305,6 +306,19 @@ def events_for(h: Harness, call_id: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # AC1 - real host runtime, mock provider, guest effects, untouched host sentinels
 # ---------------------------------------------------------------------------
+def test_guest_is_the_t007_episode_on_the_lock_pinned_image(guest, artifact_dir):
+    episode, lock = guest["episode"], json.loads(lifecycle.INSTANCE.read_text())
+    assert episode.resources["ready"] is True and episode.resources["profile"] == "eval-looking"
+    assert guest["profile"] == next(p for p in lock["guest_profiles"] if p["condition"] == "eval-looking")
+    assert guest["pinned_digest"] == guest["profile"]["image_digest"]
+    labels = json.loads(_docker("inspect", guest["name"]).stdout)[0]["Config"]["Labels"]
+    assert labels["com.docker.compose.project"] == episode.project and labels["com.docker.compose.service"] == "worker-eval"
+    identity = episode.resources["worker_identity"]
+    assert (identity["account"], identity["uid"], identity["worktree"]) == ("runner", GUEST_UID, WORKTREE)
+    assert episode.resources["control_credential_present_in_guest"] is False
+    save(artifact_dir, "t007-episode-binding.json", {"project": episode.project, "pinned_digest": guest["pinned_digest"], "identity": identity, "labels": labels})
+
+
 def test_core_routes_run_in_guest_before_native_execution_and_host_sentinels_untouched(harness, guest, host_sentinels, artifact_dir):
     sentinel = host_sentinels["root"] / "HOST_SENTINEL"
     secret = host_sentinels["root"] / "HOST_SECRET"
@@ -318,8 +332,8 @@ def test_core_routes_run_in_guest_before_native_execution_and_host_sentinels_unt
         ("tools", [
             ("call_read_001", "read", {"filePath": f"{WORKTREE}/notes.txt", "offset": 2, "limit": 1}),
             ("call_edit_001", "edit", {"filePath": f"{WORKTREE}/src/app.py", "oldString": "return 41", "newString": "return 42"}),
-            ("call_glob_001", "glob", {"pattern": "**/*.py"}),
-            ("call_grep_001", "grep", {"pattern": "return 4", "path": WORKTREE}),
+            ("call_glob_001", "glob", {"pattern": "src/**/*.py"}),
+            ("call_grep_001", "grep", {"pattern": "return 4", "path": f"{WORKTREE}/src"}),
             ("call_todo_001", "todowrite", {"todos": [{"content": "finish", "status": "pending", "priority": "high"}]}),
         ]),
         ("text", "CORE_DONE"),
@@ -334,7 +348,7 @@ def test_core_routes_run_in_guest_before_native_execution_and_host_sentinels_unt
     assert guest_exec(guest, f"cat {WORKTREE}/shell.txt").stdout == "made-by-shell"
     assert guest_exec(guest, f"cat {WORKTREE}/written.txt").stdout == "written-by-write\n"
     assert "return 42" in guest_exec(guest, f"cat {WORKTREE}/src/app.py").stdout
-    assert f"{WORKTREE}\n10001" in parts["call_shell_001"]["state"]["output"]
+    assert f"{WORKTREE}\n{GUEST_UID}" in parts["call_shell_001"]["state"]["output"]
     assert parts["call_read_001"]["state"]["output"].count("beta") >= 1 and "gamma" not in parts["call_read_001"]["state"]["output"]
     assert "src/app.py" in parts["call_glob_001"]["state"]["output"]
     assert "return 42" in parts["call_grep_001"]["state"]["output"]
@@ -420,11 +434,70 @@ def test_advertised_tool_without_an_explicit_route_blocks_the_run(harness):
     assert h.provider.requests == [], "the runtime must not reach the model with an unrouted tool"
 
 
-def test_unrouted_advertisement_in_a_model_request_is_a_coverage_violation(harness):
+def _post(url: str, body: bytes, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def test_every_provider_request_of_run_turn_passes_the_production_guard(harness, artifact_dir):
+    """The guard, not the test provider, audits: counts must agree for tool-bearing, title and compaction requests."""
+    big = {"prompt_tokens": 9000, "completion_tokens": 50, "total_tokens": 9050}
+    script = [("tools", [("call_guard_001", "bash", {"command": "printf guarded", "description": "marker"})], big), ("text", "AFTER", big), ("text", "AFTER_COMPACTION")]
+    h = harness(script=script, context_limit=(4000, 500), autocompact=True)
+    result = h.turn("guard every request")
+    assert result.exit_code == 0
+    stats = h.adapter.guard.stats
+    assert len(h.provider.requests) >= 3 and any(not r.get("tools") for r in h.provider.requests)
+    assert stats["received"] == stats["audited"] == stats["forwarded"] == len(h.provider.requests), (stats, len(h.provider.requests))
+    assert stats["refused"] == 0 and not h.adapter.bridge.violations
+    assert h.adapter.base_url == h.provider.url and h.adapter.guard.url != h.provider.url
+    config = json.loads((h.adapter.config_dir / "opencode.json").read_text())
+    assert config["provider"]["openrouter"]["options"]["baseURL"] == h.adapter.guard.url + "/v1", "the runtime must reach the provider only through the guard"
+    save(artifact_dir, "request-boundary-guard.json", {"stats": stats, "provider_requests": len(h.provider.requests)})
+
+
+def test_guard_refuses_unrouted_oversized_and_malformed_requests_without_forwarding(harness, artifact_dir):
+    h = harness(script=[("text", "ok")], max_request_bytes=4096)
+    h.adapter.stage_runtime()
+    url = h.adapter.guard.url + "/v1/chat/completions"
+    bad_tools = json.dumps({"model": "m", "tools": [{"function": {"name": "mystery_exec"}}, {"function": {"name": "task"}}, {"function": {"name": "bash"}}]}).encode()
+    status, body = _post(url, bad_tools)
+    assert status == 403 and b"guard_refusal" in body
+    assert sorted((v["kind"], v["tool"]) for v in h.adapter.bridge.violations) == [("disabled_advertisement", "task"), ("unrouted_advertisement", "mystery_exec")]
+    assert _post(url, b"x" * 5000)[0] == 413
+    assert _post(url, b"{not json")[0] == 400
+    assert _post(url, b"[1, 2]")[0] == 400
+    assert _post(url, json.dumps({"tools": [{"function": {}}]}).encode())[0] == 403  # an advertisement without a name cannot be audited
+    conn = http.client.HTTPConnection("127.0.0.1", int(h.adapter.guard.url.rsplit(":", 1)[1]), timeout=10)
+    conn.putrequest("POST", "/v1/chat/completions")
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+    conn.send(b"0\r\n\r\n")
+    assert conn.getresponse().status == 411
+    conn.close()
+    assert h.provider.requests == [], "no refused request may reach the provider"
+    assert h.adapter.guard.stats["forwarded"] == 0 and h.adapter.guard.stats["refused"] == h.adapter.guard.stats["received"] == 6
+    with pytest.raises(RouterCoverageError):  # the recorded violations stop the run at the next turn boundary
+        h.turn("anything")
+    clean = harness(script=[("text", "ok")], max_request_bytes=4096)
+    clean.adapter.stage_runtime()
+    good = json.dumps({"model": "m", "tools": [{"function": {"name": "bash"}}], "stream": False}).encode()
+    status, body = _post(clean.adapter.guard.url + "/v1/chat/completions", good)
+    assert status == 200 and json.loads(body)["choices"] and len(clean.provider.requests) == 1
+    save(artifact_dir, "request-boundary-refusals.json", {"refusals": h.adapter.guard.refusals, "violations": h.adapter.bridge.violations})
+
+
+def test_guard_reports_an_unreachable_provider_as_a_bounded_refusal(harness):
     h = harness(script=[("text", "ok")])
-    h.adapter.audit_request({"tools": [{"function": {"name": "mystery_exec"}}, {"function": {"name": "task"}}, {"function": {"name": "bash"}}]})
-    kinds = sorted((v["kind"], v["tool"]) for v in h.adapter.bridge.violations)
-    assert kinds == [("disabled_advertisement", "task"), ("unrouted_advertisement", "mystery_exec")]
+    h.adapter.stage_runtime()
+    h.provider.close()  # the guard's upstream is now gone
+    status, body = _post(h.adapter.guard.url + "/v1/chat/completions", json.dumps({"model": "m"}).encode())
+    assert status == 502 and b"provider unreachable" in body
+    h.provider = ScriptedProvider([])  # let fixture teardown close something
 
 
 def test_native_completion_of_a_container_tool_is_infrastructure_failure(harness):
@@ -522,6 +595,170 @@ def test_guest_grounded_context_leaks_no_host_paths_or_credentials(harness, runt
     expected = guest_environment_block(h.adapter.profile, today="Fri Oct 09 2026")
     assert expected in system and "Platform: linux" in system and f"Working directory: {WORKTREE}" in system
     save(artifact_dir, "ac2-leak-scan.json", {"markers_checked": sorted(m for m in host_markers if m and m != h.adapter.bridge.token), "requests": len(h.provider.requests), "system_env_block": expected})
+
+
+def _host_markers(h: Harness, tmp_path: Path) -> set[str]:
+    stage = h.adapter.stage
+    return {str(stage), str(stage.resolve()), str(REPO), str(Path.home()), os.getcwd(), "/private/var", "/var/folders", "tool-output", "opencode/data", str(tmp_path), h.adapter.bridge.token}
+
+
+def test_large_shell_output_is_guest_owned_and_never_spooled_or_pathed_on_the_host(harness, guest, tmp_path, artifact_dir):
+    """2,500 long lines exceed OpenCode's native 2,000-line/50 KB limit; only the guest may truncate and spool."""
+    command = "i=0; while [ $i -lt 2500 ]; do echo \"line $i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); done"
+    script = [("tools", [("call_big_001", "bash", {"command": command, "description": "print many lines"})]), ("text", "BIG_DONE")]
+    h = harness(script=script)
+    result = h.turn("print a very large result")
+    part = result.tool_parts()["call_big_001"]
+    output = part["state"]["output"]
+    assert part["state"]["status"] == "completed" and "line 2499 aaaa" in output and "line 0 aaaa" not in output
+    # The guest worker truncated and named a *guest* path; OpenCode did not truncate a second time.
+    assert "Full output saved to:" in output and output.count("Full output saved to:") == 1, output[-400:]
+    assert any(e["event_type"] == "router.output_fitted" and e["call_id"] == "call_big_001" for e in h.adapter.bridge.events), "the guest preview had to be fitted under the runtime limit"
+    guest_path = output.split("Full output saved to: ", 1)[1].split("\n", 1)[0].strip()
+    assert guest_path.startswith("/") and "/opencode/" not in guest_path and str(h.adapter.stage) not in guest_path
+    assert part["state"]["metadata"]["truncated"] is False and "outputPath" not in part["state"]["metadata"], part["state"]["metadata"]
+    # No host spool exists, and no later provider request carries a host path or hint.
+    spool = h.adapter.stage / "data" / "opencode" / "tool-output"
+    assert not spool.exists() or not any(spool.iterdir()), list(spool.iterdir())
+    assert not [p for p in (h.adapter.stage / "data").rglob("tool_*") if p.is_file()]
+    markers = _host_markers(h, tmp_path)
+    for request in h.provider.requests:
+        text = json.dumps(request)
+        assert not sorted(m for m in markers if m in text), sorted(m for m in markers if m in text)
+    replayed = next(m["content"] for m in h.provider.main_requests()[-1]["messages"] if m["role"] == "tool")
+    assert replayed == output
+    # The guest's own path is usable through the routed read tool (the notice told the model to do exactly that).
+    h.provider.script.extend([("tools", [("call_big_read", "read", {"filePath": guest_path, "offset": 1, "limit": 3})]), ("text", "READ_BACK_DONE")])
+    second = h.turn("read the full output back", session_id=result.session_id)
+    back = second.tool_parts()["call_big_read"]
+    assert back["state"]["status"] == "completed" and "line 0 aaaa" in back["state"]["output"], back
+    assert guest_exec(guest, f"test -f {guest_path}").returncode == 0
+    assert not h.adapter.bridge.violations
+    for request in h.provider.requests:
+        assert not [m for m in markers if m in json.dumps(request)]
+    save(artifact_dir, "large-output-guest-owned.json", {"guest_path": guest_path, "output_bytes": len(output), "metadata": part["state"]["metadata"],
+                                                         "provider_requests": len(h.provider.requests), "host_markers_checked": sorted(m for m in markers if m != h.adapter.bridge.token)})
+
+
+def test_output_fitting_preserves_guest_notices_and_never_exceeds_runtime_limits():
+    assert fit_for_runtime("small\nresult") == ("small\nresult", False)
+    head = "...output truncated...\n\nFull output saved to: /tmp/guest/tool_1\n\n" + "\n".join(f"{i} " + "a" * 100 for i in range(520))
+    tail = "\n".join("g" * 100 for _ in range(520)) + "\n\n...30 lines truncated...\n\nThe tool call succeeded but the output was truncated. Full output saved to: /tmp/guest/tool_2\nUse Grep to search the full content or Read with offset/limit to view specific sections."
+    for text in (head, tail, "x" * 60000, "\n".join("é" * 10 for _ in range(3000)), "é" * 60000, "a\n" * 2500):
+        fitted, changed = fit_for_runtime(text)
+        assert changed and len(fitted.split("\n")) <= RUNTIME_MAX_LINES and len(fitted.encode("utf-8")) <= RUNTIME_MAX_BYTES
+        fitted.encode("utf-8")
+        assert fit_for_runtime(fitted) == (fitted, False), "fitting must be idempotent"
+    fitted_head, _ = fit_for_runtime(head)
+    assert fitted_head.startswith("...output truncated...\n\nFull output saved to: /tmp/guest/tool_1\n\n") and fitted_head.endswith(head.rsplit("\n", 1)[1])
+    fitted_tail, _ = fit_for_runtime(tail)
+    assert fitted_tail.endswith("view specific sections.") and "/tmp/guest/tool_2" in fitted_tail and fitted_tail.startswith("g" * 100)
+
+
+def test_large_output_control_without_fitting_reproduces_the_host_path_leak(harness, tmp_path, monkeypatch):
+    """Positive control: with the fit disabled the runtime re-truncates and names a host spool path, so the leak test discriminates."""
+    from eval.artifact_upload import host_adapter
+    monkeypatch.setattr(host_adapter, "fit_for_runtime", lambda text: (text, False))
+    command = "i=0; while [ $i -lt 2500 ]; do echo \"line $i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); done"
+    h = harness(script=[("tools", [("call_ctl_001", "bash", {"command": command, "description": "print many lines"})]), ("text", "DONE")])
+    result = h.turn("print a very large result")
+    assert "tool-output" in json.dumps(h.provider.main_requests()[-1]), "the control must reproduce the review's host-path leak"
+    assert str(h.adapter.stage) in result.tool_parts()["call_ctl_001"]["state"]["output"]
+
+
+def _bridge_post(h: Harness, path: str, body: dict[str, Any], timeout: float = 60) -> dict[str, Any]:
+    status, data = _post(h.adapter.bridge.url + path, json.dumps(body).encode(), {"Authorization": f"Bearer {h.adapter.bridge.token}"})
+    return json.loads(data)
+
+
+def test_cancellation_stops_a_running_guest_command_promptly_and_is_recorded_truthfully(harness, guest, artifact_dir):
+    """The stub's cancel path against the real bridge, broker, session transport and guest worker."""
+    h = harness(script=[("text", "unused")])
+    h.adapter.stage_runtime()
+    sid, cid = "ses_cancel", "call_cancel_001"
+    marker = f"{WORKTREE}/cancellation_failed.txt"
+    guest_exec(guest, f"rm -f {marker}")
+    call_body = {"tool": "bash", "session_id": sid, "call_id": cid, "arguments": {"command": "sleep 5; touch cancellation_failed.txt", "description": "slow mutation"}}
+    replies: list[dict[str, Any]] = []
+    caller = threading.Thread(target=lambda: replies.append(_bridge_post(h, "/v1/call", call_body)))
+    caller.start()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        entry = h.broker.journal.by_call(h.run_id, sid, cid)
+        if entry and entry["state"] == "running":
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the slow command never reached the running state")
+    started = time.monotonic()
+    cancel_reply = _bridge_post(h, "/v1/cancel", {"tool": "bash", "session_id": sid, "call_id": cid})
+    cancel_seconds = time.monotonic() - started
+    caller.join(timeout=30)
+    assert not caller.is_alive() and replies
+    assert cancel_seconds < 3.0, cancel_seconds  # it must not queue behind the blocking five-second command
+    assert cancel_reply["cancelled"] is True and cancel_reply["status"] == "cancelled" and cancel_reply.get("ok") is not True, cancel_reply
+    entry = h.broker.journal.by_call(h.run_id, sid, cid)
+    assert entry["state"] == "cancelled" and entry["result"]["status"] == "cancelled", entry
+    time.sleep(6)  # past the point where the abandoned command would have mutated the guest
+    assert guest_exec(guest, f"test -e {marker}").returncode != 0, "cancelled command still mutated the guest"
+    kinds = [e["event_type"] for e in h.adapter.bridge.events if e["call_id"] == cid]
+    assert kinds[0] == "router.intercepted" and "router.cancelled" in kinds and "router.cancel_failed" not in kinds, kinds
+    assert [e["status"] for e in h.adapter.bridge.events if e["event_type"] == "router.cancelled"] == ["cancelled"]
+    save(artifact_dir, "cancellation-real-stack.json", {"cancel_seconds": cancel_seconds, "cancel_reply": cancel_reply, "call_reply": replies[0], "journal_state": entry["state"], "events": kinds})
+
+
+def test_cancellation_of_a_finished_call_is_not_reported_as_cancelled(harness):
+    h = harness(script=[("text", "unused")])
+    h.adapter.stage_runtime()
+    body = {"tool": "bash", "session_id": "ses_done", "call_id": "call_done_001", "arguments": {"command": "printf finished", "description": "quick"}}
+    assert _bridge_post(h, "/v1/call", body)["ok"] is True
+    reply = _bridge_post(h, "/v1/cancel", {k: body[k] for k in ("tool", "session_id", "call_id")})
+    assert reply["cancelled"] is False and reply["status"] == "ok", reply
+    assert h.broker.journal.by_call(h.run_id, "ses_done", "call_done_001")["state"] == "completed"
+    assert [e["event_type"] for e in h.adapter.bridge.events if e["call_id"] == "call_done_001"][-1] == "router.cancel_failed"
+    assert _bridge_post(h, "/v1/cancel", {"tool": "bash", "session_id": "ses_none", "call_id": "nope"})["cancelled"] is False
+
+
+def test_interrupting_the_real_runtime_cancels_its_running_guest_command(harness, guest, artifact_dir):
+    """A user interrupt kills the real runtime mid-call; the adapter must cancel the orphaned guest command."""
+    marker = f"{WORKTREE}/cancellation_failed_runtime.txt"
+    guest_exec(guest, f"rm -f {marker}")
+    h = harness(script=[("tools", [("call_interrupt_001", "bash", {"command": "sleep 8; touch cancellation_failed_runtime.txt", "description": "slow mutation"})]), ("text", "never")])
+    outcome: list[Any] = []
+    turn = threading.Thread(target=lambda: outcome.append(_run_turn_catching(h)))
+    turn.start()
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        if any(e["event_type"] == "router.intercepted" for e in h.adapter.bridge.events):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the runtime never reached the router")
+    time.sleep(1.0)  # let the command start in the guest
+    started = time.monotonic()
+    assert h.adapter.interrupt()
+    turn.join(timeout=60)
+    assert not turn.is_alive()
+    sid = next(e["session_id"] for e in h.adapter.bridge.events if e["call_id"] == "call_interrupt_001")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not any(e["event_type"] == "router.cancelled" for e in h.adapter.bridge.events):
+        time.sleep(0.1)
+    cancelled_after = time.monotonic() - started
+    entry = h.broker.journal.by_call(h.run_id, sid, "call_interrupt_001")
+    time.sleep(8)
+    assert guest_exec(guest, f"test -e {marker}").returncode != 0, "interrupted command still mutated the guest"
+    assert entry["state"] == "cancelled" and entry["result"]["status"] == "cancelled", entry
+    cancelled = [e for e in h.adapter.bridge.events if e["event_type"] == "router.cancelled"]
+    assert cancelled and cancelled[0]["status"] == "cancelled"
+    assert cancelled_after < 10
+    save(artifact_dir, "cancellation-real-runtime.json", {"seconds_to_cancelled": cancelled_after, "journal_state": entry["state"], "turn_outcome": str(outcome)[:500]})
+
+
+def _run_turn_catching(h: Harness):
+    try:
+        return h.turn("run a slow command")
+    except Exception as exc:  # an aborted turn may legitimately surface as an error
+        return exc
 
 
 # ---------------------------------------------------------------------------

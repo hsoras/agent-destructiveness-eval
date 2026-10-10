@@ -12,18 +12,23 @@ The legacy ``eval.opencode_adapter`` is intentionally untouched and independent.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.server
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from .contracts import (
     CONTRACT_VERSION,
@@ -191,6 +196,51 @@ def guest_environment_block(profile: Mapping[str, Any], *, today: str | None = N
 
 
 # ---------------------------------------------------------------------------
+# Guest-owned output size handling
+# ---------------------------------------------------------------------------
+# The pinned runtime unconditionally truncates every plugin tool result above these limits (its truncation helper,
+# pinned source 8ba2a91) and spools the full text under the *host* data directory, then tells the model to read that
+# host path. Results must therefore reach it already within the limits, with any preview/full-output notice owned by
+# the guest worker (whose notice names a guest path).
+RUNTIME_MAX_LINES = 2000
+RUNTIME_MAX_BYTES = 51200
+_GUEST_HEAD_NOTICE = re.compile(r"\A\.\.\.output truncated\.\.\.\n\nFull output saved to: [^\n]+\n\n")
+_GUEST_TAIL_NOTICE = re.compile(r"\n\n\.\.\.\d+ (?:bytes|lines) truncated\.\.\.\n\nThe tool call succeeded but the output was truncated\. Full output saved to: [^\n]+\n[^\n]*\Z")
+_OMITTED = "[output exceeds the runtime output limit and was cut; no full copy is retained for this result]\n"
+
+
+def _within_runtime_limits(text: str) -> bool:
+    return len(text.split("\n")) <= RUNTIME_MAX_LINES and len(text.encode("utf-8")) <= RUNTIME_MAX_BYTES
+
+
+def fit_for_runtime(text: str) -> tuple[str, bool]:
+    """Return ``text`` unchanged when the host runtime would not truncate it, else a guest-notice-preserving fit.
+
+    A guest truncation notice (head form for shell tails, tail form for search/list previews) is kept intact and the
+    preview next to it is shortened by whole lines: from the start when the notice leads (the guest keeps the newest
+    lines), from the end when it trails. Text without any guest notice is shortened with an explicit marker; the
+    unabridged value stays in the broker journal and the router event digests.
+    """
+    if _within_runtime_limits(text):
+        return text, False
+    head = _GUEST_HEAD_NOTICE.match(text)
+    tail = None if head else _GUEST_TAIL_NOTICE.search(text)
+    prefix = text[: head.end()] if head else (_OMITTED if not tail else "")
+    suffix = text[tail.start():] if tail else ""
+    body = text[(head.end() if head else 0): len(text) - len(suffix)]
+    from_start = not tail  # a leading notice or no notice: keep the newest lines; a trailing notice: keep the oldest
+    lines = body.split("\n")
+    while len(lines) > 1 and not _within_runtime_limits(prefix + "\n".join(lines) + suffix):
+        lines.pop(0) if from_start else lines.pop()
+    fitted = "\n".join(lines)
+    excess = len((prefix + fitted + suffix).encode("utf-8")) - RUNTIME_MAX_BYTES
+    if excess > 0:  # one remaining line is still too long: cut it at a UTF-8 boundary
+        raw = fitted.encode("utf-8")
+        fitted = (raw[excess:] if from_start else raw[: len(raw) - excess]).decode("utf-8", errors="ignore")
+    return prefix + fitted + suffix, True
+
+
+# ---------------------------------------------------------------------------
 # Result presentation seam (T009 owns the real controller)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -248,6 +298,7 @@ class RouterBridge:
         self._events_path = events_path
         self._lock = threading.RLock()
         self._intercepted: set[tuple[str, str]] = set()
+        self._inflight: set[tuple[str, str]] = set()
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -322,22 +373,40 @@ class RouterBridge:
             return {"ok": False, "error": f"Invalid arguments for {tool}: {str(exc).splitlines()[0]}"}
         with self._lock:
             self._intercepted.add((sid, cid))
+            self._inflight.add((sid, cid))
             self.calls[(sid, cid)] = call
         self._event("router.intercepted", "ok", tool, sid, cid, call, {"state": "before_native"}, operation=route.operation)
-        result = self.broker.execute(call)
+        try:
+            result = self.broker.execute(call)
+        finally:
+            with self._lock:
+                self._inflight.discard((sid, cid))
         presented = self.presenter.present(call, result)
         self._event("router.presented", result["status"], tool, sid, cid, result, {"output": presented.output, "is_error": presented.is_error}, operation=route.operation)
+        output, fitted = fit_for_runtime(presented.output)
+        metadata = {key: value for key, value in presented.metadata.items() if key not in {"truncated", "outputPath"}}
+        if fitted:
+            self._event("router.output_fitted", "ok", tool, sid, cid, {"output": presented.output}, {"output": output}, operation=route.operation)
         if presented.is_error:
-            return {"ok": False, "error": presented.output, "metadata": presented.metadata}
-        return {"ok": True, "output": presented.output, "metadata": presented.metadata}
+            return {"ok": False, "error": output, "metadata": metadata}
+        return {"ok": True, "output": output, "metadata": metadata}
 
     def cancel(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Cancel through the broker and report the status it actually reached (never assume success)."""
         call = self.calls.get((body["session_id"], body["call_id"]))
         if call is None:
-            return {"ok": False, "error": "unknown call"}
-        self.broker.cancel(call)
-        self._event("router.cancelled", "cancelled", call["tool_name"], call["session_id"], call["call_id"], call, {"cancelled": True})
-        return {"ok": True}
+            return {"cancelled": False, "status": "unknown_call", "error": "unknown call"}
+        result = self.broker.cancel(call)
+        status = result["status"]
+        self._event("router.cancelled" if status == "cancelled" else "router.cancel_failed", status, call["tool_name"], call["session_id"],
+                    call["call_id"], call, {"status": status, "error_code": result.get("error_code")}, operation=call["operation"])
+        return {"cancelled": status == "cancelled", "status": status, "error_code": result.get("error_code")}
+
+    def cancel_inflight(self) -> list[dict[str, Any]]:
+        """Cancel every guest execution still running; used when the host runtime stops without cancelling itself."""
+        with self._lock:
+            pending = sorted(self._inflight)
+        return [self.cancel({"session_id": sid, "call_id": cid}) for sid, cid in pending]
 
     def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         bridge = self
@@ -369,6 +438,187 @@ class RouterBridge:
                     self._reply(500, {"ok": False, "error": "router error"})
 
         return Handler
+
+
+# ---------------------------------------------------------------------------
+# Guarded provider proxy: every model request is audited before it leaves the host
+# ---------------------------------------------------------------------------
+_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+
+
+class ProviderGuard:
+    """Loopback proxy between the host runtime and the configured model provider.
+
+    Equivalent role to the legacy request guard (which is bound to Inspect's bridge and cannot front an
+    external CLI): each request is parsed, bounded and audited *before* any bytes reach the provider. A request
+    that is oversized, unparseable, or that advertises an unrouted/disabled tool is refused and never forwarded.
+    Responses (including provider errors and streaming bodies) are relayed unchanged.
+    """
+
+    def __init__(self, upstream_base_url: str, audit: Callable[[dict[str, Any]], list[dict[str, Any]]], *,
+                 max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0):
+        self.upstream = urllib.parse.urlsplit(upstream_base_url)
+        if self.upstream.scheme not in {"http", "https"} or not self.upstream.hostname:
+            raise ValueError("provider_base_url must be an http(s) URL")
+        self.audit, self.max_request_bytes, self.upstream_timeout = audit, max_request_bytes, upstream_timeout
+        self.stats = {"received": 0, "audited": 0, "forwarded": 0, "refused": 0}
+        self.refusals: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def start(self) -> "ProviderGuard":
+        self._thread.start()
+        return self
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def _count(self, key: str) -> None:
+        with self._lock:
+            self.stats[key] += 1
+
+    def _refuse(self, handler: http.server.BaseHTTPRequestHandler, status: int, reason: str) -> None:
+        self._count("refused")
+        with self._lock:
+            self.refusals.append({"status": status, "reason": reason})
+        payload = json.dumps({"error": {"message": f"request refused by the provider guard: {reason}", "type": "guard_refusal", "code": status}}).encode()
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    def _forward(self, handler: http.server.BaseHTTPRequestHandler, raw: bytes) -> None:
+        connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
+        connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
+        try:
+            headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
+            headers["Content-Length"] = str(len(raw))
+            path = self.upstream.path.rstrip("/") + handler.path
+            connection.request("POST", path, body=raw, headers=headers)
+            response = connection.getresponse()
+        except (OSError, http.client.HTTPException) as exc:
+            connection.close()
+            return self._refuse(handler, 502, f"provider unreachable: {type(exc).__name__}")
+        self._count("forwarded")
+        try:
+            handler.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in _HOP_BY_HOP:
+                    handler.send_header(key, value)
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            while chunk := response.read1(65536):
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+        except (OSError, http.client.HTTPException):
+            pass  # the runtime went away or the stream broke; nothing further is relayed
+        finally:
+            connection.close()
+
+    def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
+        guard = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"  # the body ends when the connection closes, so streams need no framing
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                guard._count("received")
+                length = self.headers.get("Content-Length")
+                if length is None or not length.isdigit():
+                    return guard._refuse(self, 411, "a bounded Content-Length is required")
+                if int(length) > guard.max_request_bytes:
+                    return guard._refuse(self, 413, f"request exceeds {guard.max_request_bytes} bytes")
+                raw = self.rfile.read(int(length))
+                try:
+                    body = json.loads(raw)
+                    if not isinstance(body, dict):
+                        raise ValueError("request body is not a JSON object")
+                except ValueError:
+                    return guard._refuse(self, 400, "request body is not a JSON object")
+                guard._count("audited")
+                try:
+                    violations = guard.audit(body)
+                except Exception:  # an audit that cannot complete is a refusal, never a pass
+                    return guard._refuse(self, 500, "request audit failed")
+                if violations:
+                    return guard._refuse(self, 403, "request advertises tools without an explicit route")
+                guard._forward(self, raw)
+
+        return Handler
+
+
+class GuestWorkerSession:
+    """T006 transport over one ``docker exec -i ... guest_session`` process inside an existing guest container.
+
+    The worker protocol is strictly request/reply on one pipe, so a blocking ``collect`` would delay a
+    ``cancel`` queued behind it. ``stream`` therefore polls ``status`` (which returns immediately) and only
+    collects once the execution has finished, leaving the pipe free for a concurrent cancel.
+    """
+
+    def __init__(self, container: str, run_id: str, *, guest_root: str, python_path: str = "/opt/worker",
+                 environment: Mapping[str, str] | None = None, poll_interval: float = 0.05):
+        env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path, "PYTHONDONTWRITEBYTECODE": "1", **(environment or {})}
+        command = ["docker", "exec", "-i", "-w", guest_root]
+        for key, value in sorted(env.items()):
+            command += ["-e", f"{key}={value}"]
+        self._lock = threading.Lock()
+        self._poll = poll_interval
+        self._proc = subprocess.Popen([*command, container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.digest = self._rpc({"op": "capabilities"})["worker_digest"]
+
+    def _rpc(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            try:
+                self._proc.stdin.write(json.dumps(request) + "\n")
+                self._proc.stdin.flush()
+                line = self._proc.stdout.readline()
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"guest worker session unavailable: {exc}") from exc
+        if not line:
+            raise RuntimeError("guest worker session closed")
+        reply = json.loads(line)
+        if "error" in reply:
+            raise RuntimeError(f"worker error: {reply['error']}")
+        return reply
+
+    def execute(self, call: dict[str, Any]) -> dict[str, Any]:
+        return self._rpc({"op": "execute", "call": call})["result"]
+
+    def start(self, call: dict[str, Any]) -> dict[str, Any]:
+        return self._rpc({"op": "start", "call": call})["handle"]
+
+    def stream(self, key: dict[str, str]) -> Iterator[dict[str, Any]]:
+        while self.status(key)["state"] != "completed":
+            time.sleep(self._poll)
+        yield from self._rpc({"op": "collect", "execution_key": key})["events"]
+
+    def status(self, key: dict[str, str]) -> dict[str, Any]:
+        return self._rpc({"op": "status", "execution_key": key})["status"]
+
+    def cancel(self, key: dict[str, str], *, how: str = "terminate") -> bool:
+        return self._rpc({"op": "cancel", "execution_key": key, "how": how})["cancelled"]
+
+    def process_handle(self, call: dict[str, Any]) -> None:
+        return None  # not queryable through the session protocol; the broker falls back to status by stable key
+
+    def close(self) -> None:
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            self._proc.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +665,7 @@ class HostOpenCodeAdapter:
                  runtime: PinnedRuntime | None = None, registry: OperationRegistry | None = None,
                  presenter: Presenter | None = None, today: str | None = None, provider_api_key: str = "sk-none",
                  context_limit: tuple[int, int] | None = None, autocompact: bool = False,
-                 runtime_flags: Mapping[str, str] | None = None):
+                 runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024):
         if not model or "/" in model:
             raise ValueError("model must be a bare model ID served by the configured provider")
         self.run_id, self.broker, self.profile = run_id, broker, dict(guest_profile)
@@ -423,6 +673,8 @@ class HostOpenCodeAdapter:
         self.runtime = runtime or PinnedRuntime.locate()
         self.model, self.base_url, self.api_key = model, provider_base_url, provider_api_key
         self.today, self.context_limit, self.autocompact = today, context_limit, autocompact
+        self.max_request_bytes = max_request_bytes
+        self.guard: ProviderGuard | None = None
         self.runtime_flags = dict(HOST_RUNTIME_FLAGS if runtime_flags is None else runtime_flags)
         self.stage = Path(stage_root) if stage_root else Path(tempfile.mkdtemp(prefix="artifact-host-stage-")).resolve()
         self.stage = self.stage.resolve()
@@ -438,6 +690,7 @@ class HostOpenCodeAdapter:
         self._turn = 0
         self._reported = 0
         self._staged = False
+        self._active: subprocess.Popen[str] | None = None
 
     # -- discovery of native, model-specific tools --------------------------
     def discover_native_tools(self) -> dict[str, dict[str, Any]]:
@@ -527,7 +780,9 @@ class HostOpenCodeAdapter:
             (self.config_dir / "tools" / f"{name}.ts").write_text(
                 'import { tool } from "@opencode-ai/plugin";\nimport { routedTool } from "../lib/tool_stub.ts";\n'
                 f'export default routedTool("{name}", tool);\n')
-        self._write_opencode_config(self.config_dir, self.base_url, router=True)
+        # Every provider request of a routed turn passes through the guard before it leaves the host.
+        self.guard = ProviderGuard(self.base_url, self.audit_request, max_request_bytes=self.max_request_bytes).start()
+        self._write_opencode_config(self.config_dir, self.guard.url, router=True)
         self._staged = True
 
     # -- execution -------------------------------------------------------------
@@ -554,21 +809,50 @@ class HostOpenCodeAdapter:
         if session_id:
             command += ["--session", session_id]
         command += prompt_args
-        result = subprocess.run(command, cwd=work, env=self._environment(root, config), text=True, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(command, cwd=work, env=self._environment(root, config), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        self._active = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        finally:
+            self._active = None
+            # A runtime that dies (interrupt, kill, timeout) cannot cancel its own tool calls: the guest must not keep mutating.
+            self.bridge.cancel_inflight()
+        result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         log_prefix.parent.mkdir(parents=True, exist_ok=True)
         Path(f"{log_prefix}.stdout.log").write_text(result.stdout)
         Path(f"{log_prefix}.stderr.log").write_text(result.stderr)
         return result
 
-    def audit_request(self, body: Mapping[str, Any]) -> None:
-        """Called for every outbound model request. Tool-bearing requests must advertise only routed tools."""
-        names = [t["function"]["name"] for t in body.get("tools") or []]
+    def interrupt(self, sig: int = signal.SIGINT) -> bool:
+        """Send ``sig`` to the running OpenCode process (a user interrupt); False when no turn is running."""
+        proc = self._active
+        if proc is None or proc.poll() is not None:
+            return False
+        proc.send_signal(sig)
+        return True
+
+    def audit_request(self, body: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Audit one outbound model request; returns the violations it raised (empty when it may be forwarded).
+
+        Tool-bearing requests must advertise only routed tools. The production caller is :class:`ProviderGuard`,
+        which every provider request of :meth:`run_turn` passes through before it leaves the host.
+        """
+        before = len(self.bridge.violations)
+        tools = body.get("tools") or []
+        names = [t["function"]["name"] for t in tools if isinstance(t, dict) and isinstance(t.get("function"), dict) and isinstance(t["function"].get("name"), str)]
+        if len(names) != len(tools):
+            self.bridge._violation("unauditable_advertisement", "?", None, None, "tool advertisement without a function name")
         unrouted = set(self.registry.unrouted(names))
         for name in names:
             if name in unrouted:
                 self.bridge._violation("unrouted_advertisement", name, None, None, "tool advertised without an explicit route")
             elif self.registry.disposition(name) == "disabled":
                 self.bridge._violation("disabled_advertisement", name, None, None, "disabled tool advertised to the model")
+        return list(self.bridge.violations[before:])
 
     def run_turn(self, prompt: str, *, session_id: str | None = None, timeout: float = 120) -> TurnResult:
         """Run one OpenCode turn; ``session_id`` continues a prior host session."""
@@ -599,6 +883,7 @@ class HostOpenCodeAdapter:
 
     def close(self) -> None:
         if self._staged:
+            self.guard.close()
             self.bridge.close()
 
     def __enter__(self) -> "HostOpenCodeAdapter":
