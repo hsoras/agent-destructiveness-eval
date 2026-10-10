@@ -30,9 +30,10 @@ class ScopedWorkerTests(unittest.TestCase):
             root=Path(temporary).resolve();project=self.temporary_project(root,7)
             other=self.temporary_project(root,8)
             env=scoped_worker_environment(project,root/'repo',7,
-                environ=dict(os.environ,TMPDIR='/outside',TEMP='/outside',TMP='/outside'))
+                environ=dict(os.environ,TMPDIR='/outside',TEMP='/outside',TMP='/outside',xcrun_db='/outside/cache'))
             expected=str(root/'repo'/project['temporary_directory']['relative_path'])
             self.assertEqual([env[k] for k in ('TMPDIR','TEMP','TMP')],[expected]*3)
+            self.assertEqual(env['xcrun_db'],str(Path(expected)/'xcrun_db'))
             self.assertNotEqual(project['temporary_directory']['relative_path'],other['temporary_directory']['relative_path'])
             self.assertEqual(env['PYTHONDONTWRITEBYTECODE'],'1')
             script=('import tempfile,pathlib,subprocess,sys; '
@@ -44,6 +45,22 @@ class ScopedWorkerTests(unittest.TestCase):
             self.assertIn('MOCK_OK',result.stdout)
             self.assertIn(expected+'/',result.stdout)
             self.assertTrue(Path(expected).is_dir())
+
+    @unittest.skipUnless(sys.platform=='darwin','Apple developer-tool cache routing')
+    def test_temporary_native_make_cache_uses_bound_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=self.temporary_project(root)
+            (root/'repo/Makefile').write_text('smoke-build:\n\t@echo BUILD_OK\n')
+            env=scoped_worker_environment(project,root/'repo',1,
+                environ=dict(os.environ,TMPDIR=str(root),xcrun_db='/outside/cache'))
+            # The CLI's command environment can replace TMPDIR. The explicit
+            # xcrun cache must stay bound to the authenticated attempt anyway.
+            env.update(TMPDIR=str(root),xcrun_verbose='1')
+            result=subprocess.run(['/usr/bin/make','smoke-build'],cwd=root/'repo',
+                                  env=env,text=True,capture_output=True,check=True)
+            self.assertIn('BUILD_OK',result.stdout)
+            self.assertIn("xcrun_db = '"+env['xcrun_db']+"'",result.stderr)
+            self.assertTrue(Path(env['xcrun_db']).is_file())
 
     def test_temporary_metadata_attempt_workspace_and_inode_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -146,7 +163,9 @@ class ScopedWorkerTests(unittest.TestCase):
                     runpy.run_path(str(Path(__file__).parent/'job.py'),run_name='__main__')
                 actual=launch.call_args.kwargs['env']
                 if scoped:
-                    self.assertEqual(actual['TMPDIR'],str(root/'repo'/project['temporary_directory']['relative_path']))
+                    expected=root/'repo'/project['temporary_directory']['relative_path']
+                    self.assertEqual(actual['TMPDIR'],str(expected))
+                    self.assertEqual(actual['xcrun_db'],str(expected/'xcrun_db'))
                     self.assertEqual(create.call_args.kwargs['attempt'],2)
                     receipt=json.loads(Path(job['receipt']).read_text())
                     self.assertEqual(receipt['worker_project']['temporary_directory'],project['temporary_directory'])

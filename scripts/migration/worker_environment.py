@@ -164,8 +164,11 @@ def scoped_worker_environment(project, cwd, attempt, *, environ=None):
         raise EnvironmentUnavailable('permissions', 'Worker temporary-directory attempt mismatch')
     root = Path(project['workspace'])
     temporary = str(root/binding['relative_path'])
+    # Apple developer-tool shims use this explicit cache path even when a
+    # command shell replaces TMPDIR. Keep their writes in the same bound attempt.
     environment = dict(os.environ if environ is None else environ, TMPDIR=temporary,
-                       TEMP=temporary, TMP=temporary, PYTHONDONTWRITEBYTECODE='1')
+                       TEMP=temporary, TMP=temporary, PYTHONDONTWRITEBYTECODE='1',
+                       xcrun_db=str(root/binding['relative_path']/'xcrun_db'))
     _validate_temporary_path(root, binding)
     return environment
 
