@@ -13,12 +13,146 @@ import time
 import unittest
 from unittest.mock import patch, Mock
 from worker_environment import (create_project, selected_project_policy, development_commands,
-                                EnvironmentUnavailable, host_readiness, valid_handoff)
+                                EnvironmentUnavailable, host_readiness, valid_handoff,
+                                scoped_worker_environment)
 from docker_guest import GuestBroker, bounded_process
 from providers import effective_permissions, permission_preflight
 
 
 class ScopedWorkerTests(unittest.TestCase):
+    def temporary_project(self, root, attempt=1):
+        repo=root/'repo';repo.mkdir(exist_ok=True)
+        with patch('worker_environment.git_boundary',return_value=dict(common_git_dir=str(repo/'.git'))):
+            return create_project(repo,[],attempt=attempt,projects_dir=root/'projects')
+
+    def test_temporary_launch_executes_fixture_inside_exact_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=self.temporary_project(root,7)
+            other=self.temporary_project(root,8)
+            env=scoped_worker_environment(project,root/'repo',7,
+                environ=dict(os.environ,TMPDIR='/outside',TEMP='/outside',TMP='/outside'))
+            expected=str(root/'repo'/project['temporary_directory']['relative_path'])
+            self.assertEqual([env[k] for k in ('TMPDIR','TEMP','TMP')],[expected]*3)
+            self.assertNotEqual(project['temporary_directory']['relative_path'],other['temporary_directory']['relative_path'])
+            self.assertEqual(env['PYTHONDONTWRITEBYTECODE'],'1')
+            script=('import tempfile,pathlib,subprocess,sys; '
+                    'p=pathlib.Path(tempfile.mkdtemp()); '
+                    'f=p/"mock"; f.write_text("#!"+sys.executable+"\\nprint(\\\"MOCK_OK\\\")\\n"); '
+                    'f.chmod(0o700); print(p); subprocess.run([str(f)],check=True)')
+            result=subprocess.run([sys.executable,'-B','-c',script],env=env,
+                                  text=True,capture_output=True,check=True)
+            self.assertIn('MOCK_OK',result.stdout)
+            self.assertIn(expected+'/',result.stdout)
+            self.assertTrue(Path(expected).is_dir())
+
+    def test_temporary_metadata_attempt_workspace_and_inode_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=self.temporary_project(root,3)
+            for change in ({'temporary_directory':None},{'workspace':str(root)},
+                           {'temporary_directory':dict(project['temporary_directory'],attempt=4)},
+                           {'temporary_directory':dict(project['temporary_directory'],relative_path='../outside')}):
+                with self.subTest(change=change),self.assertRaises(EnvironmentUnavailable):
+                    scoped_worker_environment(dict(project,**change),root/'repo',3)
+            with self.assertRaises(EnvironmentUnavailable):
+                scoped_worker_environment(project,root/'repo',4)
+            path=root/'repo'/project['temporary_directory']['relative_path']
+            path.rename(path.with_name('retained'));path.mkdir(mode=0o700)
+            with self.assertRaises(EnvironmentUnavailable):selected_project_policy(project,root/'repo')
+
+    def test_temporary_symlink_collision_and_unsafe_mode_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve();project=self.temporary_project(root)
+            path=root/'repo'/project['temporary_directory']['relative_path']
+            path.chmod(0o755)
+            with self.assertRaises(EnvironmentUnavailable):selected_project_policy(project,root/'repo')
+            path.chmod(0o700)
+            with patch('worker_environment.uuid.uuid4',return_value=project['id']):
+                with self.assertRaises(EnvironmentUnavailable):self.temporary_project(root)
+            path.rename(path.with_name('retained'));path.symlink_to(root,target_is_directory=True)
+            with self.assertRaises(EnvironmentUnavailable):selected_project_policy(project,root/'repo')
+            (root/'repo/.scenario').rename(root/'retained-scenario')
+            (root/'repo/.scenario').symlink_to(root,target_is_directory=True)
+            with self.assertRaises(EnvironmentUnavailable):self.temporary_project(root)
+
+    def test_temporary_invalid_attempts_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()
+            for attempt in (0,-1,True,'1',None):
+                with self.subTest(attempt=attempt),self.assertRaises(EnvironmentUnavailable):
+                    self.temporary_project(root,attempt)
+
+    def test_temporary_parent_swap_after_authentic_open_fails_closed(self):
+        for mode in ('symlink','relocate_leaf','creation'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();project=self.temporary_project(root,7)
+                parent=root/'repo/.scenario/worker-tmp';outside=root/'outside';outside.mkdir()
+                original_open=os.open;swapped=False
+                def swap(path,flags,*args,**kwargs):
+                    nonlocal swapped
+                    descriptor=original_open(path,flags,*args,**kwargs)
+                    if not swapped and str(path).endswith('-7'):
+                        swapped=True;parent.rename(parent.with_name('retained'))
+                        if mode=='relocate_leaf':
+                            parent.mkdir()
+                            (parent.with_name('retained')/str(path)).rename(parent/str(path))
+                        else:
+                            parent.symlink_to(outside,target_is_directory=True)
+                    return descriptor
+                with patch('worker_environment.os.open',side_effect=swap):
+                    with self.assertRaises(EnvironmentUnavailable):
+                        if mode=='creation':self.temporary_project(root,7)
+                        else:scoped_worker_environment(project,root/'repo',7)
+                self.assertTrue(swapped)
+
+    def test_temporary_parent_swap_between_policy_and_handoff_fails_closed(self):
+        for component in ('parent','workspace'):
+            with self.subTest(component=component),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();project=self.temporary_project(root,7)
+                parent=root/'repo/.scenario/worker-tmp';outside=root/'outside'
+                def swap_after_policy(*args):
+                    rules=selected_project_policy(*args)
+                    if component=='workspace':
+                        (root/'repo').rename(outside)
+                        (root/'repo').symlink_to(outside,target_is_directory=True)
+                    else:
+                        outside.mkdir();parent.rename(parent.with_name('retained'))
+                        parent.symlink_to(outside,target_is_directory=True)
+                    return rules
+                with patch('worker_environment.selected_project_policy',side_effect=swap_after_policy):
+                    with self.assertRaises(EnvironmentUnavailable):
+                        scoped_worker_environment(project,root/'repo',7)
+
+    def test_temporary_job_environment_only_changes_scoped_agy(self):
+        for provider, scoped in (('agy',True),('agy',False),('codex',False)):
+            with self.subTest(provider=provider,scoped=scoped),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve();project=self.temporary_project(root,2)
+                job=dict(provider=provider,command=[provider,'--sandbox'],cwd=str(root/'repo'),
+                         route=dict(scoped_worker_permissions=scoped),attempt=2,timeout=5)
+                for key in ('prompt','receipt','result','log','stderr'):job[key]=str(root/key)
+                Path(job['prompt']).write_text('fixture prompt')
+                path=root/'job.json';path.write_text(json.dumps(job))
+                process=Mock(pid=123);process.wait.return_value=0
+                parsed=dict(response='done',success=True,structured_output=dict(
+                    changed_paths=[],tests=[],guest_operations=[],limitations=[]))
+                with patch.object(sys,'argv',['job.py',str(path)]),patch(
+                        'worker_environment.host_readiness'),patch(
+                        'worker_environment.create_project',return_value=project) as create,patch(
+                        'providers.preflight',return_value=dict(ready=True)),patch(
+                        'providers.effective_permissions',return_value=dict(ready=True,permissions=project['permissions'])),patch(
+                        'providers.permission_preflight',return_value=dict(ready=True)),patch(
+                        'providers.snapshot',return_value={}),patch(
+                        'providers.agy_outcome',return_value=parsed),patch(
+                        'subprocess.Popen',return_value=process) as launch,patch.dict(os.environ,TMPDIR='/outside'):
+                    runpy.run_path(str(Path(__file__).parent/'job.py'),run_name='__main__')
+                actual=launch.call_args.kwargs['env']
+                if scoped:
+                    self.assertEqual(actual['TMPDIR'],str(root/'repo'/project['temporary_directory']['relative_path']))
+                    self.assertEqual(create.call_args.kwargs['attempt'],2)
+                    receipt=json.loads(Path(job['receipt']).read_text())
+                    self.assertEqual(receipt['worker_project']['temporary_directory'],project['temporary_directory'])
+                else:
+                    self.assertIsNone(actual);create.assert_not_called()
+
     def test_boundary_control_requires_exact_command_and_immutable_test(self):
         from scoped_worker_smoke import boundary_control
         from orchestrate import Stop

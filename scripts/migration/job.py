@@ -9,7 +9,8 @@ import sys
 import time
 from orchestrate import atomic
 from usage import log_usage
-from worker_environment import EnvironmentUnavailable, host_readiness, create_project, RESULT_SCHEMA, valid_handoff
+from worker_environment import (EnvironmentUnavailable, host_readiness, create_project,
+                                scoped_worker_environment, RESULT_SCHEMA, valid_handoff)
 from providers import agy_outcome, preflight, snapshot, permission_preflight, effective_permissions
 
 job_path = Path(sys.argv[1])
@@ -41,6 +42,7 @@ try:
                 protected += [guest.receipts, guest.responses, guest.directory/'environment.json',
                               guest.directory/'summary.json']
             project = create_project(job['cwd'], job.get('permission_commands', []),
+                                     attempt=job.get('attempt', 1),
                                      client_commands=clients, protected=protected,
                                      request_directory=guest.requests if guest else None,
                                      response_directory=guest.responses if guest else None)
@@ -84,7 +86,7 @@ try:
             command += ['-p', instructions]
         p = subprocess.Popen(command, cwd=job['cwd'], stdin=prompt if provider == 'codex' else subprocess.DEVNULL,
                              stdout=log, stderr=diagnostics if provider == 'agy' else subprocess.STDOUT, start_new_session=True,
-                             env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1') if project else None)
+                             env=scoped_worker_environment(project, job['cwd'], job.get('attempt', 1)) if project else None)
         atomic(str(job_path) + '.child.json', {'pid': p.pid, 'started': time.time()})
         try:
             exit_code = p.wait(timeout=job['timeout'])

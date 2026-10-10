@@ -85,12 +85,100 @@ def git_boundary(cwd):
                 owner='trusted coordinator; no external Git mounts granted')
 
 
-def create_project(cwd, commands, *, client_commands=(), protected=(),
+def _validate_temporary_path(root, binding):
+    """Check that the launch pathname still names every authenticated directory.
+
+    A pathname cannot be pinned atomically across an external CLI's later use.
+    Recheck just before handoff; the CLI sandbox remains the runtime boundary.
+    """
+    path = Path(root)
+    try:
+        for index, identity in enumerate(binding['directory_chain']):
+            if index:
+                path = path/binding['relative_path'].split('/')[index-1]
+            info = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISDIR(info.st_mode) or
+                    [info.st_dev, info.st_ino] != identity):
+                raise EnvironmentUnavailable('permissions', 'Worker temporary-directory path identity changed')
+        if path.resolve(strict=True) != path:
+            raise EnvironmentUnavailable('permissions', 'Worker temporary-directory path escaped workspace')
+        # Check the final pathname again after canonicalization, including its mode.
+        info = os.stat(path, follow_symlinks=False)
+        if ([info.st_dev, info.st_ino] != [binding['device'], binding['inode']] or
+                not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
+                stat.S_IMODE(info.st_mode) != 0o700):
+            raise EnvironmentUnavailable('permissions', 'Worker temporary-directory path changed before handoff')
+    except OSError as e:
+        raise EnvironmentUnavailable('permissions', 'Unsafe worker temporary-directory path: '+str(e))
+
+
+def _temporary_directory(root, project_id, attempt, *, create=False):
+    """Authenticate the complete directory chain and its current launch pathname."""
+    if type(attempt) is not int or attempt < 1:
+        raise EnvironmentUnavailable('permissions', 'Invalid temporary-directory attempt')
+    if not isinstance(project_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', project_id):
+        raise EnvironmentUnavailable('permissions', 'Invalid temporary-directory project ID')
+    parts = ['.scenario', 'worker-tmp', project_id+'-'+str(attempt)]
+    descriptors = []
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(fd)
+        for index, part in enumerate(parts):
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    if index == len(parts)-1:
+                        raise EnvironmentUnavailable('permissions', 'Worker temporary-directory collision')
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            descriptors.append(child)
+            fd = child
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise EnvironmentUnavailable('permissions', 'Unsafe worker temporary-directory ownership/mode')
+        chain = []
+        for index, descriptor in enumerate(descriptors):
+            current = os.fstat(descriptor)
+            chain.append([current.st_dev, current.st_ino])
+            if index:
+                linked = os.stat(parts[index-1], dir_fd=descriptors[index-1], follow_symlinks=False)
+                if (not stat.S_ISDIR(linked.st_mode) or
+                        [linked.st_dev, linked.st_ino] != chain[-1]):
+                    raise EnvironmentUnavailable('permissions', 'Worker temporary-directory parent changed')
+        binding = dict(relative_path='/'.join(parts), project_id=project_id, attempt=attempt,
+                       device=info.st_dev, inode=info.st_ino, directory_chain=chain)
+        _validate_temporary_path(root, binding)
+        return binding
+    except OSError as e:
+        raise EnvironmentUnavailable('permissions', 'Unsafe worker temporary directory: '+str(e))
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def scoped_worker_environment(project, cwd, attempt, *, environ=None):
+    """Return a validated launch environment; retain fixture files for recovery."""
+    selected_project_policy(project, cwd)
+    binding = project['temporary_directory']
+    if type(attempt) is not int or binding['attempt'] != attempt:
+        raise EnvironmentUnavailable('permissions', 'Worker temporary-directory attempt mismatch')
+    root = Path(project['workspace'])
+    temporary = str(root/binding['relative_path'])
+    environment = dict(os.environ if environ is None else environ, TMPDIR=temporary,
+                       TEMP=temporary, TMP=temporary, PYTHONDONTWRITEBYTECODE='1')
+    _validate_temporary_path(root, binding)
+    return environment
+
+
+def create_project(cwd, commands, *, client_commands=(), protected=(), attempt=1,
                    request_directory=None, response_directory=None, projects_dir=None):
     root = Path(cwd).resolve()
     allowed, coordinator = development_commands(commands)
     boundary = git_boundary(root)
     project_id = str(uuid.uuid4())
+    temporary_directory = _temporary_directory(root, project_id, attempt, create=True)
+    if temporary_directory != _temporary_directory(root, project_id, attempt):
+        raise EnvironmentUnavailable('permissions', 'Worker temporary directory changed during creation')
     directory = Path(projects_dir) if projects_dir else Path.home()/'.gemini/config/projects'
     directory.mkdir(parents=True, exist_ok=True)
     grants = ['command('+shlex.join(argv)+')' for argv in [*allowed, *client_commands]]
@@ -130,6 +218,7 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
     denies += ['write_file('+str(Path(p).resolve())+')' for p in protected]
     data = dict(id=project_id, name='Isolated Gemini worker '+project_id,
                 projectResources=dict(resources=[dict(folderUri=root.as_uri())]),
+                workerTemporaryDirectory=temporary_directory,
                 permissionGrants=dict(permissionGrants=dict(allow=sorted(set(grants)), deny=denies)))
     path = directory/(project_id+'.json')
     try:
@@ -139,10 +228,12 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
         path.chmod(0o600)
     except OSError as e:
         raise EnvironmentUnavailable('permissions', 'Cannot create isolated worker project: '+str(e))
+    _validate_temporary_path(root, temporary_directory)
     return dict(id=project_id, path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 commands=[*allowed, *client_commands], coordinator_only_commands=coordinator,
                 permissions=data['permissionGrants']['permissionGrants'], git_boundary=boundary,
-                workspace=str(root), source_pyproject=source_pyproject)
+                workspace=str(root), source_pyproject=source_pyproject,
+                temporary_directory=temporary_directory)
 
 
 def selected_project_policy(project, cwd):
@@ -159,6 +250,16 @@ def selected_project_policy(project, cwd):
     data = json.loads(raw)
     if data['id'] != project['id'] or data['projectResources']['resources'] != [dict(folderUri=Path(cwd).resolve().as_uri())]:
         raise EnvironmentUnavailable('permissions', 'Worker project ID/workspace mismatch')
+    if project.get('workspace') != str(Path(cwd).resolve()):
+        raise EnvironmentUnavailable('permissions', 'Worker project workspace provenance mismatch')
+    temporary = data.get('workerTemporaryDirectory')
+    if (not isinstance(temporary, dict) or
+            set(temporary) != {'relative_path', 'project_id', 'attempt', 'device', 'inode', 'directory_chain'} or
+            temporary != project.get('temporary_directory') or
+            temporary['project_id'] != project['id']):
+        raise EnvironmentUnavailable('permissions', 'Worker temporary-directory provenance mismatch')
+    if temporary != _temporary_directory(Path(project['workspace']), project['id'], temporary['attempt']):
+        raise EnvironmentUnavailable('permissions', 'Worker temporary-directory identity changed')
     rules = data['permissionGrants']['permissionGrants']
     if rules != project['permissions']:
         raise EnvironmentUnavailable('permissions', 'Worker project rules mismatch')
