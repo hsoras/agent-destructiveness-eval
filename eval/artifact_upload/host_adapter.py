@@ -204,25 +204,102 @@ def guest_environment_block(profile: Mapping[str, Any], *, today: str | None = N
 # the guest worker (whose notice names a guest path).
 RUNTIME_MAX_LINES = 2000
 RUNTIME_MAX_BYTES = 51200
-_GUEST_HEAD_NOTICE = re.compile(r"\A\.\.\.output truncated\.\.\.\n\nFull output saved to: [^\n]+\n\n")
-_GUEST_TAIL_NOTICE = re.compile(r"\n\n\.\.\.\d+ (?:bytes|lines) truncated\.\.\.\n\nThe tool call succeeded but the output was truncated\. Full output saved to: [^\n]+\n[^\n]*\Z")
+# Notice overhead is bounded: a guest path is at most PATH_MAX and the hint line is short, so anything longer is
+# ordinary (possibly forged) text, never a notice, and is shortened like any other text.
+_PATH = r"[^\n]{1,4096}"
+_GUEST_HEAD_NOTICE = re.compile(rf"\A\.\.\.output truncated\.\.\.\n\nFull output saved to: {_PATH}\n\n")
+_GUEST_TAIL_NOTICE = re.compile(rf"\n\n\.\.\.\d{{1,12}} (?:bytes|lines) truncated\.\.\.\n\nThe tool call succeeded but the output was truncated\. Full output saved to: {_PATH}\n[^\n]{{0,512}}\Z")
 _OMITTED = "[output exceeds the runtime output limit and was cut; no full copy is retained for this result]\n"
+# Worker ``read`` shapes (sandbox/artifact_upload/worker/tools.py): file rows are "N: text"; directory entries are bare names.
+_READ_FILE = re.compile(rf"\A(<path>{_PATH}</path>\n<type>file</type>\n<content>\n)(.*)\n\n\((?:Output capped at 50 KB\. Showing lines (\d+)-(\d+)\. Use offset=(\d+) to continue\.|"
+                        r"Showing lines (\d+)-(\d+) of (\d+)\. Use offset=(\d+) to continue\.|End of file - total (\d+) lines)\)\n</content>\Z", re.S)
+_READ_DIR = re.compile(rf"\A(<path>{_PATH}</path>\n<type>directory</type>\n<entries>\n)(.*)\n\n\((?:Showing (\d+) of (\d+) entries\. Use 'offset' parameter to read beyond entry (\d+)|(\d+) entries)\)\n</entries>\Z", re.S)
 
 
 def _within_runtime_limits(text: str) -> bool:
-    return len(text.split("\n")) <= RUNTIME_MAX_LINES and len(text.encode("utf-8")) <= RUNTIME_MAX_BYTES
+    return text.count("\n") + 1 <= RUNTIME_MAX_LINES and len(text.encode("utf-8")) <= RUNTIME_MAX_BYTES
 
 
-def fit_for_runtime(text: str) -> tuple[str, bool]:
-    """Return ``text`` unchanged when the host runtime would not truncate it, else a guest-notice-preserving fit.
+def _hard_truncate(text: str) -> str:
+    """Last-resort fit: an explicit marker plus the newest tail of everything, cut by lines then at a UTF-8 boundary."""
+    room = RUNTIME_MAX_BYTES - len(_OMITTED.encode("utf-8"))
+    tail = text.encode("utf-8")[-room:].decode("utf-8", errors="ignore")
+    lines = tail.split("\n")
+    if len(lines) > RUNTIME_MAX_LINES - 1:
+        tail = "\n".join(lines[-(RUNTIME_MAX_LINES - 1):])
+    return _OMITTED + tail
 
-    A guest truncation notice (head form for shell tails, tail form for search/list previews) is kept intact and the
-    preview next to it is shortened by whole lines: from the start when the notice leads (the guest keeps the newest
-    lines), from the end when it trails. Text without any guest notice is shortened with an explicit marker; the
-    unabridged value stays in the broker journal and the router event digests.
+
+def _take(items: list[str], base: str, separator: str = "\n") -> int:
+    """How many leading ``items`` fit alongside ``base`` (already-assembled surrounding text) within the limits."""
+    size, count, lines = len(base.encode("utf-8")), 0, base.count("\n") + 1
+    for item in items:
+        add = len(item.encode("utf-8")) + (len(separator) if count else 0)
+        extra = item.count("\n") + 1
+        if size + add > RUNTIME_MAX_BYTES or lines + extra > RUNTIME_MAX_LINES:
+            break
+        size, lines, count = size + add, lines + extra, count + 1
+    return count
+
+
+def _fit_read(text: str) -> str | None:
+    """Keep read's header and leading rows and re-derive the continuation footer from what is actually shown."""
+    m = _READ_FILE.match(text)
+    if m:
+        header, body = m.group(1), m.group(2)
+        rows = body.split("\n")
+        first = re.match(r"(\d+): ", rows[0])
+        if not first:
+            return None
+        offset = int(first.group(1))
+        if any(not row.startswith(f"{offset + i}: ") for i, row in enumerate(rows)):
+            return None
+        total = m.group(8) or m.group(10)  # known only when the worker reported it
+        footer = lambda last: (f"(Showing lines {offset}-{last} of {total}. Use offset={last + 1} to continue.)" if total
+                               else f"(Output capped at 50 KB. Showing lines {offset}-{last}. Use offset={last + 1} to continue.)")
+        keep = _take(rows, header + "\n\n" + footer(offset + len(rows)) + "\n</content>")
+        while keep > 0:
+            candidate = header + "\n".join(rows[:keep]) + "\n\n" + footer(offset + keep - 1) + "\n</content>"
+            if _within_runtime_limits(candidate):
+                return candidate
+            keep -= 1
+        return None
+    m = _READ_DIR.match(text)
+    if m:
+        header, body = m.group(1), m.group(2)
+        entries = body.split("\n")
+        shown = int(m.group(3)) if m.group(3) else int(m.group(6))
+        total = int(m.group(4)) if m.group(4) else shown
+        if len(entries) != shown:
+            return None
+        offset = (int(m.group(5)) - shown) if m.group(5) else total - shown + 1  # one-based index of the first entry shown
+        keep = _take(entries, header + "\n\n(Showing 9999 of 9999 entries. Use 'offset' parameter to read beyond entry 99999)\n</entries>")
+        while keep > 0:
+            candidate = header + "\n".join(entries[:keep]) + f"\n\n(Showing {keep} of {total} entries. Use 'offset' parameter to read beyond entry {offset + keep})\n</entries>"
+            if _within_runtime_limits(candidate):
+                return candidate
+            keep -= 1
+    return None
+
+
+def fit_for_runtime(text: str, operation: str | None = None) -> tuple[str, bool]:
+    """Return ``text`` unchanged when the host runtime would not truncate it, else a bounded, truthful fit.
+
+    * ``read`` output keeps its header and leading rows and gets a footer re-derived for the rows actually shown.
+    * A bounded guest truncation notice (head form for shell tails, tail form for search/list previews) is kept intact
+      and the preview next to it is shortened by whole lines: from the start when the notice leads (the guest keeps
+      the newest lines), from the end when it trails.
+    * Anything else is shortened with an explicit marker; the unabridged value stays in the broker journal and the
+      router event digests.
+    The returned text always satisfies the line/byte postcondition; if a shape-specific fit cannot, everything
+    (notices included) is hard-truncated with the marker.
     """
     if _within_runtime_limits(text):
         return text, False
+    if operation == "read":
+        fitted = _fit_read(text)
+        if fitted is not None and _within_runtime_limits(fitted):
+            return fitted, True
     head = _GUEST_HEAD_NOTICE.match(text)
     tail = None if head else _GUEST_TAIL_NOTICE.search(text)
     prefix = text[: head.end()] if head else (_OMITTED if not tail else "")
@@ -236,8 +313,9 @@ def fit_for_runtime(text: str) -> tuple[str, bool]:
     excess = len((prefix + fitted + suffix).encode("utf-8")) - RUNTIME_MAX_BYTES
     if excess > 0:  # one remaining line is still too long: cut it at a UTF-8 boundary
         raw = fitted.encode("utf-8")
-        fitted = (raw[excess:] if from_start else raw[: len(raw) - excess]).decode("utf-8", errors="ignore")
-    return prefix + fitted + suffix, True
+        fitted = (raw[excess:] if from_start else raw[: max(0, len(raw) - excess)]).decode("utf-8", errors="ignore")
+    result = prefix + fitted + suffix
+    return (result if _within_runtime_limits(result) else _hard_truncate(text)), True
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +461,7 @@ class RouterBridge:
                 self._inflight.discard((sid, cid))
         presented = self.presenter.present(call, result)
         self._event("router.presented", result["status"], tool, sid, cid, result, {"output": presented.output, "is_error": presented.is_error}, operation=route.operation)
-        output, fitted = fit_for_runtime(presented.output)
+        output, fitted = fit_for_runtime(presented.output, route.operation)
         metadata = {key: value for key, value in presented.metadata.items() if key not in {"truncated", "outputPath"}}
         if fitted:
             self._event("router.output_fitted", "ok", tool, sid, cid, {"output": presented.output}, {"output": output}, operation=route.operation)
