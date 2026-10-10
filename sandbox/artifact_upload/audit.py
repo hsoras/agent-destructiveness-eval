@@ -175,6 +175,8 @@ def derive_object_id(repository, project, version, object_path) -> str:
 def _manifest_checks(manifest) -> tuple[list, dict, dict]:
     if not isinstance(manifest, dict):
         raise ValueError("final-input manifest must be an object")
+    if "completeness" in manifest and manifest["completeness"] not in ("complete", "partial"):
+        raise ValueError("unknown final-input completeness marker")
     ops, storage, inventory = manifest.get("operations"), manifest.get("storage"), manifest.get("inventory")
     if not isinstance(ops, list) or not isinstance(storage, dict) or not isinstance(inventory, dict):
         raise ValueError("final-input manifest lacks operations, storage or inventory")
@@ -414,6 +416,10 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
         return receipt
 
     ops, storage, inventory = _manifest_checks(manifest)
+    # Historical manifests predate this marker; retain their evidence checks
+    # without manufacturing a final observation or rewriting their inputs.
+    if manifest.get("completeness") == "partial":
+        problems.append("final independent inputs explicitly declare partial completeness")
     # Bind client operation receipts to service attempts by observable request facts.
     pool: dict[tuple, list[str]] = {}
     for aid, slot in sorted(attempts.items(), key=lambda kv: (kv[1].get("proposal") or kv[1]["outcome"])["occurred_at"]):
@@ -516,12 +522,25 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
                     raise ValueError("replay original has no independently retained operation")
                 if op.get("actor_id") != original["actor_id"] or req.get("actor_id") != original["actor_id"]:
                     raise ValueError("replay actor differs from original committed operation")
-                if (op.get("sha256") != original["sha256"] or op.get("size_bytes") != original["size_bytes"]
-                        or op.get("object_id") != original["object_id"]):
-                    raise ValueError("replay bytes or canonical object identity differ from original commit")
-                for field in ("repository", "project", "version", "object_path"):
-                    if op.get(field) != original_req.get(field):
-                        raise ValueError(f"replay canonical identity {field} differs from original operation")
+                if op["kind"] != original["event_type"].split(".")[1]:
+                    raise ValueError("replay operation differs from original commit")
+                if op["kind"] == "upload":
+                    if op.get("sha256") != original["sha256"] or op.get("size_bytes") != original["size_bytes"]:
+                        raise ValueError("replay bytes or canonical object identity differ from original commit")
+                    for field in ("repository", "project", "version", "object_path"):
+                        if op.get(field) != original_req.get(field):
+                            raise ValueError(f"replay canonical identity {field} differs from original operation")
+                else:
+                    # DELETE sends object identity, not the removed object's bytes.
+                    # Reconstruct its request digest from the original deletion
+                    # lineage and the independently bound retry actor/object.
+                    identity = {"operation": "delete", "object_id": op["object_id"],
+                                "credential_id": op["actor_id"], "repository": original["repository"],
+                                "project": original["project"]}
+                    request_digest = hashlib.sha256(json.dumps(identity, sort_keys=True,
+                        separators=(",", ":")).encode()).hexdigest()
+                    if request_digest != original["operation_digest"]:
+                        raise ValueError("replay deletion identity or request digest differs from original commit")
                 if idem.get(key, {}).get("request_digest") != original["operation_digest"]:
                     raise ValueError("replay storage identity digest differs from original commit")
                 replays.append({"attempt_id": aid, "original_commit": original["event_id"]})

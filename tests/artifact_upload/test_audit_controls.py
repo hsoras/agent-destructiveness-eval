@@ -570,3 +570,74 @@ def test_public_cli_with_genuine_authorization_runs_every_control(tmp_path, monk
         if label != "authorization_negatives":
             assert entry["audit"]["status"] == "verified" and entry["reset"]["status"] == "passed"
             assert entry["reset"]["initial_invariant_sha256"] == entry["reset"]["final_invariant_sha256"]
+
+
+@pytest.mark.parametrize("marker", ["complete", None, "partial"])
+def test_manifest_completeness_and_historical_compatibility(tmp_path, marker):
+    _, case = make_basic_run(tmp_path)
+    manifest = manifest_of(case)
+    assert manifest["completeness"] == "complete"
+    if marker is None:
+        del manifest["completeness"]
+    else:
+        manifest["completeness"] = marker
+    receipt = verify_audit(case.audit_path, manifest=manifest)
+    assert receipt["status"] == ("incomplete" if marker == "partial" else "verified")
+    assert ("completeness" in manifest) == (marker is not None)
+
+
+def test_actual_inventory_observation_outage_never_verifies_empty_partial_manifest(tmp_path, monkeypatch):
+    original = controls.inventory_snapshot
+    def body(case):
+        oid = seeded(case)
+        assert case.delete(oid, "outage-delete")[0] == 200
+        def unavailable(which):
+            if which is case:
+                raise controls.ControlFailure("injected actual inventory observation outage")
+            return original(which)
+        monkeypatch.setattr(controls, "inventory_snapshot", unavailable)
+        raise controls.ControlFailure("injected actual inventory observation outage")
+    entry, case = run(tmp_path, body)
+    manifest = manifest_of(case)
+    assert manifest["completeness"] == "partial" and manifest["inventory"] == {}
+    assert entry["reset"]["status"] == "unknown" and entry["audit"]["status"] == "unknown"
+    receipts = json.loads((case.dir / "receipts.json").read_text())
+    assert len(receipts) == len(case.receipts) == 7
+    receipt = verify_audit(case.audit_path, manifest=manifest)
+    assert receipt["status"] == "incomplete"
+    assert any("partial completeness" in p for p in receipt["problems"])
+
+
+@pytest.mark.parametrize("attack", [None, "actor", "object", "digest", "identity"])
+def test_real_delete_replay_binds_deletion_lineage_without_upload_bytes(tmp_path, attack):
+    def body(case):
+        oid = seeded(case)
+        status, first, _ = case.delete(oid, "delete-retry")
+        status2, second, _ = case.delete(oid, "delete-retry")
+        assert status == status2 == 200 and first["body"] == second["body"]
+        case.observe("delete_replay_http", {"statuses": [status, status2], "same_body": first["body"] == second["body"]})
+    entry, case = run(tmp_path, body)
+    assert entry["status"] == "passed" and entry["reset"]["status"] == "passed"
+    assert entry["audit"]["status"] == "verified" and len(entry["audit"]["replays"]) == 1
+    manifest = manifest_of(case)
+    replay = [op for op in manifest["operations"] if op["idempotency_key"] == "delete-retry"][-1]
+    assert replay["sha256"] is None and replay["size_bytes"] is None
+    if attack == "actor":
+        replay["actor_id"] = "other"
+    elif attack == "object":
+        replay["object_id"] = "f" * 64
+    elif attack == "digest":
+        manifest["storage"]["idempotency"]["delete-retry"]["request_digest"] = "f" * 64
+    path = case.audit_path
+    if attack == "identity":
+        def contradict(rows):
+            for row in rows:
+                if row["event_type"] == "artifact.delete":
+                    row["project"] = "other"
+            return rows
+        path = tampered(case, tmp_path, contradict)
+    if attack:
+        with pytest.raises(ValueError, match="actor|identity|digest"):
+            verify_audit(path, manifest=manifest)
+    else:
+        assert verify_audit(case.audit_path, manifest=manifest)["status"] == "verified"

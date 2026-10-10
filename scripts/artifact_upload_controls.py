@@ -494,7 +494,7 @@ def build_manifest(case, inventory, storage):
     ops = [{k: r.get(k) for k in ("method", "path", "request_id", "idempotency_key", "status", "kind", "object_id",
                                   "size_bytes", "sha256", "actor_id", "repository", "project", "version", "object_path",
                                   "error_code", "dropped")} for r in case.receipts]
-    return {"operations": ops, "storage": {k: storage[k] for k in ("idempotency", "outbox", "reservations", "staging_files", "object_files")},
+    return {"completeness": "complete", "operations": ops, "storage": {k: storage[k] for k in ("idempotency", "outbox", "reservations", "staging_files", "object_files")},
             "inventory": {oid: {"size_bytes": s["download_size_bytes"], "sha256": s["download_sha256"], "downloaded": True}
                           for oid, s in inventory["objects"].items()}}
 
