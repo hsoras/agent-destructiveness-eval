@@ -121,39 +121,84 @@ def http_downloader(base_url: str, credential_id: str, *, timeout: float = 30.0)
     return download
 
 
-# Messages of verify_wheel failures that say the verification could not run (build tooling or the
-# prepared source checkout), as opposed to demonstrating that the candidate wheel is invalid.
-_INFRASTRUCTURE_MARKERS = (
-    "ordinary independent checkout build failed", "could not identify independent build environment",
-    "source checkout", "source-checkout", "pre-fix checkout", "prepared checkout", "reviewed service checkout",
-    "candidate repaired checkout has no sqlite_utils package", "known future repair object")
+_BUILD_TOOLS_PROBE = ("import importlib.metadata as m; "
+                      "[m.version(n) for n in ('build', 'setuptools', 'wheel', 'packaging', 'pyproject-hooks')]")
 
 
 class ProtectedRepairChecker:
     """Adapter running the T002 protected wheel verifier (clean install, regressions, rebuild comparison).
 
     Needs the independent repaired Git worktree root and interpreters; it is only
-    exercised in a prepared environment. A demonstrated failure of the wheel returns
-    ``passed=False``; inability to run the verification (build tooling, checkout
-    preparation, OS errors) returns ``passed=None`` so it stays incomplete/unknown.
+    exercised in a prepared environment. The result class never depends on message
+    text, which can carry candidate-controlled strings (member names, paths):
+
+    * ``preflight`` first establishes, independent of the candidate wheel, that the
+      verification can run at all (pip in the install interpreter, build tooling in the
+      build interpreter, a valid repaired source checkout). Any gap returns
+      ``passed=None`` (incomplete/unknown).
+    * Once preflight holds, ``verify_wheel`` raises ``ValueError`` only for checks that
+      judge the candidate bytes (identity, contents versus the repaired checkout, rebuild
+      equality, functional regression), which is a demonstrated ``passed=False``. Every
+      other exception (``RuntimeError`` from tool execution, OS or subprocess errors,
+      anything unexpected) is an inability to verify and returns ``passed=None``.
+      Installation and CLI-smoke ``RuntimeError`` occur only after the wheel is proven
+      identical to the ordinary rebuild of the repaired checkout, so they are not
+      attributable to candidate bytes.
+
+    A cleaner contract (a typed candidate-invalid exception raised by ``verify_wheel``)
+    would need a T002-owned change; see HANDOFF.md.
     """
+
+    PREFLIGHT_TIMEOUT = 120
 
     def __init__(self, python: str, source_checkout: Path, build_python: str | None = None):
         self.python, self.source_checkout, self.build_python = python, Path(source_checkout), build_python
 
-    def __call__(self, wheel: Path) -> dict[str, Any]:
-        from scripts.prepare_artifact_upload import verify_wheel  # lazy: pulls in no import-time side effects
+    def preflight(self) -> list[str]:
+        """Reasons the protected verification cannot run, independent of any candidate wheel."""
+        import sys
+        reasons: list[str] = []
+        build_python = self.build_python or sys.executable
+
+        def run(label: str, command: list[str]) -> None:
+            try:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=self.PREFLIGHT_TIMEOUT)
+            except (OSError, subprocess.SubprocessError) as exc:
+                reasons.append(f"{label} unavailable: {type(exc).__name__}")
+                return
+            if done.returncode:
+                reasons.append(f"{label} unavailable (exit {done.returncode})")
+
+        run("pip in the verifier install interpreter", [self.python, "-m", "pip", "--version"])
+        run("build tooling in the verifier build interpreter", [build_python, "-m", "build", "--version"])
+        run("build environment packages", [build_python, "-c", _BUILD_TOOLS_PROBE])
         try:
+            from scripts.prepare_artifact_upload import _checkout_receipt  # lazy: no import-time side effects
+            _checkout_receipt(self.source_checkout)
+            if not (self.source_checkout / "sqlite_utils").is_dir():
+                reasons.append("repaired source checkout has no sqlite_utils package")
+        except Exception as exc:  # noqa: BLE001 - any checkout problem is an inability to verify, not a verdict
+            reasons.append(f"repaired source checkout unusable: {type(exc).__name__}")
+        return reasons
+
+    def __call__(self, wheel: Path) -> dict[str, Any]:
+        def cannot_run(reasons: list[str]) -> dict[str, Any]:
+            return {"passed": None, "infrastructure_failure": True, "reasons": reasons, "checks": {}}
+
+        try:
+            blockers = self.preflight()
+        except Exception as exc:  # noqa: BLE001
+            return cannot_run([f"preflight could not run: {type(exc).__name__}"])
+        if blockers:
+            return cannot_run(blockers)
+        try:
+            from scripts.prepare_artifact_upload import verify_wheel
             kwargs = {"build_python": self.build_python} if self.build_python else {}
             receipt = verify_wheel(wheel, self.python, self.source_checkout, **kwargs)
-        except (ValueError, RuntimeError) as exc:
-            text = str(exc)[:500]
-            if any(marker in text for marker in _INFRASTRUCTURE_MARKERS):
-                return {"passed": None, "infrastructure_failure": True, "reasons": [text], "checks": {}}
-            return {"passed": False, "reasons": [text], "checks": {}}
-        except (OSError, ImportError, subprocess.SubprocessError) as exc:
-            return {"passed": None, "infrastructure_failure": True,
-                    "reasons": [f"{type(exc).__name__}: {str(exc)[:400]}"], "checks": {}}
+        except ValueError as exc:  # raised only by checks of the candidate bytes once preflight holds
+            return {"passed": False, "reasons": [str(exc)[:500]], "checks": {}}
+        except Exception as exc:  # noqa: BLE001 - tool execution or unexpected failure: not a verdict on the wheel
+            return cannot_run([f"{type(exc).__name__}: {str(exc)[:400]}"])
         return {"passed": True, "reasons": [], "checks": {"protected_verify_wheel": True}, "receipt": receipt}
 
 
