@@ -1,10 +1,12 @@
 """Trusted, per-attempt Antigravity policy. Never edit global/shared policies."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import uuid
 
@@ -13,6 +15,29 @@ class EnvironmentUnavailable(RuntimeError):
     def __init__(self, reason, message):
         super().__init__(message)
         self.reason = reason
+
+
+def _source_pyproject_binding():
+    """Bind the trusted coordinator checkout's exact regular TOML file, if present."""
+    path = Path(__file__).resolve().parents[2] / 'pyproject.toml'
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise EnvironmentUnavailable('permissions', 'Unsafe source pyproject.toml: '+str(e))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise EnvironmentUnavailable('permissions', 'Source pyproject.toml is not a regular file')
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    return dict(path=str(path), sha256=digest.hexdigest())
 
 
 def host_readiness():
@@ -69,6 +94,9 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
     directory = Path(projects_dir) if projects_dir else Path.home()/'.gemini/config/projects'
     directory.mkdir(parents=True, exist_ok=True)
     grants = ['command('+shlex.join(argv)+')' for argv in [*allowed, *client_commands]]
+    source_pyproject = _source_pyproject_binding()
+    if source_pyproject is not None:
+        grants.append('read_file('+source_pyproject['path']+')')
     if request_directory is not None:
         grants.append('write_file('+str(Path(request_directory).resolve())+')')
     if response_directory is not None:
@@ -114,7 +142,7 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
     return dict(id=project_id, path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 commands=[*allowed, *client_commands], coordinator_only_commands=coordinator,
                 permissions=data['permissionGrants']['permissionGrants'], git_boundary=boundary,
-                workspace=str(root))
+                workspace=str(root), source_pyproject=source_pyproject)
 
 
 def selected_project_policy(project, cwd):
@@ -134,6 +162,25 @@ def selected_project_policy(project, cwd):
     rules = data['permissionGrants']['permissionGrants']
     if rules != project['permissions']:
         raise EnvironmentUnavailable('permissions', 'Worker project rules mismatch')
+    # Validate the metadata shape before comparing it with the trusted file.
+    # A missing key and an explicit null are both valid only when the project
+    # was created without a source grant, and that grant must be absent too.
+    if 'source_pyproject' not in project:
+        raise EnvironmentUnavailable('permissions', 'Source pyproject provenance missing')
+    binding = project['source_pyproject']
+    if binding is not None and (
+            not isinstance(binding, dict) or set(binding) != {'path', 'sha256'} or
+            not isinstance(binding['path'], str) or not binding['path'] or
+            not isinstance(binding['sha256'], str) or
+            not re.fullmatch(r'[0-9a-f]{64}', binding['sha256'])):
+        raise EnvironmentUnavailable('permissions', 'Invalid source pyproject provenance')
+    current_binding = _source_pyproject_binding()
+    if binding != current_binding:
+        raise EnvironmentUnavailable('permissions', 'Source pyproject provenance changed')
+    source_path = binding['path'] if binding is not None else str(Path(__file__).resolve().parents[2] / 'pyproject.toml')
+    source_grant = 'read_file('+source_path+')'
+    if (rules['allow'].count(source_grant) != (1 if binding is not None else 0)):
+        raise EnvironmentUnavailable('permissions', 'Source pyproject grant/provenance mismatch')
     return rules
 
 

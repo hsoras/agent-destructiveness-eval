@@ -110,8 +110,71 @@ class ScopedWorkerTests(unittest.TestCase):
             self.assertIn('write_file('+str(repo/'.git')+')',rules['deny'])
             self.assertIn('write_file('+str(root/'receipt.json')+')',rules['deny'])
             self.assertEqual(project['git_boundary']['common_git_dir'],str(repo/'.git'))
+            binding=project['source_pyproject']
+            if binding is not None:
+                exact='read_file('+binding['path']+')'
+                self.assertIn(exact,rules['allow'])
+                self.assertNotIn('read_file('+str(Path(binding['path']).parent)+')',rules['allow'])
+                self.assertNotIn('write_file('+binding['path']+')',rules['allow'])
+                self.assertEqual(binding['sha256'],hashlib.sha256(Path(binding['path']).read_bytes()).hexdigest())
+            self.assertIn('command(git)',rules['deny'])
+            self.assertIn('read_file('+str(Path.home()/'.docker')+')',rules['deny'])
             path=Path(project['path']);path.write_text(path.read_text()+' ')
             with self.assertRaises(EnvironmentUnavailable):selected_project_policy(project,repo)
+
+    def test_pyproject_binding_tamper_and_symlink_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);repo=root/'repo';repo.mkdir()
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            subprocess.run(['git','-C',str(repo),'symbolic-ref','HEAD','refs/heads/disposable'],check=True)
+            source=root/'trusted';(source/'scripts/migration').mkdir(parents=True)
+            (source/'pyproject.toml').write_text('[tool.pytest]\n')
+            with patch('worker_environment.__file__',str(source/'scripts/migration/worker_environment.py')):
+                project=create_project(repo,[],projects_dir=root/'projects')
+                rules=selected_project_policy(project,repo)
+                grant='read_file('+str((source/'pyproject.toml').resolve())+')'
+                self.assertIn(grant,rules['allow'])
+                self.assertNotIn('read_file('+str(source.resolve())+')',rules['allow'])
+                self.assertNotIn('write_file('+str((source/'pyproject.toml').resolve())+')',rules['allow'])
+                tampered=dict(project,source_pyproject=dict(project['source_pyproject'],sha256='0'*64))
+                with self.assertRaises(EnvironmentUnavailable):selected_project_policy(tampered,repo)
+                (source/'pyproject.toml').unlink()
+                (source/'pyproject.toml').symlink_to('/etc/hosts')
+                with self.assertRaises(EnvironmentUnavailable):create_project(repo,[],projects_dir=root/'projects')
+
+    def test_absent_pyproject_has_no_grant_and_lost_binding_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);repo=root/'repo';repo.mkdir()
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            subprocess.run(['git','-C',str(repo),'symbolic-ref','HEAD','refs/heads/disposable'],check=True)
+            source=root/'trusted';(source/'scripts/migration').mkdir(parents=True)
+            module=source/'scripts/migration/worker_environment.py'
+            with patch('worker_environment.__file__',str(module)):
+                # An initially absent optional source file is a legitimate no-grant case.
+                absent=create_project(repo,[],projects_dir=root/'projects')
+                absent_rules=selected_project_policy(absent,repo)
+                source_path=str((source/'pyproject.toml').resolve())
+                self.assertIsNone(absent['source_pyproject'])
+                self.assertNotIn('read_file('+source_path+')',absent_rules['allow'])
+
+                (source/'pyproject.toml').write_text('[tool.pytest]\n')
+                project=create_project(repo,[],projects_dir=root/'projects')
+                policy_path=Path(project['path']);policy_bytes=policy_path.read_bytes()
+                self.assertIn('read_file('+source_path+')',project['permissions']['allow'])
+                (source/'pyproject.toml').unlink()
+                for altered in (dict((k,v) for k,v in project.items() if k!='source_pyproject'),
+                                dict(project,source_pyproject=None)):
+                    with self.subTest(metadata='missing' if 'source_pyproject' not in altered else 'null'):
+                        with self.assertRaises(EnvironmentUnavailable):
+                            selected_project_policy(altered,repo)
+                        self.assertEqual(policy_path.read_bytes(),policy_bytes)
+
+                # A lost binding cannot be hidden by removing its grant metadata either.
+                project_without_claim=dict(project,permissions=dict(project['permissions'],
+                    allow=[rule for rule in project['permissions']['allow'] if rule!='read_file('+source_path+')']))
+                with self.assertRaises(EnvironmentUnavailable):
+                    selected_project_policy(project_without_claim,repo)
+                self.assertEqual(policy_path.read_bytes(),policy_bytes)
 
     def test_localhost_failure_is_initialization(self):
         with patch('worker_environment.socket.socket',side_effect=PermissionError('outer sandbox')):
