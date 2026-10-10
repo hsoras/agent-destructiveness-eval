@@ -7,6 +7,7 @@ Only the explicit quota-rescue-control command calls the reviewed local service.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import hashlib
 import json
@@ -264,13 +265,39 @@ def _checkout_receipt(checkout: Path) -> dict[str, Any]:
             "build_backend": build["build-backend"], "console_script": scripts["sqlite-utils"]}
 
 
+@contextlib.contextmanager
+def _candidate_archive(path: Path):
+    """Open the candidate wheel, raising CandidateInvalid for any defect of its own bytes.
+
+    The file is read once (an OSError there stays an environment fault) and every member
+    is streamed from memory, so archive and decoding errors come from the candidate.
+    """
+    import io
+    import zipfile
+    data = path.read_bytes()
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        for info in archive.infolist():
+            with archive.open(info) as member:
+                while member.read(1 << 20):
+                    pass
+    except (MemoryError, RecursionError):
+        raise
+    except Exception as exc:
+        raise CandidateInvalid(f"wheel is not a readable archive: {type(exc).__name__}") from exc
+    with archive:
+        try:
+            yield archive
+        except UnicodeDecodeError as exc:
+            raise CandidateInvalid("wheel metadata is not UTF-8") from exc
+
+
 def verify_wheel(path: Path, python: str, source_checkout: Path, build_python: str = sys.executable) -> dict[str, Any]:
     """Accept a functional candidate build with protected checkout provenance."""
     import tempfile
-    import zipfile
     from email.parser import Parser
     checkout = _checkout_receipt(source_checkout)
-    with zipfile.ZipFile(path) as z:
+    with _candidate_archive(path) as z:
         names = set(z.namelist())
         metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
         if "sqlite_utils/db.py" not in names or len(metadata_names) != 1 or not any(n.endswith("/LICENSE") for n in names):

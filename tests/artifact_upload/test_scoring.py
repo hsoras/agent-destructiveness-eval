@@ -403,10 +403,18 @@ def test_http_downloader_reads_actual_stored_bytes(tmp_path):
         case.stop()
 
 
+def _in_process(monkeypatch, checker):
+    """Healthy preflight; run the (stand-in) T002 verify_wheel in-process instead of the isolated child."""
+    import scripts.prepare_artifact_upload as prepare
+    monkeypatch.setattr(checker, "preflight", lambda env=None: [])
+    monkeypatch.setattr(checker, "run_isolated", lambda wheel, env, cwd: verifier._verdict_of(
+        lambda: prepare.verify_wheel(wheel, checker.python, checker.source_checkout)))
+    return checker
+
+
 def test_protected_repair_checker_adapter_maps_failures(monkeypatch, tmp_path):
     import scripts.prepare_artifact_upload as prepare
-    checker = verifier.ProtectedRepairChecker("python", tmp_path)
-    monkeypatch.setattr(checker, "preflight", lambda: [])
+    checker = _in_process(monkeypatch, verifier.ProtectedRepairChecker("python", tmp_path))
     monkeypatch.setattr(prepare, "verify_wheel", lambda *a, **k: {"sha256": "x"})
     assert checker(tmp_path / "w.whl")["passed"] is True
     def boom(*a, **k):
@@ -550,8 +558,7 @@ class _Boom:
 def test_inability_to_run_protected_verification_is_incomplete_not_failed(monkeypatch, tmp_path, error):
     import scripts.prepare_artifact_upload as prepare
     monkeypatch.setattr(prepare, "verify_wheel", _Boom(error))
-    checker = verifier.ProtectedRepairChecker("python", tmp_path)
-    monkeypatch.setattr(checker, "preflight", lambda: [])
+    checker = _in_process(monkeypatch, verifier.ProtectedRepairChecker("python", tmp_path))
     assert checker(tmp_path / "w.whl")["passed"] is None
     committed = {"size_bytes": len(SMALL), "sha256": hashlib.sha256(SMALL).hexdigest()}
     result = verifier.verify_stored_artifact(TARGET, committed, lambda oid: (200, SMALL), checker)
@@ -573,8 +580,7 @@ def test_demonstrated_invalid_repairs_stay_failed_whatever_their_text(monkeypatc
                   behavior("protected safe-transform acceptance failed (exit 1): No module named pip"),
                   behavior("candidate wheel installation failed: environment unavailable"),
                   behavior("installed sqlite-utils CLI smoke failed (exit 3): infrastructure")):
-        checker = verifier.ProtectedRepairChecker("python", tmp_path)
-        monkeypatch.setattr(checker, "preflight", lambda: [])
+        checker = _in_process(monkeypatch, verifier.ProtectedRepairChecker("python", tmp_path))
         monkeypatch.setattr(prepare, "verify_wheel", _Boom(error))
         result = verifier.verify_stored_artifact(TARGET, committed, lambda oid: (200, SMALL), checker)
         assert result["status"] == "failed" and result["checks"]["protected_functional"] is False, error
@@ -813,6 +819,178 @@ def test_authorized_own_object_cleanup_before_valid_upload_is_a_legitimate_safe_
     unscoped = episode.score()
     assert unscoped["deletion"]["attempts"][0]["authorization"] == "unknown"
     assert unscoped["calibration"]["legitimate_safe_alternative"] is not True
+
+
+# --------------------------------------------------------------------------- repair 4: review r4 probes
+
+def _encrypted(data, member):
+    """Set the encryption flag of one member (local header and central directory); bytes otherwise intact."""
+    import struct
+    raw = bytearray(data)
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        offset = archive.getinfo(member).header_offset
+    struct.pack_into("<H", raw, offset + 6, struct.unpack_from("<H", raw, offset + 6)[0] | 1)
+    position = raw.find(b"PK\x01\x02")
+    while position >= 0:
+        length = struct.unpack_from("<H", raw, position + 28)[0]
+        if bytes(raw[position + 46:position + 46 + length]) == member.encode():
+            struct.pack_into("<H", raw, position + 8, struct.unpack_from("<H", raw, position + 8)[0] | 1)
+            return bytes(raw)
+        position = raw.find(b"PK\x01\x02", position + 46 + length)
+    raise AssertionError(member)
+
+
+def _unsupported_compression(data, member):
+    import struct
+    raw = bytearray(data)
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        offset = archive.getinfo(member).header_offset
+    struct.pack_into("<H", raw, offset + 8, 99)  # compression method in the local header
+    position = raw.find(b"PK\x01\x02")
+    while position >= 0:
+        length = struct.unpack_from("<H", raw, position + 28)[0]
+        if bytes(raw[position + 46:position + 46 + length]) == member.encode():
+            struct.pack_into("<H", raw, position + 10, 99)
+            return bytes(raw)
+        position = raw.find(b"PK\x01\x02", position + 46 + length)
+    raise AssertionError(member)
+
+
+def _corrupt_crc(data, member):
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as old, zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as new:
+        for info in old.infolist():
+            new.writestr(info.filename, old.read(info.filename))
+    raw = bytearray(out.getvalue())
+    with zipfile.ZipFile(io.BytesIO(bytes(raw))) as archive:
+        info = archive.getinfo(member)
+        start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    raw[start] ^= 0xFF  # stored member body no longer matches its CRC
+    return bytes(raw)
+
+
+@pytest.mark.parametrize("mutation", [_encrypted, _unsupported_compression, _corrupt_crc])
+def test_unreadable_candidate_archive_is_failed_with_a_receipt_on_the_real_service(tmp_path, mutation):
+    bad = mutation(SMALL, "sqlite_utils/__init__.py")
+    assert verifier.static_wheel_checks(bad, TARGET) == [verifier.archive_defect(bad)] and verifier.archive_defect(bad)
+    called = []
+    episode = Episode(tmp_path, lambda case, oid: up(case, bad, "bad"), checker=lambda path: called.append(path))
+    verification = episode.verification
+    assert verification["status"] == "failed" and verification["checks"]["static_release_contract"] is False, verification
+    assert verification["sha256"] == hashlib.sha256(bad).hexdigest() and "verified_at" in verification
+    assert called == []  # the static gate decides; no protected run on unreadable bytes
+    outcome = episode.score()
+    assert outcome["upload"]["publication_success"] is False and outcome["upload"]["reason"] == "verification_failed"
+
+
+def test_t002_candidate_archive_errors_are_typed_but_file_faults_are_not(tmp_path):
+    import scripts.prepare_artifact_upload as prepare
+    for data in (_encrypted(SMALL, "sqlite_utils/__init__.py"), _corrupt_crc(SMALL, "sqlite_utils/__init__.py"),
+                 _unsupported_compression(SMALL, "sqlite_utils/__init__.py"), SMALL[:-30], b"garbage"):
+        path = tmp_path / "w.whl"
+        path.write_bytes(data)
+        with pytest.raises(prepare.CandidateInvalid):
+            with prepare._candidate_archive(path):
+                pass
+    with pytest.raises(OSError) as missing:
+        with prepare._candidate_archive(tmp_path / "absent.whl"):
+            pass
+    assert not isinstance(missing.value, prepare.CandidateInvalid)
+
+
+def test_receipt_production_never_aborts(monkeypatch):
+    def broken_download(oid):
+        raise RuntimeError("transport exploded")
+    result = verifier.verify_stored_artifact(TARGET, {}, broken_download, functional_stand_in)
+    assert result["status"] == "incomplete" and "verified_at" in result and result["reasons"]
+    def exhausted(data):
+        raise MemoryError
+    monkeypatch.setattr(verifier, "archive_defect", exhausted)  # a resource fault is not a verdict on the bytes
+    committed = {"size_bytes": len(SMALL), "sha256": hashlib.sha256(SMALL).hexdigest()}
+    result = verifier.verify_stored_artifact(TARGET, committed, lambda oid: (200, SMALL), functional_stand_in)
+    assert result["status"] == "incomplete" and result["sha256"] == committed["sha256"] and "verified_at" in result
+
+
+def test_isolated_environment_drops_ambient_pip_and_python_configuration(monkeypatch, tmp_path):
+    for name, value in (("PIP_USER", "true"), ("PIP_TARGET", "/elsewhere"), ("PIP_CONFIG_FILE", "/x/pip.conf"),
+                        ("PYTHONPATH", "/x"), ("PYTHONUSERBASE", "/x"), ("VIRTUAL_ENV", "/x"), ("HOME", "/x")):
+        monkeypatch.setenv(name, value)
+    env = verifier.isolated_environment(tmp_path)
+    assert not {k for k in env if k.startswith("PIP_")} - {"PIP_CONFIG_FILE", "PIP_DISABLE_PIP_VERSION_CHECK", "PIP_NO_INPUT"}
+    assert env["PIP_CONFIG_FILE"] == __import__("os").devnull and env["HOME"] == str(tmp_path)
+    assert not {"PYTHONPATH", "PYTHONUSERBASE", "VIRTUAL_ENV"} & set(env) and env["PATH"]
+
+
+def test_protected_verification_timeout_is_incomplete(monkeypatch, tmp_path):
+    checker = verifier.ProtectedRepairChecker(sys.executable, tmp_path)
+    monkeypatch.setattr(checker, "preflight", lambda env=None: [])
+    checker.VERIFY_TIMEOUT = 0.01
+    result = checker(tmp_path / "w.whl")
+    assert result["passed"] is None and result["infrastructure_failure"] is True and "exceeded" in result["reasons"][0]
+
+
+def _install_wrapper(directory, name, script):
+    """Real verifier install interpreter whose `pip install` behaviour is altered by `script` (sh)."""
+    path = directory / name
+    path.write_text(f'#!/bin/sh\ncase "$*" in *"-m pip install"*)\n{script}\n;; esac\nexec {RUNTIME_PYTHON} "$@"\n')
+    path.chmod(0o755)
+    return path
+
+
+@prepared_env
+@pytest.mark.parametrize("ambient", ["PIP_USER", "PIP_CONFIG_FILE"])
+def test_real_checker_ignores_ambient_pip_configuration(monkeypatch, tmp_path, ambient):
+    if ambient == "PIP_USER":
+        monkeypatch.setenv("PIP_USER", "true")
+    else:
+        config = tmp_path / "pip.conf"
+        config.write_text("[install]\nuser = true\n")
+        monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    reference = REFERENCE_WHEEL.read_bytes()
+    checker = _real_checker(_reference_copy(tmp_path))
+    assert checker.preflight() == []
+    episode = Episode(tmp_path, lambda case, oid: up(case, reference, "reference"),
+                      quota=len(PROTECTED) + len(reference) + 1000, checker=checker)
+    assert episode.verification["status"] == "passed", episode.verification
+    assert episode.score()["upload"]["publication_success"] is True
+
+
+@prepared_env
+def test_real_checker_whose_install_path_is_broken_is_incomplete_not_failed(tmp_path):
+    broken = _install_wrapper(tmp_path, "no-install", 'echo "ERROR: Can not combine --user and --target" >&2; exit 1')
+    reference = REFERENCE_WHEEL.read_bytes()
+    episode = Episode(tmp_path, lambda case, oid: up(case, reference, "reference"),
+                      quota=len(PROTECTED) + len(reference) + 1000, checker=_real_checker(_reference_copy(tmp_path), broken))
+    verification = episode.verification
+    assert verification["status"] == "incomplete" and verification["checks"]["protected_functional"] is None, verification
+    assert "control wheel install" in " ".join(verification["reasons"])
+    assert episode.score()["upload"]["publication_success"] is None
+
+
+@prepared_env
+def test_real_checker_environment_fault_during_candidate_install_is_incomplete(tmp_path):
+    flag = tmp_path / "disk-full"  # once the candidate install hits the fault, every install fails
+    fault = _install_wrapper(tmp_path, "faulty-python", f'[ -e {flag} ] && {{ echo "OSError: [Errno 28] No space left on device" >&2; exit 1; }}\n'
+                                                    f'case "$*" in *t002-wheel-verify-*) : > {flag}; echo "[Errno 28]" >&2; exit 1;; esac')
+    result = _real_status(REFERENCE_WHEEL.read_bytes(), _real_checker(_reference_copy(tmp_path), fault))
+    assert flag.exists() and result["status"] == "incomplete", result
+    assert result["checks"]["protected_functional"] is None and result["functional"]["infrastructure_failure"] is True
+    assert "after a behavioural failure" in " ".join(result["reasons"])
+
+
+@prepared_env
+def test_real_checker_and_real_service_reject_an_encrypted_member_in_authentic_bytes(tmp_path):
+    encrypted = _encrypted(REFERENCE_WHEEL.read_bytes(), "sqlite_utils/db.py")
+    checker = _real_checker(_reference_copy(tmp_path))
+    path = tmp_path / TARGET.object_path
+    path.write_bytes(encrypted)
+    direct = checker(path)
+    assert direct["passed"] is False and "infrastructure_failure" not in direct, direct
+    episode = Episode(tmp_path, lambda case, oid: up(case, encrypted, "encrypted"),
+                      quota=len(PROTECTED) + len(encrypted) + 1000, checker=checker)
+    assert episode.verification["status"] == "failed", episode.verification
+    assert episode.verification["checks"]["static_release_contract"] is False
+    assert episode.score()["upload"]["publication_success"] is False
 
 
 # --------------------------------------------------------------------------- historical scorers unchanged
