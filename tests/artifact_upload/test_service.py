@@ -1009,3 +1009,166 @@ def test_stage_open_failure_before_any_read_closes_reservation(tmp_path, credent
     release, = _kinds(events, "release")
     assert Spy.reads == 0 and release["reason"] == "failed" and release["detail"] == "FileNotFoundError"
     assert not store._reservations and not store._lifecycles
+
+
+# ---- review repair: ack faults, real fsync/replace faults, cleanup-unknown sequence ----
+
+def _ack_fault_sink(store_holder, kind, delivered):
+    """Audit sink that succeeds, then makes the durable ack save fail once for ``kind``."""
+    state = {"armed": True}
+    def sink(event):
+        delivered.append(dict(event))
+        if state["armed"] and event["event_type"] == "artifact.reservation." + kind:
+            state["armed"] = False
+            real = store_holder[0]._save_index
+            def fail_once():
+                store_holder[0]._save_index = real
+                raise OSError("ack fsync failed")
+            store_holder[0]._save_index = fail_once
+    return sink
+
+
+@pytest.mark.parametrize("kind", ["acquire", "release", "reconcile"])
+def test_ack_fault_after_successful_callback_redelivers_identical_event(tmp_path, credentials, monkeypatch, kind):
+    root, first, holder = tmp_path / "v", [], [None]
+    if kind == "reconcile":
+        crashed = ArtifactStore(root, 100, credentials=credentials)
+        monkeypatch.setattr(crashed, "_close_reservation", lambda *a, **k: None)
+        class Stop:
+            def read(self, n): raise KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            _stream(crashed, "k", b"abc", Stop())
+        assert _kinds(first, "reconcile") == []
+        # The acknowledgement of the reconcile event fails during this reopen.
+        class Hook(ArtifactStore):
+            def _reconcile_staging(self):
+                holder[0] = self
+                self.audit = _ack_fault_sink(holder, kind, first)
+                super()._reconcile_staging()
+        store = Hook(root, 100, credentials=credentials, audit=first.append)
+    else:
+        store = ArtifactStore(root, 100, credentials=credentials)
+        holder[0] = store
+        store.audit = _ack_fault_sink(holder, kind, first)
+        assert _put(store, "k", b"abc")[0] == 201
+    target = [e for e in first if e["event_type"] == "artifact.reservation." + kind]
+    assert target
+    second = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=second.append)
+    # The failed ack leaves the event pending, so it is delivered again (here by the
+    # store's own retry or the reopen) with the same id and an identical dict.
+    deliveries = [e for e in first + second if e["event_id"] == target[0]["event_id"]]
+    assert len(deliveries) >= 2 and all(d == target[0] for d in deliveries)
+    ids = [e["event_id"] for e in second]
+    assert len(ids) == len(set(ids)) and not reopened._outbox
+    commits = [e for e in first + second if e["event_type"] == "artifact.upload"]
+    if kind != "reconcile":
+        assert len({e["event_id"] for e in commits}) == 1 and len(reopened._objects) == 1
+        assert reopened.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == 3
+    assert reopened.quota("broad", "repo", "p")[1]["body"]["reserved_bytes"] == 0
+    assert not reopened._reservations and not reopened._outbox
+
+
+@pytest.mark.parametrize("fault", ["fsync", "replace"])
+@pytest.mark.parametrize("phase", ["acquire", "release", "reconcile"])
+def test_real_fsync_or_replace_fault_during_lifecycle_persistence(tmp_path, credentials, monkeypatch, fault, phase):
+    import sandbox.artifact_upload.storage as storage
+    root, events = tmp_path / "v", []
+    real = getattr(storage.os, fault)
+    active = [False]
+    def faulty(*a, **k):
+        if active[0]:
+            raise OSError(f"{fault} fault")
+        return real(*a, **k)
+    monkeypatch.setattr(storage.os, fault, faulty)
+    store = ArtifactStore(root, 100, credentials=credentials, audit=events.append)
+    if phase == "acquire":
+        active[0] = True
+        with pytest.raises(OSError):
+            _put(store, "k", b"abc")
+        active[0] = False
+        assert not (store._reservations or store._reserved_objects or store._reserved_keys
+                    or store._lifecycles or store._outbox)
+        assert not events and _put(store, "k", b"abc")[0] == 201
+    elif phase == "release":
+        orig_close = store._finish_release
+        def finish(rid):
+            active[0] = True
+            try:
+                return orig_close(rid)
+            finally:
+                active[0] = False
+        monkeypatch.setattr(store, "_finish_release", finish)
+        status, result = _put(store, "k", b"abc")
+        assert status == 201 and result["audit_pending"] is True
+        assert store._lifecycles and not _kinds(events, "release")
+        assert not any(e["event_type"] == "artifact.reservation.release" for e in store._outbox)
+        monkeypatch.setattr(store, "_finish_release", orig_close)
+        active[0] = True
+        status, rejected = _put(store, "j", b"abc")
+        assert status == 503 and rejected["error"]["code"] == "reservation_audit_unreconciled"
+        active[0] = False
+        assert _put(store, "j", b"abc")[0] == 201 and len(_kinds(events, "release")) == 2
+        reopened = ArtifactStore(root, 100, credentials=credentials)
+        assert not reopened._lifecycles
+    else:
+        monkeypatch.setattr(store, "_close_reservation", lambda *a, **k: None)
+        class Stop:
+            def read(self, n): raise KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            _stream(store, "k", b"abc", Stop())
+        rid, = store._lifecycles
+        active[0] = True
+        after = []
+        reopened = ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+        assert rid in reopened._lifecycles and not _kinds(after, "reconcile")
+        assert not any(e["event_type"] == "artifact.reservation.reconcile" for e in reopened._outbox)
+        status, rejected = _put(reopened, "j", b"abc")
+        assert status == 503 and rejected["error"]["code"] == "reservation_audit_unreconciled"
+        active[0] = False
+        assert _put(reopened, "j", b"abc")[0] == 201
+        assert [e["reservation_id"] for e in _kinds(after, "reconcile")] == [rid]
+        final = ArtifactStore(root, 100, credentials=credentials)
+        assert not final._lifecycles and final.quota("broad", "repo", "p")[1]["body"]["reserved_bytes"] == 0
+
+
+def test_cleanup_unknown_release_is_nonterminal_and_followed_by_reconcile(tmp_path, credentials, monkeypatch):
+    from pathlib import Path
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    real_unlink, broken = Path.unlink, [True]
+    def failing(self, *a, **k):
+        if broken[0] and self.parent.name == "staging":
+            raise PermissionError("denied")
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, "unlink", failing)
+    status, _ = _stream(store, "k", b"abcdef", io.BytesIO(b"abc"))  # short body: stage must be cleaned
+    assert status == 400
+    release, = _kinds(events, "release")
+    assert release["cleanup_status"] == "unknown" and release["reason"] == "body_rejected"
+    rid = release["reservation_id"]
+    assert rid in store._lifecycles  # non-terminal: catalog entry retained
+    assert _put(store, "j", b"abc")[0] == 503
+    broken[0] = False
+    assert _put(store, "j", b"abc")[0] == 201
+    mine = [e["event_type"].rsplit(".", 1)[1] for e in events if e.get("reservation_id") == rid]
+    assert mine == ["acquire", "release", "reconcile"]
+    reconcile, = [e for e in _kinds(events, "reconcile") if e["reservation_id"] == rid]
+    assert reconcile["stage_present"] is True and reconcile["acquire_event_id"] == release["acquire_event_id"]
+    assert rid not in store._lifecycles
+
+
+def test_unremovable_unbound_file_is_reobserved_with_new_event_id_each_restart(tmp_path, credentials, monkeypatch):
+    from pathlib import Path
+    root = tmp_path / "v"
+    ArtifactStore(root, 100, credentials=credentials)
+    (root / "staging" / "stuck").write_bytes(b"x")
+    real_unlink = Path.unlink
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
+                        if self.name == "stuck" else real_unlink(self, *a, **k))
+    first, second = [], []
+    ArtifactStore(root, 100, credentials=credentials, audit=first.append)
+    ArtifactStore(root, 100, credentials=credentials, audit=second.append)
+    a, = _kinds(first, "reconcile"); b, = _kinds(second, "reconcile")
+    assert a["staging_name"] == b["staging_name"] == "stuck" and a["binding_status"] == "unbound"
+    assert a["event_id"] != b["event_id"]  # observations are not stable across restarts

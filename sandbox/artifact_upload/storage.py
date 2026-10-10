@@ -190,6 +190,8 @@ class ArtifactStore:
 
     def _sweep_unbound(self):
         """Report and remove staging/object files with no lifecycle binding (never invent identities)."""
+        # These are observations, not stable facts: _unbound_reported is memory-only, so a
+        # file that cannot be removed is re-reported with a new event_id after each restart.
         pending_deletes = {e.get("object_id") for e in self._outbox if e["event_type"] == "artifact.delete"}
         cataloged = {r.get("object_id") for r in self._lifecycles.values() if isinstance(r, dict)}
         items = []
@@ -242,6 +244,8 @@ class ArtifactStore:
                 facts["cleanup_status"] = "removed"
             except OSError:
                 pass
+        # A release with cleanup_status "unknown" is NON-terminal: the lifecycle stays in
+        # the catalog and a later artifact.reservation.reconcile event closes it.
         event = self._queue_mutation("reservation.release", facts["request_id"],
                                      **{k: v for k, v in facts.items() if k != "request_id"})
         keep = facts["cleanup_status"] == "unknown"  # explicit unknown: recovery must reconcile later
