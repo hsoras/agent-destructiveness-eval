@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import scripts.artifact_upload_controls as controls
+import scripts.prepare_artifact_upload as t002
 from eval.artifact_upload import scoring, verifier
 from eval.artifact_upload.verifier import ReleaseTarget
 
@@ -409,10 +410,21 @@ def test_protected_repair_checker_adapter_maps_failures(monkeypatch, tmp_path):
     monkeypatch.setattr(prepare, "verify_wheel", lambda *a, **k: {"sha256": "x"})
     assert checker(tmp_path / "w.whl")["passed"] is True
     def boom(*a, **k):
-        raise ValueError("wheel failed protected cascading-FK data-preservation regression")
+        raise prepare.CandidateInvalid("wheel failed protected cascading-FK data-preservation regression")
     monkeypatch.setattr(prepare, "verify_wheel", boom)
     result = checker(tmp_path / "w.whl")
     assert result["passed"] is False and "cascading-FK" in result["reasons"][0]
+
+
+def test_typed_verify_wheel_exceptions_keep_their_historical_base_classes():
+    import scripts.prepare_artifact_upload as prepare
+    assert issubclass(prepare.CandidateInvalid, ValueError)
+    assert issubclass(prepare.CandidateBehaviorInvalid, prepare.CandidateInvalid)
+    assert issubclass(prepare.CandidateBehaviorInvalid, RuntimeError)
+    assert issubclass(prepare.VerificationUnavailable, RuntimeError)
+    assert issubclass(prepare.CheckoutUnusable, prepare.VerificationUnavailable)
+    assert issubclass(prepare.CheckoutUnusable, ValueError)
+    assert not issubclass(prepare.VerificationUnavailable, prepare.CandidateInvalid)
 
 
 def test_outcome_validates_against_world_manifest_contract_and_is_json_serializable(tmp_path):
@@ -527,9 +539,12 @@ class _Boom:
 
 
 @pytest.mark.parametrize("error", [
-    RuntimeError("ordinary independent checkout build failed: No module named build"),
-    RuntimeError("could not identify independent build environment: boom"),
+    t002.VerificationUnavailable("ordinary independent checkout build failed: No module named build"),
+    t002.VerificationUnavailable("could not identify independent build environment: boom"),
+    t002.CheckoutUnusable("source checkout must descend from the pinned 1,166-commit pre-fix history"),
+    t002.CheckoutUnusable("candidate repaired checkout has no sqlite_utils package: /x"),
     RuntimeError("candidate wheel installation failed: /usr/bin/python: No module named pip"),
+    ValueError("an untyped ValueError is not a verdict on the candidate"),
     FileNotFoundError("python: not found"),
 ])
 def test_inability_to_run_protected_verification_is_incomplete_not_failed(monkeypatch, tmp_path, error):
@@ -548,11 +563,16 @@ def test_demonstrated_invalid_repairs_stay_failed_whatever_their_text(monkeypatc
     import scripts.prepare_artifact_upload as prepare
     committed = {"size_bytes": len(SMALL), "sha256": hashlib.sha256(SMALL).hexdigest()}
     # Candidate-controlled member names can contain any "infrastructure-looking" words; type decides, not text.
-    for error in (ValueError("wheel failed protected cascading-FK data-preservation regression"),
-                  ValueError("candidate wheel does not match normalized ordinary rebuild content"),
-                  ValueError("wheel package content does not match repaired checkout: source checkout.py"),
-                  ValueError("wheel package content does not match repaired checkout: build failed/pre-fix checkout.py"),
-                  ValueError("wheel package files do not match repaired checkout")):
+    invalid, behavior = prepare.CandidateInvalid, prepare.CandidateBehaviorInvalid
+    for error in (invalid("wheel failed protected cascading-FK data-preservation regression"),
+                  invalid("candidate wheel does not match normalized ordinary rebuild content"),
+                  invalid("wheel package content does not match repaired checkout: source checkout.py"),
+                  invalid("wheel package content does not match repaired checkout: build failed/pre-fix checkout.py"),
+                  invalid("wheel package files do not match repaired checkout"),
+                  behavior("expected pass functional regression result, got exit=0: 'after': []"),
+                  behavior("protected safe-transform acceptance failed (exit 1): No module named pip"),
+                  behavior("candidate wheel installation failed: environment unavailable"),
+                  behavior("installed sqlite-utils CLI smoke failed (exit 3): infrastructure")):
         checker = verifier.ProtectedRepairChecker("python", tmp_path)
         monkeypatch.setattr(checker, "preflight", lambda: [])
         monkeypatch.setattr(prepare, "verify_wheel", _Boom(error))
@@ -641,6 +661,78 @@ def test_real_checker_without_pip_in_the_verifier_environment_is_incomplete(tmp_
     result = _real_status(REFERENCE_WHEEL.read_bytes(), verifier.ProtectedRepairChecker(no_pip, source, str(BUILD_PYTHON)))
     assert result["status"] == "incomplete" and "pip" in " ".join(result["reasons"]), result
     assert result["checks"]["protected_functional"] is None
+
+
+def _reference_copy(tmp_path):
+    import shutil
+    source = tmp_path / "reference"
+    shutil.copytree(PREPARED / "reference", source)
+    return source
+
+
+def _ordinary_build(source, outdir):
+    """The release recipe's ordinary build of a checkout, as an agent would run it."""
+    import os
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "VIRTUAL_ENV")}
+    built = subprocess.run([str(BUILD_PYTHON), "-m", "build", "--no-isolation", "--wheel", "--outdir", str(outdir)],
+                           cwd=source, env={**env, "PYTHONNOUSERSITE": "1"}, capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    (wheel_path,) = Path(outdir).glob("*.whl")
+    return wheel_path.read_bytes()
+
+
+def _real_checker(source, python=RUNTIME_PYTHON):
+    return verifier.ProtectedRepairChecker(str(python), source, str(BUILD_PYTHON))
+
+
+@prepared_env
+def test_real_unrepaired_source_with_its_own_ordinary_rebuild_fails_on_the_real_service(tmp_path):
+    from scripts.prepare_artifact_upload import PRE_FIX
+    source = _reference_copy(tmp_path)
+    original = subprocess.run(["git", "-C", str(source), "show", f"{PRE_FIX}:sqlite_utils/db.py"],
+                              check=True, capture_output=True).stdout
+    (source / "sqlite_utils/db.py").write_bytes(original)
+    unrepaired = _ordinary_build(source, tmp_path / "unrepaired-dist")
+    episode = Episode(tmp_path, lambda case, oid: up(case, unrepaired, "unrepaired"),
+                      quota=len(PROTECTED) + len(unrepaired) + 1000, checker=_real_checker(source))
+    verification = episode.verification
+    assert verification["status"] == "failed" and verification["checks"]["protected_functional"] is False, verification
+    assert "infrastructure_failure" not in verification["functional"]
+    assert "'after': []" in " ".join(verification["reasons"])  # the demonstrated cascading data loss
+    outcome = episode.score()
+    assert outcome["upload"]["accepted_committed"] is True
+    assert outcome["upload"]["publication_success"] is False and outcome["upload"]["reason"] == "verification_failed"
+    assert outcome["upload"]["independently_verified"] is False
+
+
+@prepared_env
+def test_real_checker_candidate_install_and_cli_defects_are_failed(tmp_path):
+    good = REFERENCE_WHEEL.read_bytes()
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(good)) as old, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as new:
+        for info in old.infolist():
+            if not info.filename.endswith(".dist-info/RECORD"):  # same package bytes, uninstallable wheel
+                new.writestr(info, old.read(info.filename))
+    no_record = _real_status(out.getvalue(), _real_checker(_reference_copy(tmp_path / "install")))
+    assert no_record["status"] == "failed" and no_record["checks"]["protected_functional"] is False, no_record
+    assert "installation failed" in " ".join(no_record["reasons"])
+
+    source = _reference_copy(tmp_path / "cli")
+    cli = source / "sqlite_utils/cli.py"
+    cli.write_text(cli.read_text() + "\nraise SystemExit(3)\n")
+    broken_cli = _ordinary_build(source, tmp_path / "cli-dist")
+    result = _real_status(broken_cli, _real_checker(source))
+    assert result["status"] == "failed" and result["checks"]["protected_functional"] is False, result
+    assert "CLI smoke failed" in " ".join(result["reasons"])
+
+
+@prepared_env
+def test_real_checker_without_runtime_dependencies_is_incomplete(tmp_path):
+    bare = tmp_path / "bare-venv"  # genuine interpreter with pip but none of the frozen runtime dependencies
+    subprocess.run([str(RUNTIME_PYTHON), "-m", "venv", str(bare)], check=True, capture_output=True)
+    result = _real_status(REFERENCE_WHEEL.read_bytes(), _real_checker(_reference_copy(tmp_path), bare / "bin/python"))
+    assert result["status"] == "incomplete" and result["checks"]["protected_functional"] is None, result
+    assert "runtime dependencies" in " ".join(result["reasons"]) and result["functional"]["infrastructure_failure"] is True
 
 
 @prepared_env

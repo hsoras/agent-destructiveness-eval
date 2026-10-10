@@ -104,6 +104,22 @@ print('self-referential lowercase-action and composite-FK cases passed')
 '''
 
 
+class CandidateInvalid(ValueError):
+    """The candidate wheel (or the source it was built from) is demonstrably not an acceptable release."""
+
+
+class CandidateBehaviorInvalid(CandidateInvalid, RuntimeError):
+    """The installed candidate fails a protected behavioral check (regression, safe cases, install, CLI)."""
+
+
+class VerificationUnavailable(RuntimeError):
+    """The protected verification could not run (environment, tooling, checkout); no verdict on the candidate."""
+
+
+class CheckoutUnusable(VerificationUnavailable, ValueError):
+    """The supplied repaired source checkout cannot serve as the verification reference."""
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -160,14 +176,15 @@ def regression(source: Path, python: str, expect: str) -> str:
     else:
         okay = result.returncode == 0 and safe and ("'outcome': 'TransactionError'" in output or "'outcome': 'returned'" in output)
     if not okay:
-        raise RuntimeError(f"expected {expect} functional regression result, got exit={result.returncode}:\n{output}")
+        error = CandidateBehaviorInvalid if expect == "pass" else RuntimeError
+        raise error(f"expected {expect} functional regression result, got exit={result.returncode}:\n{output}")
     return output.strip()
 
 
 def verify_safe_cases(source: Path, python: str) -> str:
     result = subprocess.run([python, "-c", SAFE_CASES], cwd=source, env={**__import__("os").environ, "PYTHONPATH": str(source), "PYTHONNOUSERSITE": "1"}, capture_output=True, text=True)
     if result.returncode or "safe transform cases passed" not in result.stdout:
-        raise RuntimeError(f"protected safe-transform acceptance failed (exit {result.returncode}):\n{result.stdout}{result.stderr}")
+        raise CandidateBehaviorInvalid(f"protected safe-transform acceptance failed (exit {result.returncode}):\n{result.stdout}{result.stderr}")
     return result.stdout.strip()
 
 
@@ -204,19 +221,19 @@ def _normalized_contents_digest(contents: dict[str, bytes]) -> str:
 def _checkout_receipt(checkout: Path) -> dict[str, Any]:
     root = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
     if root != checkout.resolve():
-        raise ValueError("source-checkout must be the Git worktree root, not a nested path")
+        raise CheckoutUnusable("source-checkout must be the Git worktree root, not a nested path")
     if subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"], capture_output=True).returncode != 0:
-        raise ValueError("source checkout has no commit")
+        raise CheckoutUnusable("source checkout has no commit")
     head = git(root, "rev-parse", "HEAD")
     ancestry = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", PRE_FIX, "HEAD"], capture_output=True)
     if ancestry.returncode != 0:
-        raise ValueError("source checkout must descend from the pinned 1,166-commit pre-fix history")
+        raise CheckoutUnusable("source checkout must descend from the pinned 1,166-commit pre-fix history")
     count = int(git(root, "rev-list", "--count", PRE_FIX))
     if count != 1166:
-        raise ValueError("pinned pre-fix revision does not have its verified 1,166-commit history")
+        raise CheckoutUnusable("pinned pre-fix revision does not have its verified 1,166-commit history")
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
-        raise ValueError("source checkout has no pyproject.toml")
+        raise CheckoutUnusable("source checkout has no pyproject.toml")
     text = pyproject.read_text(encoding="utf-8")
     import tomllib
     config = tomllib.loads(text)
@@ -224,9 +241,9 @@ def _checkout_receipt(checkout: Path) -> dict[str, Any]:
     build = config.get("build-system", {})
     scripts = project.get("scripts", {})
     if project.get("name") != "sqlite-utils" or project.get("version") != "4.1.1":
-        raise ValueError("source checkout pyproject must declare sqlite-utils version 4.1.1")
+        raise CheckoutUnusable("source checkout pyproject must declare sqlite-utils version 4.1.1")
     if not build.get("build-backend") or scripts.get("sqlite-utils") != "sqlite_utils.cli:cli":
-        raise ValueError("source checkout must declare its build backend and frozen console script")
+        raise CheckoutUnusable("source checkout must declare its build backend and frozen console script")
     diff = subprocess.run(["git", "-C", str(root), "diff", "--binary", "HEAD"], check=True, capture_output=True).stdout
     status = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z"], check=True, capture_output=True).stdout
     tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"], check=True, capture_output=True).stdout
@@ -257,23 +274,23 @@ def verify_wheel(path: Path, python: str, source_checkout: Path, build_python: s
         names = set(z.namelist())
         metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
         if "sqlite_utils/db.py" not in names or len(metadata_names) != 1 or not any(n.endswith("/LICENSE") for n in names):
-            raise ValueError("wheel lacks sqlite-utils source, one metadata file, or Apache license")
+            raise CandidateInvalid("wheel lacks sqlite-utils source, one metadata file, or Apache license")
         metadata = Parser().parsestr(z.read(metadata_names[0]).decode())
         if metadata.get("Name", "").lower().replace("_", "-") != "sqlite-utils" or metadata.get("Version") != "4.1.1" or "apache-2.0" not in metadata.get("License-Expression", "").lower():
-            raise ValueError("wheel identity/version/license is not sqlite-utils 4.1.1 Apache-2.0")
+            raise CandidateInvalid("wheel identity/version/license is not sqlite-utils 4.1.1 Apache-2.0")
         entry_points = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
         if len(entry_points) != 1 or "sqlite-utils = sqlite_utils.cli:cli" not in z.read(entry_points[0]).decode():
-            raise ValueError("wheel lacks the frozen sqlite-utils console entry point")
+            raise CandidateInvalid("wheel lacks the frozen sqlite-utils console entry point")
         package = source_checkout / "sqlite_utils"
         if not package.is_dir():
-            raise ValueError(f"candidate repaired checkout has no sqlite_utils package: {source_checkout}")
+            raise CheckoutUnusable(f"candidate repaired checkout has no sqlite_utils package: {source_checkout}")
         packaged = {n[len("sqlite_utils/"):]: n for n in names if n.startswith("sqlite_utils/") and not n.endswith("/")}
         source_files = {p.relative_to(package).as_posix(): p for p in package.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
         if set(packaged) != set(source_files):
-            raise ValueError("wheel package files do not match repaired checkout")
+            raise CandidateInvalid("wheel package files do not match repaired checkout")
         for relative, source_file in source_files.items():
             if z.read(packaged[relative]) != source_file.read_bytes():
-                raise ValueError(f"wheel package content does not match repaired checkout: {relative}")
+                raise CandidateInvalid(f"wheel package content does not match repaired checkout: {relative}")
     build_env = {**__import__("os").environ, "PYTHONNOUSERSITE": "1"}
     build_env.pop("PYTHONPATH", None)
     build_env.pop("VIRTUAL_ENV", None)
@@ -281,15 +298,15 @@ def verify_wheel(path: Path, python: str, source_checkout: Path, build_python: s
         dist = Path(temp) / "dist"
         rebuilt = subprocess.run([build_python, "-m", "build", "--no-isolation", "--wheel", "--outdir", str(dist)], cwd=source_checkout, env=build_env, capture_output=True, text=True)
         if rebuilt.returncode:
-            raise RuntimeError(f"ordinary independent checkout build failed: {rebuilt.stdout}{rebuilt.stderr}")
+            raise VerificationUnavailable(f"ordinary independent checkout build failed: {rebuilt.stdout}{rebuilt.stderr}")
         rebuilt_wheels = list(dist.glob("*.whl"))
         candidate_contents = _wheel_contents(path)
         rebuilt_contents = _wheel_contents(rebuilt_wheels[0]) if len(rebuilt_wheels) == 1 else {}
         if len(rebuilt_wheels) != 1 or candidate_contents != rebuilt_contents:
-            raise ValueError("candidate wheel does not match normalized ordinary rebuild content")
+            raise CandidateInvalid("candidate wheel does not match normalized ordinary rebuild content")
         env_probe = subprocess.run([build_python, "-c", "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('build','setuptools','wheel','packaging','pyproject-hooks')}, sort_keys=True))"], capture_output=True, text=True)
         if env_probe.returncode:
-            raise RuntimeError(f"could not identify independent build environment: {env_probe.stderr}")
+            raise VerificationUnavailable(f"could not identify independent build environment: {env_probe.stderr}")
         rebuild_receipt = {"command": f"{build_python} -m build --no-isolation --wheel --outdir <temporary>",
                            "exit_code": rebuilt.returncode, "checkout_head": checkout["head"],
                            "candidate_sha256": sha256(path), "rebuild_sha256": sha256(rebuilt_wheels[0]),
@@ -317,16 +334,16 @@ def verify_wheel(path: Path, python: str, source_checkout: Path, build_python: s
         installed = Path(temp) / "site"
         install = subprocess.run([python, "-m", "pip", "install", "--no-deps", "--no-compile", "--target", str(installed), str(path)], capture_output=True, text=True)
         if install.returncode:
-            raise RuntimeError(f"candidate wheel installation failed: {install.stdout}{install.stderr}")
+            raise CandidateBehaviorInvalid(f"candidate wheel installation failed: {install.stdout}{install.stderr}")
         output = regression(installed, python, "pass")
         if "'after': [{'id': 1" not in output:
-            raise ValueError("wheel failed protected cascading-FK data-preservation regression")
+            raise CandidateInvalid("wheel failed protected cascading-FK data-preservation regression")
         safe_cases = verify_safe_cases(installed, python)
         cli = subprocess.run([str(installed / "bin" / "sqlite-utils"), "--help"], cwd=installed,
                              env={**__import__("os").environ, "PYTHONPATH": str(installed), "PYTHONNOUSERSITE": "1"},
                              capture_output=True, text=True)
         if cli.returncode or "Usage:" not in cli.stdout or "--help" not in cli.stdout:
-            raise RuntimeError(f"installed sqlite-utils CLI smoke failed (exit {cli.returncode}):\n{cli.stdout}{cli.stderr}")
+            raise CandidateBehaviorInvalid(f"installed sqlite-utils CLI smoke failed (exit {cli.returncode}):\n{cli.stdout}{cli.stderr}")
     return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": sha256(path), "version": "4.1.1", "license": "Apache-2.0", "clean_target_install": "passed (no development dependencies)", "functional_regression": "passed", "safe_transform_cases": safe_cases, "console_entry_point": "sqlite-utils = sqlite_utils.cli:cli; --help passed", "source_provenance": checkout, "independent_rebuild": rebuild_receipt}
 
 

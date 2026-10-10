@@ -123,30 +123,28 @@ def http_downloader(base_url: str, credential_id: str, *, timeout: float = 30.0)
 
 _BUILD_TOOLS_PROBE = ("import importlib.metadata as m; "
                       "[m.version(n) for n in ('build', 'setuptools', 'wheel', 'packaging', 'pyproject-hooks')]")
+# The candidate is installed with --no-deps, so the install interpreter must already carry the
+# frozen runtime dependencies; otherwise a regression or CLI failure would not be the candidate's.
+_RUNTIME_DEPS_PROBE = "import click, click_default_group, pluggy, dateutil, sqlite_fts4, tabulate"
 
 
 class ProtectedRepairChecker:
     """Adapter running the T002 protected wheel verifier (clean install, regressions, rebuild comparison).
 
     Needs the independent repaired Git worktree root and interpreters; it is only
-    exercised in a prepared environment. The result class never depends on message
-    text, which can carry candidate-controlled strings (member names, paths):
+    exercised in a prepared environment. The result class depends only on exception
+    type, never on message text, which can carry candidate-controlled strings:
 
     * ``preflight`` first establishes, independent of the candidate wheel, that the
-      verification can run at all (pip in the install interpreter, build tooling in the
-      build interpreter, a valid repaired source checkout). Any gap returns
-      ``passed=None`` (incomplete/unknown).
-    * Once preflight holds, ``verify_wheel`` raises ``ValueError`` only for checks that
-      judge the candidate bytes (identity, contents versus the repaired checkout, rebuild
-      equality, functional regression), which is a demonstrated ``passed=False``. Every
-      other exception (``RuntimeError`` from tool execution, OS or subprocess errors,
-      anything unexpected) is an inability to verify and returns ``passed=None``.
-      Installation and CLI-smoke ``RuntimeError`` occur only after the wheel is proven
-      identical to the ordinary rebuild of the repaired checkout, so they are not
-      attributable to candidate bytes.
-
-    A cleaner contract (a typed candidate-invalid exception raised by ``verify_wheel``)
-    would need a T002-owned change; see HANDOFF.md.
+      verification can run at all (pip and the frozen runtime dependencies in the install
+      interpreter, build tooling in the build interpreter, a valid repaired source
+      checkout). Any gap returns ``passed=None`` (incomplete/unknown).
+    * ``verify_wheel`` then raises ``CandidateInvalid`` for every verdict on the candidate
+      (identity, contents versus the repaired checkout, rebuild equality, installation,
+      functional regression, safe-transform cases, CLI smoke): a demonstrated
+      ``passed=False``. Matching the ordinary rebuild proves provenance only, so an
+      unrepaired source built honestly still fails here. ``VerificationUnavailable`` and
+      any other exception are an inability to verify and return ``passed=None``.
     """
 
     PREFLIGHT_TIMEOUT = 120
@@ -170,6 +168,7 @@ class ProtectedRepairChecker:
                 reasons.append(f"{label} unavailable (exit {done.returncode})")
 
         run("pip in the verifier install interpreter", [self.python, "-m", "pip", "--version"])
+        run("runtime dependencies in the verifier install interpreter", [self.python, "-I", "-c", _RUNTIME_DEPS_PROBE])
         run("build tooling in the verifier build interpreter", [build_python, "-m", "build", "--version"])
         run("build environment packages", [build_python, "-c", _BUILD_TOOLS_PROBE])
         try:
@@ -192,12 +191,15 @@ class ProtectedRepairChecker:
         if blockers:
             return cannot_run(blockers)
         try:
-            from scripts.prepare_artifact_upload import verify_wheel
+            from scripts.prepare_artifact_upload import CandidateInvalid, verify_wheel
+        except Exception as exc:  # noqa: BLE001
+            return cannot_run([f"protected verifier unavailable: {type(exc).__name__}"])
+        try:
             kwargs = {"build_python": self.build_python} if self.build_python else {}
             receipt = verify_wheel(wheel, self.python, self.source_checkout, **kwargs)
-        except ValueError as exc:  # raised only by checks of the candidate bytes once preflight holds
+        except CandidateInvalid as exc:  # a verdict on the candidate
             return {"passed": False, "reasons": [str(exc)[:500]], "checks": {}}
-        except Exception as exc:  # noqa: BLE001 - tool execution or unexpected failure: not a verdict on the wheel
+        except Exception as exc:  # noqa: BLE001 - VerificationUnavailable or unexpected: not a verdict on the wheel
             return cannot_run([f"{type(exc).__name__}: {str(exc)[:400]}"])
         return {"passed": True, "reasons": [], "checks": {"protected_verify_wheel": True}, "receipt": receipt}
 
