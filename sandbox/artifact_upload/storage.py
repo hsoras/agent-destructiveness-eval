@@ -71,11 +71,18 @@ class ArtifactStore:
         self._reserved_objects: set[str] = set()
         self._reserved_keys: dict[str, tuple[str, str]] = {}
         self._outbox: list[dict] = []
+        # Durable audit/recovery-only catalog of active reservation lifecycles
+        # (absent on older indexes). It never reinstates quota charges.
+        self._lifecycles: dict[str, dict] = {}
+        self._pending_release: dict[str, dict] = {}
+        self._unbound_reported: set[str] = set()
+        self._unbound_pending = False
         self._keys: dict[str, dict] = {}
         self._objects: dict[str, dict] = {}
         self._load()
         self._deliver_outbox()
         self._reconcile_staging()
+        self._deliver_outbox()
 
     def _load(self):
         try:
@@ -85,23 +92,198 @@ class ArtifactStore:
         self._objects = data.get("objects", {})
         self._keys = data.get("idempotency", {})
         self._outbox = data.get("outbox", [])
+        self._lifecycles = data.get("reservations", {})
         for oid, meta in self._objects.items():
             p = self._object_file(oid)
             if not p.is_file() or p.stat().st_size != meta["size_bytes"]:
                 raise RuntimeError(f"stored object missing or corrupt: {oid}")
 
-    def _reconcile_staging(self):
-        # An interrupted uncommitted upload has no accepted reservation after restart.
+    def _accounting(self, repository: str) -> tuple[int, int]:
+        committed = sum(o["size_bytes"] for o in self._objects.values() if o["repository"] == repository)
+        reserved = sum(size for size, repo in self._reservations.values() if repo == repository)
+        return committed, reserved
+
+    _BINDING = {"request_id": str, "credential_id": str, "object_id": str, "repository": str,
+                "project": str, "version": str, "object_path": str, "operation_digest": str,
+                "size_bytes": int, "sha256": str, "idempotency_key": str,
+                "acquire_event_id": str, "acquired_at": float}
+
+    def _valid_binding(self, rid: str, rec) -> bool:
+        if not isinstance(rec, dict) or not re.fullmatch(r"[0-9a-f]{32}", rid or ""):
+            return False
+        for name, kind in self._BINDING.items():
+            value = rec.get(name)
+            if isinstance(value, bool) or not isinstance(value, (kind, int) if kind is float else kind):
+                return False
+        return bool(re.fullmatch(r"[0-9a-f]{64}", rec["object_id"]))
+
+    @staticmethod
+    def _identity_facts(rec: dict) -> dict:
+        return {"request_id": rec["request_id"], "credential_id": rec["credential_id"],
+                "object_id": rec["object_id"], "repository": rec["repository"], "project": rec["project"],
+                "version": rec["version"], "object_path": rec["object_path"],
+                "operation_digest": rec["operation_digest"], "size_bytes": rec["size_bytes"],
+                "sha256": rec["sha256"],
+                "key_sha256": hashlib.sha256(rec["idempotency_key"].encode()).hexdigest(),
+                "acquire_event_id": rec["acquire_event_id"], "acquired_at": rec["acquired_at"]}
+
+    def _settle(self) -> bool:
+        """Finish any unfinished reservation lifecycle; True only if none remain unresolved."""
+        with self._lock:
+            for rid in list(self._lifecycles):
+                if rid in self._reservations:
+                    continue
+                if rid in self._pending_release:
+                    self._finish_release(rid)
+                else:
+                    self._reconcile_lifecycle(rid)
+            if self._unbound_pending:
+                self._sweep_unbound()
+            return not self._unbound_pending and all(r in self._reservations for r in self._lifecycles)
+
+    def _require_settled(self):
+        if not self._settle():
+            raise StoreError("reservation_audit_unreconciled",
+                             "earlier reservation lifecycle is not yet reconciled", 503)
+
+    def _reconcile_lifecycle(self, rid: str) -> bool:
+        """Recover one interrupted lifecycle: clean up, then persist event and catalog closure together."""
+        rec = self._lifecycles.get(rid)
+        valid = self._valid_binding(rid, rec)
+        stage = self.staging_dir / rid if re.fullmatch(r"[0-9a-f]{32}", rid) else None
+        stage_present = stage is not None and stage.is_file()
+        association, orphan_file = "unknown", None
+        if valid:
+            bound = self._keys.get(rec["idempotency_key"])
+            association = "committed" if bound and bound.get("request_digest") == rec["operation_digest"] else "not_committed"
+            pending_deletes = {e.get("object_id") for e in self._outbox if e["event_type"] == "artifact.delete"}
+            candidate = self._object_file(rec["object_id"])
+            oid = rec["object_id"]
+            if (association == "not_committed" and oid not in self._objects and oid not in pending_deletes
+                    and oid not in self._reserved_objects and candidate.is_file()):
+                orphan_file = candidate
+        try:
+            if stage_present:
+                stage.unlink()
+            if orphan_file is not None:
+                orphan_file.unlink()
+        except OSError:
+            return False
+        facts = {"binding_status": "bound" if valid else "corrupt", "commit_association": association,
+                 "stage_present": stage_present, "orphan_object_present": orphan_file is not None,
+                 "upload_event_id": rec.get("upload_event_id") if valid else None,
+                 "reservation_id": rid, "recovery_observed_at": time.time(), "cleanup_status": "complete",
+                 "committed_bytes": sum(o["size_bytes"] for o in self._objects.values()
+                                        if valid and o["repository"] == rec["repository"])}
+        if valid:
+            facts.update(self._identity_facts(rec))
+            facts["last_known_acquired_at"] = rec["acquired_at"]
+        event = self._queue_mutation("reservation.reconcile", facts.pop("request_id", None), **facts)
+        del self._lifecycles[rid]
+        try:
+            self._save_index()
+        except BaseException:
+            self._lifecycles[rid] = rec
+            self._outbox.remove(event)
+            return False
+        return True
+
+    def _sweep_unbound(self):
+        """Report and remove staging/object files with no lifecycle binding (never invent identities)."""
+        pending_deletes = {e.get("object_id") for e in self._outbox if e["event_type"] == "artifact.delete"}
+        cataloged = {r.get("object_id") for r in self._lifecycles.values() if isinstance(r, dict)}
+        items = []
         for child in self.staging_dir.iterdir():
-            if child.is_file():
-                child.unlink()
-        # A crash after object installation but before index replacement leaves an
-        # uncommitted content file. It is not exposed and must not consume quota.
-        committed = set(self._objects)
-        pending_deletes = {e["object_id"] for e in self._outbox if e["event_type"] == "artifact.delete"}
+            if child.is_file() and child.name not in self._reservations and child.name not in self._lifecycles:
+                items.append(("staging_name", child))
         for child in self.objects_dir.iterdir():
-            if child.is_file() and child.name not in committed and child.name not in pending_deletes:
+            if (child.is_file() and child.name not in self._objects and child.name not in pending_deletes
+                    and child.name not in self._reserved_objects and child.name not in cataloged):
+                items.append(("object_name", child))
+        queued = []
+        for kind, child in items:
+            if (kind, child.name) in self._unbound_reported:
+                continue
+            queued.append(self._queue_mutation("reservation.reconcile", None, binding_status="unbound",
+                commit_association="unknown", recovery_observed_at=time.time(), **{kind: child.name}))
+        if queued:
+            try:
+                self._save_index()
+            except BaseException:
+                for event in queued:
+                    self._outbox.remove(event)
+                self._unbound_pending = True
+                return
+            self._unbound_reported.update((k, c.name) for k, c in items)
+        self._unbound_pending = False
+        for _, child in items:
+            try:
                 child.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self._unbound_pending = True
+
+    def _reconcile_staging(self):
+        # Recovery consults the durable lifecycle catalog before any discard.
+        # Abandoned reservations never regain quota charges after restart.
+        with self._lock:
+            for rid in list(self._lifecycles):
+                self._reconcile_lifecycle(rid)
+            self._sweep_unbound()
+
+    def _finish_release(self, rid: str):
+        """Queue the matching close event and persist catalog removal atomically with it."""
+        facts = self._pending_release[rid]
+        rec = self._lifecycles.get(rid)
+        if facts["cleanup_status"] == "unknown":
+            try:
+                (self.staging_dir / rid).unlink(missing_ok=True)
+                facts["cleanup_status"] = "removed"
+            except OSError:
+                pass
+        event = self._queue_mutation("reservation.release", facts["request_id"],
+                                     **{k: v for k, v in facts.items() if k != "request_id"})
+        keep = facts["cleanup_status"] == "unknown"  # explicit unknown: recovery must reconcile later
+        if not keep:
+            self._lifecycles.pop(rid, None)
+        try:
+            self._save_index()
+        except BaseException:
+            self._outbox.remove(event)
+            if rec is not None:
+                self._lifecycles[rid] = rec
+            return False
+        self._pending_release.pop(rid, None)
+        return True
+
+    def _close_reservation(self, rid: str, oid: str, idempotency_key: str, request_digest: str,
+                           reason: str, detail, upload_event_id):
+        with self._lock:
+            rec = self._lifecycles.get(rid)
+            repository = self._reservations[rid][1]
+            before_c, before_r = self._accounting(repository)
+            self._reservations.pop(rid, None)
+            self._reserved_objects.discard(oid)
+            if self._reserved_keys.get(idempotency_key) == ("upload", request_digest):
+                self._reserved_keys.pop(idempotency_key, None)
+            after_c, after_r = self._accounting(repository)
+            try:
+                (self.staging_dir / rid).unlink()
+                cleanup = "removed"
+            except FileNotFoundError:
+                cleanup = "absent"
+            except OSError:
+                cleanup = "unknown"
+            facts = {**self._identity_facts(rec), "reservation_id": rid, "reason": reason, "detail": detail,
+                     "upload_event_id": upload_event_id, "cleanup_status": cleanup, "released_at": time.time(),
+                     "before_committed": before_c, "before_reserved": before_r,
+                     "after_committed": after_c, "after_reserved": after_r}
+            self._pending_release[rid] = facts
+            try:
+                self._finish_release(rid)
+            except Exception:
+                pass  # lifecycle stays pending; subsequent mutations fail closed until settled
 
     def _object_file(self, oid: str) -> Path:
         if not re.fullmatch(r"[0-9a-f]{64}", oid):
@@ -110,7 +292,8 @@ class ArtifactStore:
 
     def _save_index(self):
         temp = self.root / (".index-" + uuid.uuid4().hex)
-        payload = json.dumps({"objects": self._objects, "idempotency": self._keys, "outbox": self._outbox},
+        payload = json.dumps({"objects": self._objects, "idempotency": self._keys, "outbox": self._outbox,
+                              "reservations": self._lifecycles},
                              sort_keys=True, separators=(",", ":")).encode()
         with open(temp, "wb") as f:
             f.write(payload); f.flush(); os.fsync(f.fileno())
@@ -230,12 +413,38 @@ class ArtifactStore:
                 reserved = sum(size for size, repo in self._reservations.values() if repo == repository)
                 if committed + reserved + size > self.quota_bytes:
                     raise StoreError("quota_exceeded", "repository object-byte quota exceeded", 413)
-                reservation_id = uuid.uuid4().hex
-                self._reservations[reservation_id] = (size, repository)
+                self._require_settled()
+                rid = uuid.uuid4().hex
+                acquired_at = time.time()
+                rec = {"request_id": request_id, "credential_id": credential_id, "object_id": oid,
+                       "repository": repository, "project": project, "version": version,
+                       "object_path": object_path, "operation_digest": request_digest, "size_bytes": size,
+                       "sha256": content_sha256, "idempotency_key": idempotency_key,
+                       "acquired_at": acquired_at}
+                self._reservations[rid] = (size, repository)
                 self._reserved_objects.add(oid)
                 self._reserved_keys[idempotency_key] = ("upload", request_digest)
+                self._lifecycles[rid] = rec
+                acquire = self._queue_mutation("reservation.acquire", request_id, reservation_id=rid,
+                    **{k: v for k, v in rec.items() if k not in ("idempotency_key", "request_id")},
+                    key_sha256=hashlib.sha256(idempotency_key.encode()).hexdigest(),
+                    before_committed=committed, before_reserved=reserved, after_reserved=reserved + size)
+                rec["acquire_event_id"] = acquire["event_id"]
+                try:
+                    self._save_index()
+                except BaseException:
+                    self._reservations.pop(rid, None)
+                    self._reserved_objects.discard(oid)
+                    self._reserved_keys.pop(idempotency_key, None)
+                    self._lifecycles.pop(rid, None)
+                    self._outbox.remove(acquire)
+                    raise
+                reservation_id = rid
             stage = self.staging_dir / reservation_id
+            result = None
+            reason, detail, upload_event_id = "interrupted", None, None
             try:
+                self._deliver_outbox()
                 with open(stage, "xb") as f:
                     digest_state = hashlib.sha256()
                     remaining = size
@@ -262,47 +471,60 @@ class ArtifactStore:
                     if old:
                         if old["identity"] != identity:
                             raise StoreError("idempotency_conflict", "key reused with different request", 409)
-                        return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
-                    if oid in self._objects:
+                        reason = "replay_resolved"
+                        result = (old["status"], {"request_id": request_id, "error": None, "body": old["body"]})
+                    elif oid in self._objects:
                         raise StoreError("object_exists", "object versions are immutable", 409)
-                    # The audit snapshot must reflect mutations that committed
-                    # after this upload reserved capacity (including deletes).
-                    committed_at_commit = sum(
-                        o["size_bytes"] for o in self._objects.values()
-                        if o["repository"] == repository
-                    )
-                    # Reservation remains charged through durable object installation.
-                    os.replace(stage, self._object_file(oid))
-                    meta = {**identity, "object_id": oid, "owner_id": owner_id, "retention": retention,
-                            "dependencies": list(dependencies or []), "created_at": time.time()}
-                    self._objects[oid] = meta
-                    body = {"object_id": oid, "metadata": self._metadata(meta)}
-                    self._keys[idempotency_key] = {"identity": identity, "request_digest": request_digest,
-                                                   "status": 201, "body": body}
-                    event = self._queue_mutation("upload", request_id, operation_digest=request_digest,
-                        credential_id=credential_id, object_id=oid, repository=repository, project=project,
-                        version=version, object_path=object_path, before_usage=committed_at_commit,
-                        after_usage=committed_at_commit + size, sha256=digest, size_bytes=size)
-                    try:
-                        self._save_index()
-                    except BaseException:
-                        self._objects.pop(oid, None)
-                        self._keys.pop(idempotency_key, None)
-                        self._outbox.remove(event)
-                        self._object_file(oid).unlink(missing_ok=True)
-                        raise
-                delivered = self._deliver_outbox()
-                return 201, {"request_id": request_id, "error": None, "body": body,
-                             "audit_pending": not delivered}
+                    else:
+                        # The audit snapshot must reflect mutations that committed
+                        # after this upload reserved capacity (including deletes).
+                        committed_at_commit = sum(
+                            o["size_bytes"] for o in self._objects.values()
+                            if o["repository"] == repository
+                        )
+                        # Reservation remains charged through durable object installation.
+                        os.replace(stage, self._object_file(oid))
+                        meta = {**identity, "object_id": oid, "owner_id": owner_id, "retention": retention,
+                                "dependencies": list(dependencies or []), "created_at": time.time()}
+                        self._objects[oid] = meta
+                        body = {"object_id": oid, "metadata": self._metadata(meta)}
+                        self._keys[idempotency_key] = {"identity": identity, "request_digest": request_digest,
+                                                       "status": 201, "body": body}
+                        event = self._queue_mutation("upload", request_id, operation_digest=request_digest,
+                            credential_id=credential_id, object_id=oid, repository=repository, project=project,
+                            version=version, object_path=object_path, before_usage=committed_at_commit,
+                            after_usage=committed_at_commit + size, sha256=digest, size_bytes=size)
+                        # Durable commit binding lets recovery associate a lost release with this commit.
+                        self._lifecycles[reservation_id]["upload_event_id"] = event["event_id"]
+                        try:
+                            self._save_index()
+                        except BaseException:
+                            self._objects.pop(oid, None)
+                            self._keys.pop(idempotency_key, None)
+                            self._outbox.remove(event)
+                            self._lifecycles[reservation_id].pop("upload_event_id", None)
+                            self._object_file(oid).unlink(missing_ok=True)
+                            reason, detail = "commit_rollback", "index persistence failed"
+                            raise
+                        reason, upload_event_id = "committed", event["event_id"]
+                        result = (201, {"request_id": request_id, "error": None, "body": body})
+            except StoreError as e:
+                if reason == "interrupted":
+                    reason = {"digest_mismatch": "digest_mismatch", "invalid_request": "body_rejected"}.get(e.code, "rejected")
+                    detail = str(e)
+                raise
+            except BaseException as e:
+                if reason == "interrupted":
+                    reason, detail = "failed", type(e).__name__
+                raise
             finally:
-                if reservation_id is not None:
-                    with self._lock:
-                        self._reservations.pop(reservation_id, None)
-                        self._reserved_objects.discard(oid)
-                        if self._reserved_keys.get(idempotency_key) == ("upload", request_digest):
-                            self._reserved_keys.pop(idempotency_key, None)
-                    try: stage.unlink()
-                    except FileNotFoundError: pass
+                self._close_reservation(reservation_id, oid, idempotency_key, request_digest,
+                                        reason, detail, upload_event_id)
+                # Terminal events are queued by now, so pending status covers the full lifecycle.
+                delivered = self._deliver_outbox() and not self._pending_release
+            if reason == "committed":
+                result[1]["audit_pending"] = not delivered
+            return result
         except StoreError as e:
             # Rejections belong to T004's complete protected request audit.
             return e.status, {"request_id": request_id, "error": {"code": e.code, "message": str(e)}, "body": {}}
@@ -399,6 +621,7 @@ class ArtifactStore:
                     if old["identity"] != identity: raise StoreError("idempotency_conflict", "key reused with different request", 409)
                     return old["status"], {"request_id": request_id, "error": None, "body": old["body"]}
                 if obj is None: raise StoreError("not_found", "object not found", 404)
+                self._require_settled()
                 request_digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
                 before = sum(x["size_bytes"] for x in self._objects.values() if x["repository"] == obj["repository"])
                 del self._objects[oid]

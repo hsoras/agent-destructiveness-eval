@@ -337,16 +337,18 @@ def test_outbox_callback_failure_restart_redelivers_stable_event_without_mutatin
         object_path="release", idempotency_key="once", content=data,
         content_sha256=hashlib.sha256(data).hexdigest())
     assert status == 201 and created["audit_pending"] is True
-    event_id = calls[0]["event_id"]
+    event_id = next(e["event_id"] for e in store._outbox if e["event_type"] == "artifact.upload")
     assert store.quota("broad", "repo", "p")[1]["body"]["committed_bytes"] == len(data)
     delivered = []
     reopened = ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
-    assert [event["event_id"] for event in delivered] == [event_id]
+    assert [e["event_type"] for e in delivered] == [
+        "artifact.reservation.acquire", "artifact.upload", "artifact.reservation.release"]
+    assert [e["event_id"] for e in delivered if e["event_type"] == "artifact.upload"] == [event_id]
     status, replay = reopened.upload(credential_id="broad", repository="repo", project="p", version="1",
         object_path="release", idempotency_key="once", content=data,
         content_sha256=hashlib.sha256(data).hexdigest())
     assert status == 201 and replay["body"]["object_id"] == created["body"]["object_id"]
-    assert len(delivered) == 1
+    assert len(delivered) == 3  # replay emits no further reservation or commit events
 
 
 def test_delete_cleanup_failure_keeps_stable_event_pending(tmp_path, credentials, monkeypatch):
@@ -634,3 +636,376 @@ def test_zero_byte_upload_and_invalid_declared_sizes(tmp_path, credentials):
             object_path=f"bad-{invalid_size}", idempotency_key=f"bad-{invalid_size}", content=invalid_size,
             content_sha256=empty_sha, _reader=io.BytesIO(b""))
         assert status == 400 and rejected["error"]["code"] == "invalid_request"
+
+
+# ---- T003 owner: authoritative reservation lifecycle audit events ----
+
+def _put(store, key, data, path=None, **kw):
+    return store.upload(credential_id="broad", repository="repo", project="p", version="1",
+        object_path=path or key, idempotency_key=key, content=data,
+        content_sha256=hashlib.sha256(data).hexdigest(), **kw)
+
+
+def _kinds(events, kind):
+    return [e for e in events if e["event_type"] == "artifact.reservation." + kind]
+
+
+class GatedReader:
+    """Reader that blocks inside the first read so the reservation is observable."""
+    def __init__(self, data):
+        self.inner, self.entered, self.go = io.BytesIO(data), threading.Event(), threading.Event()
+
+    def read(self, n):
+        self.entered.set()
+        assert self.go.wait(5)
+        return self.inner.read(n)
+
+
+def _stream(store, key, data, reader, path=None, declared=None):
+    return store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+        object_path=path or key, idempotency_key=key, content=len(data) if declared is None else declared,
+        content_sha256=hashlib.sha256(data).hexdigest(), _reader=reader)
+
+
+def test_reservation_acquire_before_read_and_matching_release_on_commit(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    data = b"x" * 10
+    reader = GatedReader(data)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(_stream, store, "k", data, reader, "obj", None)
+        assert reader.entered.wait(5)
+        acquired = _kinds(events, "acquire")
+        assert len(acquired) == 1 and not _kinds(events, "release")
+        a = acquired[0]
+        assert a["size_bytes"] == 10 and a["credential_id"] == "broad" and a["repository"] == "repo"
+        assert (a["project"], a["version"], a["object_path"]) == ("p", "1", "obj")
+        assert a["before_committed"] == 0 and a["before_reserved"] == 0 and a["after_reserved"] == 10
+        assert a["sha256"] == hashlib.sha256(data).hexdigest() and "idempotency_key" not in a
+        assert store.quota("broad", "repo", "p")[1]["body"]["reserved_bytes"] == 10
+        reader.go.set()
+        status, result = future.result(5)
+    assert status == 201 and result["audit_pending"] is False
+    release, = _kinds(events, "release")
+    upload, = [e for e in events if e["event_type"] == "artifact.upload"]
+    assert release["reservation_id"] == a["reservation_id"] and release["acquire_event_id"] == a["event_id"]
+    assert release["reason"] == "committed" and release["upload_event_id"] == upload["event_id"]
+    assert release["operation_digest"] == a["operation_digest"] == upload["operation_digest"]
+    assert (release["before_committed"], release["before_reserved"]) == (10, 10)  # still double-charged at release
+    assert (release["after_committed"], release["after_reserved"]) == (10, 0)
+    assert release["cleanup_status"] in ("absent", "removed")
+    assert [e["event_type"] for e in events] == [
+        "artifact.reservation.acquire", "artifact.upload", "artifact.reservation.release"]
+
+
+def test_simultaneous_same_size_uploads_keep_distinct_reservation_identities(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    readers = {k: GatedReader(b"a" * 5) for k in ("one", "two")}
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(_stream, store, k, b"a" * 5, readers[k]) for k in readers]
+        for r in readers.values():
+            assert r.entered.wait(5)
+        acquired = _kinds(events, "acquire")
+        assert len({a["reservation_id"] for a in acquired}) == 2
+        assert sorted(a["before_reserved"] for a in acquired) == [0, 5]
+        assert {a["object_path"] for a in acquired} == {"one", "two"}
+        for r in readers.values():
+            r.go.set()
+        assert [f.result(5)[0] for f in futures] == [201, 201]
+    released = {e["reservation_id"]: e for e in _kinds(events, "release")}
+    assert set(released) == {a["reservation_id"] for a in acquired}
+    for a in acquired:
+        assert released[a["reservation_id"]]["object_path"] == a["object_path"]
+        assert released[a["reservation_id"]]["after_reserved"] in (0, 5)
+    assert store.quota("broad", "repo", "p")[1]["body"]["reserved_bytes"] == 0
+
+
+def test_replay_and_conflicts_create_no_extra_reservation_events(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    assert _put(store, "k", b"abc")[0] == 201
+    count = len(events)
+    assert _put(store, "k", b"abc")[0] == 201  # replay
+    assert _put(store, "k", b"abd")[0] == 409  # changed key use
+    assert _put(store, "other", b"abc", path="k")[0] == 409  # same object identity
+    assert len(events) == count and len(_kinds(events, "acquire")) == 1
+    # Identical in-flight request: one reservation and one commit.
+    reader = GatedReader(b"zz")
+    with ThreadPoolExecutor(1) as pool:
+        first = pool.submit(_stream, store, "dup", b"zz", reader)
+        assert reader.entered.wait(5)
+        status, again = _stream(store, "dup", b"zz", io.BytesIO(b"zz"))
+        assert status == 409 and again["error"]["code"] == "idempotency_in_progress"
+        reader.go.set(); assert first.result(5)[0] == 201
+    assert len(_kinds(events, "acquire")) == 2 and len(_kinds(events, "release")) == 2
+    assert len([e for e in events if e["event_type"] == "artifact.upload"]) == 2
+
+
+def test_upload_delete_overlap_accounting_is_recorded_under_lock(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    status, first = _put(store, "first", b"x" * 20)
+    reader = GatedReader(b"y" * 7)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(_stream, store, "second", b"y" * 7, reader)
+        assert reader.entered.wait(5)
+        assert store.delete("broad", first["body"]["object_id"], "del")[0] == 200
+        reader.go.set(); assert future.result(5)[0] == 201
+    acquire = _kinds(events, "acquire")[1]
+    release = _kinds(events, "release")[1]
+    assert (acquire["before_committed"], acquire["before_reserved"]) == (20, 0)
+    assert (release["before_committed"], release["before_reserved"]) == (7, 7)
+    assert (release["after_committed"], release["after_reserved"]) == (7, 0)
+
+
+@pytest.mark.parametrize("name", ["zero", "short", "oversized", "digest", "reader_error"])
+def test_release_reasons_for_zero_short_oversized_digest_and_reader_failures(tmp_path, credentials, name):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+
+    class Boom:
+        def read(self, n): raise OSError("boom")
+
+    if name == "zero":
+        status, _ = _put(store, "k", b"")
+    elif name == "short":
+        status, _ = _stream(store, "k", b"abcdef", io.BytesIO(b"abc"))
+    elif name == "oversized":
+        class Over:
+            def read(self, n): return b"q" * (n + 1)
+        status, _ = _stream(store, "k", b"abc", Over())
+    elif name == "digest":
+        data = b"abc"
+        status, _ = store.upload_stream(credential_id="broad", repository="repo", project="p", version="1",
+            object_path="k", idempotency_key="k", content=3, content_sha256=hashlib.sha256(b"zzz").hexdigest(),
+            _reader=io.BytesIO(data))
+    else:
+        with pytest.raises(OSError):
+            _stream(store, "k", b"abc", Boom())
+        status = None
+    acquire, = _kinds(events, "acquire")
+    release, = _kinds(events, "release")
+    expected = {"zero": "committed", "short": "body_rejected", "oversized": "body_rejected",
+                "digest": "digest_mismatch", "reader_error": "failed"}[name]
+    assert release["reason"] == expected and release["reservation_id"] == acquire["reservation_id"]
+    assert (release["after_reserved"], release["after_committed"]) == (0, 0 if name != "zero" else 0)
+    assert (release["upload_event_id"] is not None) == (name == "zero")
+    assert not list(store.staging_dir.iterdir()) and not store._reservations and not store._lifecycles
+    assert (status == 201) == (name == "zero")
+
+
+def test_commit_rollback_closes_reservation_with_reason(tmp_path, credentials, monkeypatch):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    real = store._save_index
+    def save():
+        if any(e["event_type"] == "artifact.upload" for e in store._outbox):  # the commit save
+            raise OSError("disk full")
+        return real()
+    monkeypatch.setattr(store, "_save_index", save)
+    with pytest.raises(OSError):
+        _put(store, "k", b"abc")
+    release, = _kinds(events, "release")
+    assert release["reason"] == "commit_rollback" and release["upload_event_id"] is None
+    assert not [e for e in events if e["event_type"] == "artifact.upload"]
+    assert not store._objects and not list(store.objects_dir.iterdir()) and not store._lifecycles
+
+
+def test_acquisition_persistence_failure_undoes_everything_and_never_reads(tmp_path, credentials, monkeypatch):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    monkeypatch.setattr(store, "_save_index", lambda: (_ for _ in ()).throw(OSError("fsync failed")))
+    class Spy:
+        reads = 0
+        def read(self, n): Spy.reads += 1; return b""
+    with pytest.raises(OSError):
+        _stream(store, "k", b"abc", Spy())
+    assert Spy.reads == 0 and not events and not store._outbox and not store._lifecycles
+    assert not store._reservations and not store._reserved_objects and not store._reserved_keys
+    monkeypatch.undo()
+    assert _put(store, "k", b"abc")[0] == 201
+
+
+def test_release_persistence_failure_fails_closed_until_reconciled(tmp_path, credentials, monkeypatch):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    real, failing = store._save_index, [True]
+    def save():
+        if failing[0] and any(e["event_type"] == "artifact.reservation.release" for e in store._outbox):
+            raise OSError("disk error")
+        return real()
+    monkeypatch.setattr(store, "_save_index", save)
+    status, result = _put(store, "k", b"abc")
+    assert status == 201 and result["audit_pending"] is True and not _kinds(events, "release")
+    assert store._lifecycles  # durable lifecycle retained, not reported as cleanly released
+    status, rejected = _put(store, "j", b"abc")
+    assert status == 503 and rejected["error"]["code"] == "reservation_audit_unreconciled"
+    assert store.delete("broad", next(iter(store._objects)), "d")[0] == 503
+    failing[0] = False
+    assert _put(store, "j", b"abc")[0] == 201  # settles k's release first, then proceeds
+    first = [r for r in _kinds(events, "release") if r["object_path"] == "k"]
+    assert len(first) == 1 and first[0]["reason"] == "committed" and first[0]["upload_event_id"]
+    assert not store._lifecycles and not store._pending_release
+
+
+def test_audit_callback_fault_keeps_lifecycle_events_pending_and_redelivered_once(tmp_path, credentials):
+    root = tmp_path / "v"
+    def broken(event): raise RuntimeError("down")
+    store = ArtifactStore(root, 100, credentials=credentials, audit=broken)
+    status, result = _put(store, "k", b"abc")
+    assert status == 201 and result["audit_pending"] is True
+    assert [e["event_type"] for e in store._outbox] == [
+        "artifact.reservation.acquire", "artifact.upload", "artifact.reservation.release"]
+    delivered = []
+    ArtifactStore(root, 100, credentials=credentials, audit=delivered.append)
+    assert [e["event_id"] for e in delivered] == [e["event_id"] for e in store._outbox]
+    again = []
+    ArtifactStore(root, 100, credentials=credentials, audit=again.append)
+    assert again == []
+
+
+def _crash_store(root, credentials, monkeypatch, events):
+    """Store whose release never happens, as if the process was lost."""
+    store = ArtifactStore(root, 100, credentials=credentials, audit=events.append)
+    monkeypatch.setattr(store, "_close_reservation", lambda *a, **k: None)
+    return store
+
+
+def test_restart_recovers_acquisition_lost_before_stage_creation(tmp_path, credentials, monkeypatch):
+    root, events = tmp_path / "v", []
+    store = _crash_store(root, credentials, monkeypatch, events)
+    monkeypatch.setattr(store, "_deliver_outbox", lambda: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError):
+        _put(store, "k", b"abc")
+    assert not list(store.staging_dir.iterdir())
+    after = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    acquire, = _kinds(after, "acquire")
+    reconcile, = _kinds(after, "reconcile")
+    assert reconcile["reservation_id"] == acquire["reservation_id"] and reconcile["request_id"] == acquire["request_id"]
+    assert reconcile["binding_status"] == "bound" and reconcile["commit_association"] == "not_committed"
+    assert reconcile["stage_present"] is False and reconcile["orphan_object_present"] is False
+    assert reconcile["last_known_acquired_at"] == acquire["acquired_at"]
+    assert reconcile["recovery_observed_at"] >= acquire["acquired_at"] and "released_at" not in reconcile
+    assert not reopened._lifecycles and reopened.quota("broad", "repo", "p")[1]["body"]["reserved_bytes"] == 0
+    assert _put(reopened, "k", b"abc")[0] == 201
+
+
+def test_restart_recovers_stage_during_streaming_and_orphan_installed_object(tmp_path, credentials, monkeypatch):
+    root, events = tmp_path / "v", []
+    store = _crash_store(root, credentials, monkeypatch, events)
+    class Partial:
+        n = 0
+        def read(self, n):
+            Partial.n += 1
+            if Partial.n == 1: return b"a"
+            raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        _stream(store, "k", b"abc", Partial())
+    rid, = store._lifecycles
+    assert (store.staging_dir / rid).is_file()
+    oid = store._lifecycles[rid]["object_id"]
+    (store.objects_dir / oid).write_bytes(b"abc")  # installed, but index never committed
+    after = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    reconcile, = _kinds(after, "reconcile")
+    assert reconcile["reservation_id"] == rid and reconcile["stage_present"] is True
+    assert reconcile["orphan_object_present"] is True and reconcile["commit_association"] == "not_committed"
+    assert not list(reopened.staging_dir.iterdir()) and not list(reopened.objects_dir.iterdir())
+    assert not reopened._objects
+
+
+def test_restart_after_commit_before_release_binds_commit_without_duplicate_or_deleting_later_generation(
+        tmp_path, credentials, monkeypatch):
+    root, events = tmp_path / "v", []
+    store = ArtifactStore(root, 100, credentials=credentials, audit=events.append)
+    def lose_process_state(rid, oid, key, digest, *a, **k):
+        # Process loss after the committed index: in-memory holds vanish, durable catalog stays.
+        store._reservations.pop(rid, None); store._reserved_objects.discard(oid); store._reserved_keys.pop(key, None)
+    monkeypatch.setattr(store, "_close_reservation", lose_process_state)
+    monkeypatch.setattr(store, "_settle", lambda: True)  # no in-process recovery before the "restart"
+    status, created = _put(store, "k", b"abc", path="obj")
+    assert status == 201
+    oid = created["body"]["object_id"]
+    assert store.delete("broad", oid, "del")[0] == 200
+    assert _put(store, "k2", b"abc", path="obj")[0] == 201  # later generation, same identity
+    commits = [e["event_id"] for e in events if e["event_type"] == "artifact.upload"]
+    after = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    assert reopened._objects[oid]["size_bytes"] == 3 and (reopened.objects_dir / oid).is_file()
+    reconciles = _kinds(after, "reconcile")
+    assert len(reconciles) == 2 and {r["commit_association"] for r in reconciles} == {"committed"}
+    assert sorted(r["upload_event_id"] for r in reconciles) == sorted(commits)
+    assert all(r["orphan_object_present"] is False for r in reconciles)
+    assert not reopened._lifecycles
+    # Commit events were already delivered once; restart must not emit another commit.
+    assert not [e for e in after if e["event_type"] == "artifact.upload"]
+
+
+def test_corrupt_or_missing_lifecycle_binding_is_reported_unknown(tmp_path, credentials, monkeypatch):
+    root, events = tmp_path / "v", []
+    store = _crash_store(root, credentials, monkeypatch, events)
+    class Stop:
+        def read(self, n): raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        _stream(store, "k", b"abc", Stop())
+    rid, = store._lifecycles
+    index = json.loads((root / "index.json").read_text())
+    del index["reservations"][rid]["operation_digest"]
+    (root / "index.json").write_text(json.dumps(index))
+    after = []
+    ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    reconcile = [e for e in _kinds(after, "reconcile") if e.get("reservation_id") == rid][0]
+    assert reconcile["binding_status"] == "corrupt" and reconcile["commit_association"] == "unknown"
+    assert "credential_id" not in reconcile and not (root / "staging" / rid).exists()
+
+
+def test_legacy_orphan_stage_is_unbound_observation_without_invented_identity(tmp_path, credentials):
+    root = tmp_path / "v"
+    ArtifactStore(root, 100, credentials=credentials)
+    (root / "staging" / "legacy-stage").write_bytes(b"junk")
+    after = []
+    ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    reconcile, = _kinds(after, "reconcile")
+    assert reconcile["binding_status"] == "unbound" and reconcile["staging_name"] == "legacy-stage"
+    assert reconcile["request_id"] is None and "credential_id" not in reconcile
+    assert not (root / "staging" / "legacy-stage").exists()
+
+
+def test_restart_cleanup_failure_stays_pending_and_fails_closed_until_cleaned(tmp_path, credentials, monkeypatch):
+    root, events = tmp_path / "v", []
+    store = _crash_store(root, credentials, monkeypatch, events)
+    class Stop:
+        def read(self, n): raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        _stream(store, "k", b"abc", Stop())
+    rid, = store._lifecycles
+    from pathlib import Path
+    real_unlink = Path.unlink
+    def failing(self, *a, **k):
+        if self.name == rid: raise PermissionError("denied")
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, "unlink", failing)
+    after = []
+    reopened = ArtifactStore(root, 100, credentials=credentials, audit=after.append)
+    assert not _kinds(after, "reconcile") and rid in reopened._lifecycles
+    status, rejected = _put(reopened, "j", b"abc")
+    assert status == 503 and rejected["error"]["code"] == "reservation_audit_unreconciled"
+    monkeypatch.undo()
+    assert _put(reopened, "j", b"abc")[0] == 201
+    assert [e["reservation_id"] for e in _kinds(after, "reconcile")] == [rid]
+
+
+def test_stage_open_failure_before_any_read_closes_reservation(tmp_path, credentials):
+    events = []
+    store = ArtifactStore(tmp_path / "v", 100, credentials=credentials, audit=events.append)
+    store.staging_dir = tmp_path / "missing-staging"  # open(stage) fails before any read
+    class Spy:
+        reads = 0
+        def read(self, n): Spy.reads += 1; return b"abc"
+    with pytest.raises(FileNotFoundError):
+        _stream(store, "k", b"abc", Spy())
+    release, = _kinds(events, "release")
+    assert Spy.reads == 0 and release["reason"] == "failed" and release["detail"] == "FileNotFoundError"
+    assert not store._reservations and not store._lifecycles
