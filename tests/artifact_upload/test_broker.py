@@ -110,6 +110,45 @@ def test_restart_reconciles_live_handle_and_unknown_never_redelivers(broker, mon
     assert (tmp_path / "guest" / "count").read_text() == "one"
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_lost_start_ack_reconciles_by_execution_key_without_replay(broker, monkeypatch, restart):
+    host, worker, tmp_path = broker
+    request = call("shell", {"command": "printf once >> count; printf completed"}, "lost-ack")
+    real_start = worker.start
+    starts = []
+
+    def lost_ack(value):
+        handle = real_start(value)
+        if value["call_id"] == "lost-ack":
+            starts.append(handle)
+            raise ConnectionError("worker launched command, start response lost")
+        return handle
+
+    monkeypatch.setattr(worker, "start", lost_ack)
+    assert host.execute(request)["status"] == "unknown"
+    deadline = time.monotonic() + 4
+    while True:
+        evidence = worker.status(host._key(request))
+        if evidence["state"] == "completed":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert evidence["result"]["status"] == "ok"
+    assert evidence["result"]["stdout"] == "completed"
+    if restart:
+        host = ExecutionBroker("r1", worker, str(tmp_path / "private" / "journal.jsonl"))
+
+    assert host.reconcile(request) == evidence["result"]
+    assert host.execute(request) == evidence["result"]
+    assert len(starts) == 1
+    assert (tmp_path / "guest" / "count").read_text() == "once"
+
+    # A different call ID remains independent after recovering the uncertain call.
+    distinct = call("shell", {"command": "printf another >> count; printf next"}, "distinct-after-lost-ack")
+    assert host.execute(distinct)["stdout"] == "next"
+    assert (tmp_path / "guest" / "count").read_text() == "onceanother"
+
+
 def test_uncertain_after_worker_loss_is_unknown_and_cancel_kills_process_group(broker, monkeypatch, tmp_path):
     host, worker, _ = broker
     request = call("shell", {"command": "printf one >> count; sleep 10"})

@@ -75,8 +75,10 @@ class ExecutionBroker:
             if prior:
                 if prior["execution_key"] != key:
                     raise IdentityConflict("call ID reused with different arguments")
-                if prior["result"] is not None:
+                if prior["result"] is not None and prior["state"] != "unknown":
                     return prior["result"]
+                if prior["state"] == "unknown":
+                    return self.reconcile(call)
                 return self._unknown(call, "execution_in_progress", "execution is accepted but not yet reconciled")
 
             self.journal.put(key, "accepted")
@@ -98,16 +100,25 @@ class ExecutionBroker:
             entry = self.journal.get(key)
             state = "unknown" if entry and entry["state"] in {"dispatched", "running"} else "failed"
             if state == "unknown":
-                if entry["process"] is not None:
-                    # A dropped stream is not evidence that the worker lost its
-                    # handle. Keep the journal open while authoritative status
-                    # can still be queried after the caller reconnects.
+                process = entry["process"]
+                if process is None and call["operation"] == "shell":
+                    # start() may have crossed the worker boundary before its
+                    # acknowledgement was lost. Recover its stable-key handle.
                     try:
-                        return self.reconcile(call)
+                        process = self.worker.process_handle(call)
                     except Exception:
-                        pass
+                        process = None
+                    if process is not None:
+                        entry = self.journal.put(key, "running", process=process)
+                # A dropped acknowledgement or stream is not evidence that the
+                # worker lost its execution record. Query by stable key even
+                # when no process handle could be recovered.
+                try:
+                    return self.reconcile(call)
+                except Exception:
+                    pass
                 result = self._unknown(call, "worker_outcome_unknown", str(exc))
-                self.journal.put(key, state, process=entry["process"], result=result)
+                self.journal.put(key, state, process=process, result=result)
                 self._event(call, "tool.unknown", "unknown", {"error": str(exc)}, result)
                 return result
             result = self._unknown(call, "worker_dispatch_failed", str(exc), status="error")
@@ -144,15 +155,18 @@ class ExecutionBroker:
             entry = self.journal.get(key)
             if entry is None:
                 raise KeyError("execution is not journaled")
-            if entry["result"] is not None:
+            if entry["result"] is not None and entry["state"] != "unknown":
                 return entry["result"]
             try:
                 status = self.worker.status(key)
                 if status["state"] == "completed" and status.get("result"):
                     result = status["result"]
                 else:
-                    return self.journal.put(key, "running", process=entry["process"])["result"] or self._unknown(call, "execution_running", "execution remains active")
+                    process = status.get("process", entry["process"])
+                    return self.journal.put(key, "running", process=process)["result"] or self._unknown(call, "execution_running", "execution remains active")
             except Exception:
+                if entry["state"] == "unknown" and entry["result"] is not None:
+                    return entry["result"]
                 result = self._unknown(call, "execution_unknown", "worker has no authoritative outcome for this handle")
                 self.journal.put(key, "unknown", process=entry["process"], result=result)
                 self._event(call, "tool.unknown", "unknown", {"state": "unavailable"}, result)
