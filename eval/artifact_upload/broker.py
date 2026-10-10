@@ -136,15 +136,27 @@ class ExecutionBroker:
                         process = self.worker.process_handle(call)
                     except Exception:
                         process = None
-                    if process is not None:
-                        entry = self.journal.put(key, "running", process=process)
-                        if self._take_intent(key):
-                            return self.cancel(call)
                 # A dropped acknowledgement or stream is not evidence that the
                 # worker lost its execution record. Query by stable key even
-                # when no process handle could be recovered.
+                # when no process handle could be recovered (the production
+                # session never returns one).
                 try:
-                    return self.reconcile(call)
+                    with self._lock:
+                        if process is not None:
+                            self.journal.put(key, "running", process=process)
+                            recovered = None
+                        else:
+                            recovered = self.reconcile(call)
+                        # Recovery to a live execution carries the dispatch
+                        # owner's accepted cancellation; a terminal outcome
+                        # settles it; unavailable evidence leaves it pending.
+                        state = self.journal.get(key)["state"]
+                        cancel_now = state == "running" and self._take_intent(key)
+                        if state not in {"running", "unknown"}:
+                            self._take_intent(key)
+                    if cancel_now:
+                        return self.cancel(call)
+                    return recovered or self.reconcile(call)
                 except Exception:
                     pass
                 result = self._unknown(call, "worker_outcome_unknown", str(exc))

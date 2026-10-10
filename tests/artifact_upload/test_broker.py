@@ -236,7 +236,7 @@ def test_uncertain_after_worker_loss_is_unknown_and_cancel_kills_process_group(b
         validate("event", event)
 
 
-@pytest.mark.parametrize("phase", ["registered", "dispatched", "lost_ack", "running", "completed"])
+@pytest.mark.parametrize("phase", ["registered", "dispatched", "lost_ack", "lost_ack_no_handle", "running", "completed"])
 def test_cancellation_intent_survives_every_dispatch_phase(broker, monkeypatch, phase):
     """An accepted cancel is never lost between registration, dispatch, start acknowledgement and collection."""
     host, worker, tmp_path = broker
@@ -251,7 +251,7 @@ def test_cancellation_intent_survives_every_dispatch_phase(broker, monkeypatch, 
         entered.set()
         assert release.wait(10)
         handle = real_start(value)
-        if phase == "lost_ack":
+        if phase.startswith("lost_ack"):
             raise ConnectionError("start acknowledgement lost after crossing the worker boundary")
         return handle
 
@@ -266,7 +266,10 @@ def test_cancellation_intent_survives_every_dispatch_phase(broker, monkeypatch, 
         assert host.cancel(request) == done and done["status"] == "ok"
         assert host.journal.get(key)["state"] == "completed"
         return
-    if phase in {"dispatched", "lost_ack"}:
+    if phase == "lost_ack_no_handle":
+        # As GuestWorkerSession: no handle; recovery is by stable-key status only.
+        monkeypatch.setattr(worker, "process_handle", lambda _call: None)
+    if phase != "running":
         monkeypatch.setattr(worker, "start", gated_start)
     outcome = {}
     thread = threading.Thread(target=lambda: outcome.setdefault("result", host.execute(request)))
@@ -295,6 +298,54 @@ def test_cancellation_intent_survives_every_dispatch_phase(broker, monkeypatch, 
     assert not marker.exists(), "accepted cancellation let the command mutate the guest"
     for event in host.events:
         validate("event", event)
+
+
+@pytest.mark.parametrize("evidence", ["completed", "unavailable"])
+def test_pending_cancel_after_lost_ack_without_handle_keeps_honest_evidence(broker, monkeypatch, evidence):
+    """Status-only recovery with a pending cancel: completed stays completed; no evidence stays unknown, never replayed."""
+    host, worker, tmp_path = broker
+    request = call("shell", {"command": "printf once >> count"}, f"pending-{evidence}")
+    key = {name: request[name] for name in ("run_id", "session_id", "call_id", "argument_digest")}
+    real_start, real_status, real_cancel = worker.start, worker.status, worker.cancel
+    starts, cancellations = [], []
+    entered, release = threading.Event(), threading.Event()
+
+    def gated_start(value):
+        starts.append(value["call_id"])
+        entered.set()
+        assert release.wait(10)
+        real_start(value)
+        deadline = time.monotonic() + 4
+        while real_status(key)["state"] != "completed":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        if evidence == "unavailable":
+            monkeypatch.setattr(worker, "status", lambda _key: (_ for _ in ()).throw(ConnectionError("status outage")))
+        raise ConnectionError("start acknowledgement lost after crossing the worker boundary")
+
+    monkeypatch.setattr(worker, "process_handle", lambda _call: None)
+    monkeypatch.setattr(worker, "start", gated_start)
+    monkeypatch.setattr(worker, "cancel", lambda value, how="terminate": cancellations.append(value) or real_cancel(value, how=how))
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.setdefault("result", host.execute(request)))
+    thread.start()
+    try:
+        assert entered.wait(4)
+        assert host.cancel(request)["error_code"] == "cancellation_pending"
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    result = outcome["result"]
+    if evidence == "completed":
+        assert result["status"] == "ok" and host.journal.get(key)["state"] == "completed"
+        assert result == real_status(key)["result"]
+        assert host._cancel_intent == set()
+    else:
+        assert result["status"] == "unknown" and host.journal.get(key)["state"] == "unknown"
+        assert host.execute(request) == result
+    assert cancellations == [] and starts == [request["call_id"]]
+    assert (tmp_path / "guest" / "count").read_text() == "once"
 
 
 def test_cancel_reconciliation_never_overwrites_the_collected_terminal_result(broker, monkeypatch):
