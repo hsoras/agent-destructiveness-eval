@@ -258,10 +258,12 @@ python3 scripts/migration/orchestrate.py resume --max-workers 2 --approved-execu
 These commands are documentation only and were not executed for this infrastructure task.
 
 
-Scoped Gemini execution repair is under verification on `infra/gemini-worker-fix`.
-See [the execution status and retained evidence](GEMINI_WORKER_DIAGNOSIS.md).
-The opt-in project policy and dedicated Docker broker are disabled in the shipped
-provider configuration. Do not enable them for migration until the real scoped
-worker smoke proves Python/pytest/build execution, protected filesystem boundaries,
-guest build/run, coordinator commit and independent review. A successful trusted
-Docker precheck or unit suite does not certify Gemini readiness.
+Gemini scoped execution passed a genuine disposable edit/unittest/pytest/make,
+protected-path, Docker guest, coordinator-commit and independent Sol review smoke.
+See [the verified diagnosis, receipts and safe reload procedure](GEMINI_WORKER_DIAGNOSIS.md).
+Use `providers-gemini-scoped.json` only by an explicit operator rollout; the existing
+provider/runtime configuration is unchanged. Run the coordinator in an authorized
+host environment while `agy --sandbox` protects workers. Shared Git and privileged
+integration checks remain coordinator-owned; Luna fallback and independent review
+remain mandatory. Docker worker access is only through the bounded broker with an
+explicitly prepared isolated guest and approved fixed context/recipe.

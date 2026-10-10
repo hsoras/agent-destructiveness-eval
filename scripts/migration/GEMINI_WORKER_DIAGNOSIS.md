@@ -1,102 +1,224 @@
-# Gemini worker diagnosis, 2026-10-09
+# Gemini worker diagnosis and verified repair, 2026-10-09
 
-Gemini implementation readiness is **not established**. The real worker edited a
-Python file correctly, but did not run its test or produce a commit. This patch
-hardens diagnosis and fallback; it does not claim to repair account permissions.
+Gemini 3.8 Flash Medium completed a genuine isolated source edit, unittest, pytest,
+Makefile build, protected-write negative tests, Docker guest build/run, structured
+handoff, trusted coordinator commit, independent Sol Medium approval, and
+idempotent recovery. No migration state or Boss checkout was changed or merged.
+The verified report is
+`/private/tmp/gemini-scoped-verified-e2e-20261009/report.json`.
 
-## Follow-up execution repair status
+## Root causes and repair
 
-The execution repair is still **unverified and disabled by default**. The following
-work remains on the isolated branch after `d19ef56`; do not enable the scoped route
-or claim Gemini readiness based on the coordinator-only Docker result.
+The recorded failure was execution policy and filesystem scope, not authentication
+or demonstrated quota exhaustion. The global rules did not allow the absolute
+project Python/test commands. The virtualenv executable additionally resolves to
+`/Users/sarosh/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/bin/python3.11`,
+outside the virtualenv. Exact command grants and narrow read-only mounts for both
+the virtualenv and resolved runtime are necessary. A plain `python3` grant does
+not match the absolute executable. Ask/Deny retain precedence over Allow.
 
-- `worker_environment.py` creates a fresh UUID project with one task workspace,
-  exact development argv grants, read-only virtualenv **and resolved runtime**
-  dependencies, protected Git/evidence paths, and explicit broker queue access.
-  It never modifies global/shared settings or an existing project. Python, pytest,
-  make, and normal npm development targets are eligible; privileged checks remain
-  coordinator-only. Every original mandatory coordinator check remains intact.
-- `job.py` checks localhost initialization in its existing execution environment,
-  forces the internal sandbox, records the selected project and exact launch argv,
-  requires structured results, and preserves a terminal receipt even when guest
-  cleanup fails. It does not escalate itself. The launcher must already run in an
-  operator-authorized host environment.
-- `providers.py` preserves global/shared restrictions and verifies the selected
-  UUID project bytes. CLI 1.3.2's zero-turn `/permissions` shortcut omits selected
-  project grants; actual conversation startup loads them. Any inherited
-  unsandboxed Allow grant rejects the scoped route. Observed unsandboxed Deny/Ask
-  overlap now rejects preflight rather than falsely marking commands ready.
-- Git ownership stays with `Coordinator.verify_worker`, which validates edits,
-  scope, branch/HEAD and mandatory tests before committing. The project receipt
-  identifies the private worktree Git directory (HEAD, index, commondir) and common
-  Git directory (branch ref, objects, config). Shared metadata is not mounted;
-  native and terminal Git mutation is denied. Actual subprocess protection still
-  needs the negative worker probe.
-- `docker_guest.py` exposes only fixed build/run operations over a bounded file
-  queue. The trusted coordinator uses the named isolated OrbStack machine's own
-  Docker daemon. Source descriptors are pinned without following symlinks; request
-  reads and subprocess output are bounded. Build uses a cached approved image ID
-  and no network; run has no network/mounts, read-only root, unprivileged UID,
-  dropped capabilities, no-new-privileges and CPU/memory/PID limits. No worker sees
-  a host Docker socket or unrestricted daemon command. OrbStack isolated machines
-  share its Linux kernel; this is not a separate adversarial VM.
-- `scoped_worker_smoke.py` requires actual edit/unittest/pytest/make tool evidence,
-  negative subprocess tests for Git and trusted receipts, guest build/run lineage,
-  a clean coordinator-owned task commit, structured output, independent Sol review,
-  unchanged fixture baseline and idempotent state recovery. It never merges.
+`worker_environment.py` creates a new UUID project for each attempt, with only its
+assigned worktree as a writable workspace. It selects approved Python unittest/
+pytest, make and npm development commands from the existing worker check list;
+other checks stay with the coordinator. Dependencies and trusted guest-client
+code are mounted read-only. Existing global/shared/project settings are not edited.
+`providers.py` preserves inherited restrictions and rejects every inherited
+unsandboxed Allow grant. It validates the selected project's ID, workspace and
+policy hash. CLI 1.3.2's zero-turn `/permissions` shortcut omits the selected
+project; actual conversation initialization loads it, as the real tests confirm.
 
-The first scoped E2E attempt failed with sandbox `Operation not permitted` when
-executing the virtualenv interpreter:
-`/private/tmp/gemini-scoped-e2e-20261009/report.json`. Its executable resolves outside
-`.venv`, so a narrow read-only runtime grant was added. The next disposable probe
-was then denied before execution by `unsandboxed(*)`, even though its call requested
-ordinary sandboxed Python execution:
-`/private/tmp/gemini-worker-project-probe/runtime.jsonl`. Exit 0/SUCCESS is not a
-passed test. The resolved runtime grant is therefore not yet validated.
+Adding `unsandboxed(*)` to Deny proved counterproductive in this CLI version: it
+also denied ordinary sandboxed Python. After explicit user authorization, a fresh
+disposable project without that new rule passed the real Python probe. The sandbox
+remains mandatory, and there are no unsandboxed Allow grants. A separate genuine
+bypass request was denied by the CLI permission engine despite terminal SUCCESS
+and exit 0; `/private/tmp/gemini-worker-project-probe/bypass-negative.jsonl` preserves
+that evidence. The denial parser treats this as failure, never successful work.
 
-Automatic approval review rejected a proposed fresh disposable project probe
-without that explicit Deny, stating it could weaken the worker boundary. No
-workaround was executed. User authorization was requested to test the documented
-CLI behavior with `--sandbox`, no unsandboxed Allow grants, and headless bypass
-requests denied. Until resolved, this blocks real Python and end-to-end worker
-verification. It does not establish an authentication or quota failure, or prove
-that all safe Antigravity deployments are fundamentally impossible.
+The outer coding-agent sandbox prevented CLI localhost initialization and account
+log writes. `job.py` checks localhost readiness and runs agy in the already
+operator-authorized coordinator execution environment. It never escalates itself;
+`--sandbox` still encloses worker terminal commands. Normal Codex/Luna sandboxing
+and mandatory coordinator checks remain intact.
 
-The trusted broker's actual hardened precheck passed build and run:
-`/private/tmp/gemini-broker-hardened-precheck.log`. It used only
-`gemini-worker-smoke-20261009`, daemon
-`7541c977-dd0a-4b7e-9878-c48c87bdaecd`, with no host daemon changes. This machine is
-operator-provisioned (isolated, network-isolated, SSH forwarding disabled, no
-mounts, two CPUs and 2 GiB RAM) with Docker installed and `python:3.11-slim` cached.
-Provisioning is not automatic; existing machines are never reconfigured by the
-broker. The original 79 safety cases remain; new tests cover policy/runtime
-paths, inherited restrictions, localhost failure, structured receipts, descriptor
-races, bounded I/O, container cleanup and failed project/cleanup recovery.
+Linked worktree Git metadata is outside the workspace. In the verified fixture,
+`repo/.git/worktrees/T001/{HEAD,index,commondir}` points to the shared
+`repo/.git/{config,objects,refs/heads/migration/T001-state}`. Full absolute paths are
+recorded in `worker_project.git_boundary`. Granting unrestricted shared Git access
+would expose other tasks. The worker therefore leaves edits uncommitted. Existing
+`Coordinator.verify_worker` validates scope, HEAD/branch, mandatory checks and
+JUnit evidence before creating a clean child commit. Both native and terminal
+Git mutation are denied, and the common Git directory is not mounted. Actual
+subprocess probes confirm protected Git and receipt writes are denied.
 
-After authorization, reproduce only in a fresh disposable artifact root from an
-already authorized host execution environment:
+## Docker and evidence boundaries
+
+`docker_guest.py` brokers only bounded build/run operations through a file queue.
+The worker receives request-write and response-read access, never host Docker or
+OrbStack IPC. The trusted runner addresses the explicitly named guest daemon.
+It refuses machines without isolation, isolated networking, disabled SSH forwarding,
+empty mounts, and CPU/memory limits. It uses only approved cached Python image
+IDs, fixed recipes, explicit regular source files, and no build network. Run uses
+no network/mounts, read-only root, unprivileged UID, dropped capabilities,
+no-new-privileges, and CPU/memory/PID limits. Descriptor-relative no-follow opens
+prevent source/request races; input/output limits and owned-process cancellation
+bound resource use. Failed runs remove only the session's exact container name.
+
+The prepared disposable machine is `gemini-worker-smoke-20261009`, two CPUs,
+2 GiB RAM, no mounts, no SSH forwarding; Docker daemon ID is
+`7541c977-dd0a-4b7e-9878-c48c87bdaecd`. No host daemon or unrelated machine was
+modified. OrbStack isolated machines share its Linux kernel; this is not a separate
+adversarial VM. The current broker deliberately supports the fixed cached Python
+unittest probe recipe. Arbitrary Dockerfiles, compose, privileged Docker flags,
+application integration checks and dependency/network installation are not worker
+capabilities; those remain trusted coordinator operations. Provisioning and new
+recipe/image authorization are explicit operator work, never automatic.
+
+The initial independent workflow review correctly rejected a missing coordinator
+receipt for the sandbox boundary test. That test cannot demonstrate denial in an
+unrestricted host process. The final harness separately launches it through agy
+in the same verified sandbox project, requires exactly the expected command and
+working directory, compares policy/test hashes and snapshots before/after, and
+retains a hashed coordinator control receipt. The independent Sol reviewer then
+approved all four acceptance criteria. Original normal coordinator unittest,
+pytest, make, scope, JUnit and commit checks were preserved.
+
+## Verification and limitations
+
+- Verified workflow report: `/private/tmp/gemini-scoped-verified-e2e-20261009/report.json`.
+  Task commit: `28e80718f65393780e0dec41ef37147c427f1c13`, owner trusted coordinator.
+  Only probe.py changed; fixture baseline stayed unchanged; recovery did not rewrite
+  completed state; no merge occurred.
+- Actual worker receipts: `state/tasks/T001/worker-1-exit.json` and `worker-1.jsonl`
+  under that artifact root. The structured handoff records four passing development/
+  boundary commands and both guest operations. Tool output proves execution.
+- Independent sandbox control: `state/tasks/T001/worker-1-job.json.control/receipt.json`.
+  Policy/test/log hashes and unchanged snapshots are retained; actual output is
+  `Ran 1 test` and `OK`. The final strict working-directory validator accepts all
+  six real worker commands and the one control command.
+- Guest receipt summary: `state/tasks/T001/worker-1-job.json.guest/summary.json`.
+  Build/run exit 0 with the same image, daemon and independently verified source
+  hashes; guest unittest reports one test and OK.
+- Independent workflow review: `state/tasks/T001/review-1-result.txt`.
+  All AC1–AC4 approved. Independent read-only patch review is also retained through
+  the Sol Medium review session; it found and verified fixes for races, cleanup,
+  receipt recovery and command working-directory validation. Final independent CLI
+  review approved the patch at
+  `/private/tmp/gemini-verified-infrastructure-review/result.json`. It noted the
+  failed intermediate suite at `/private/tmp/gemini-scoped-delivery-tests.log`,
+  which used a stale control fixture while Cwd validation was updated. That run
+  is retained as failed evidence, not counted as acceptance.
+- All 79 original safety cases remain, including exit-0 denial detection, genuine
+  provider-failure fallback, rejection of application-failure fallback and recovery.
+  The 96-test suite passed in 229.358 seconds at
+  `/private/tmp/gemini-scoped-authorized-tests.log`. The final expanded acceptance suite passed **97 tests in 239.937 seconds** at
+  `/private/tmp/gemini-scoped-acceptance-tests.log`; final focused checks are at
+  `/private/tmp/gemini-scoped-final-focused-tests.log` (18 passed).
+- Prior genuine Luna fallback remains preserved at
+  `/private/tmp/gemini-worker-fallback-real-20261009/report.json`. No fallback,
+  review or coordinator validation gate was removed.
+
+Reproduce only in a new disposable artifact root from an authorized host execution
+environment (this consumes model allowance):
 
 ```sh
-/path/to/python3.11 scripts/migration/scoped_worker_smoke.py \
+/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -B \
+  scripts/migration/scoped_worker_smoke.py \
   --state-dir /private/tmp/new-gemini-scoped-smoke \
   --docker-machine gemini-worker-smoke-20261009
 ```
 
-Do not update the Boss's frozen configuration, providers policy, persisted state,
-or running processes to try this. `providers.json`, `config.json` and
-`orchestrate.py` remain unchanged. Keep Luna fallback and independent review.
-The integration/reload instructions below describe the existing diagnostic
-commit; **do not integrate or activate this unverified execution repair yet**.
-Independent read-only GPT-6.1 Sol Medium review found no remaining code blockers
-in its final pass; it explicitly withheld Gemini readiness approval pending real
-worker filesystem probes and the full E2E. The last full test run is retained at
-`/private/tmp/gemini-scoped-final-tests.log` (95 tests, 229.129 seconds, all 79
-existing safety cases included); the latest 17 focused scoped/broker
-checks pass, including cancellation during an active operation and skipping queued
-requests. The real final file-queue precheck passed at
-`/private/tmp/gemini-broker-queue-final.log` with build and run receipts at
-`/private/tmp/gemini-broker-queue-final/queue/summary.json`. These remain trusted
-coordinator checks, not Gemini worker successes.
+No purchases, API keys, billing settings or global permissions were changed.
+A collaboration Sol review hit its usage limit; the final cached CLI Sol Medium
+review completed and approved without purchases. Gemini calls completed successfully.
+Remaining subscription allowance and billing-plan identity are unknown. Proven
+readiness applies to this installed CLI/account/runtime and scoped workflow;
+new dependencies, build tools or Docker recipes need their own narrow grants and
+verification. Protected tests are immutable controls, not an assertion that arbitrary
+repository code is safe for unrestricted trusted-host execution.
+
+## Safe integration and coordinator reload — operator only
+
+The patch keeps `providers.json`, `config.json` and `orchestrate.py` unchanged.
+`providers-gemini-scoped.json` is a separate opt-in routing file with scoped
+permissions enabled; it retains Luna fallback and Sol Medium review. It does not
+silently enable a Docker guest for real migration tasks. Use the broker only for
+an explicitly configured, reviewed disposable guest context.
+
+1. Let current workers/reviewers reach terminal receipts and the coordinator release
+   its lock. Preserve the Boss's local edits. If scheduling must be stopped, the
+   operator stops only its confirmed coordinator PID gracefully at a safe boundary;
+   never kill detached jobs, clear locks/state, or alter active task worktrees.
+2. Review and cherry-pick the isolated infrastructure commits into the selected
+   coordinator source checkout. Apply only commits not already integrated: diagnostic
+   `d19ef56`, gated environment/broker `6eec0f1`, and the final verified commit listed
+   in the delivery. Do not reset/rebase the Boss's branches or merge this branch
+   automatically. Run the full suite from that patched source:
+
+   ```sh
+   /Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -B \
+     -m unittest discover -s scripts/migration -p 'test_*.py' -v
+   ```
+
+3. Preserve the original frozen config at
+   `/Users/sarosh/programming/agent-destructiveness-eval/scripts/migration/config.json`.
+   Its digest matches the state's recorded
+   `8f94916d48bbed5437079b2ba5abcac61b89653bfac7f0fa2ae9522e3901361d`
+   after the same `{repo}` Python-path expansion used by the coordinator. An initial
+   raw-JSON comparison omitted that expansion and incorrectly suggested mismatch;
+   the normalized read-only check corrected this. Reverify before restart:
+
+   ```sh
+   /Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -B - /Users/sarosh/programming/agent-destructiveness-eval/scripts/migration/config.json <<'PYCONFIG'
+   import hashlib, json, sys
+   from pathlib import Path
+   state = json.loads(Path('/Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator/state.json').read_text())
+   config = json.loads(Path(sys.argv[1]).read_text())
+   config['python'] = config['python'].replace('{repo}', state['repo'])
+   assert hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest() == state['config_digest'], 'Frozen config mismatch; do not resume'
+   print('Frozen config verified')
+   PYCONFIG
+   ```
+
+4. Processes do not hot-reload. After safe shutdown and integration, the operator
+   performs read-only status with the patched source, the same repository/state/
+   frozen config, and either the unchanged original providers policy or an explicit
+   switch to the new scoped policy. Pending jobs retain their stored commands/routes.
+   The activation command is:
+
+   ```sh
+   /Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -B \
+     /patched/coordinator/source/scripts/migration/orchestrate.py status \
+     --repo /Users/sarosh/programming/agent-destructiveness-eval \
+     --state-dir /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator \
+     --config /Users/sarosh/programming/agent-destructiveness-eval/scripts/migration/config.json \
+     --providers-config /patched/coordinator/source/scripts/migration/providers-gemini-scoped.json
+   ```
+
+   Preserve the recorded workspace root
+   `/Users/sarosh/programming/.agent-destructiveness-eval-migration-worktrees`.
+   Do not move/recreate worktrees, repair real tasks, overwrite original providers
+   files, or rewrite frozen input/config digests merely to enable this patch.
+5. Only the Boss/operator with migration execution authority resumes, from a host
+   environment permitting localhost and account-local CLI initialization:
+
+   ```sh
+   /Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -B \
+     /patched/coordinator/source/scripts/migration/orchestrate.py resume \
+     --repo /Users/sarosh/programming/agent-destructiveness-eval \
+     --state-dir /Users/sarosh/programming/agent-destructiveness-eval/.git/migration-orchestrator \
+     --config /Users/sarosh/programming/agent-destructiveness-eval/scripts/migration/config.json \
+     --providers-config /patched/coordinator/source/scripts/migration/providers-gemini-scoped.json \
+     --max-workers 1 --approved-execution
+   ```
+
+   Substitute only the selected patched source path and preserve explicitly chosen
+   existing concurrency. Resolve reported existing blockers through the established
+   audited recovery procedure; do not use `run` to start over or automatically
+   relaunch a persisted uncertain/partial attempt. Mandatory reviews, integration
+   checks and wave validation remain authoritative. These are operator instructions;
+   no migration status/resume/repair action was executed during this infrastructure
+   task, and no matching coordinator process was signaled or restarted.
 
 ## Historical evidence for diagnostic commit d19ef56
 

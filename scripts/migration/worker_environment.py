@@ -76,7 +76,7 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
     if client_commands:
         grants.append('read_file('+str(Path(__file__).resolve().parent)+')')
     # Dependencies are read-only; they are not added as writable workspace folders.
-    for argv in allowed:
+    for argv in [*allowed, *client_commands]:
         executable = Path(argv[0])
         if executable.is_absolute():
             dependencies = executable.parent.parent if executable.parent.name == 'bin' else executable.parent
@@ -84,7 +84,10 @@ def create_project(cwd, commands, *, client_commands=(), protected=(),
             resolved = executable.resolve()
             runtime = resolved.parent.parent if resolved.parent.name == 'bin' else resolved.parent
             grants.append('read_file('+str(runtime)+')')
-    denies = ['unsandboxed(*)', 'command(sudo)', 'command(git)', 'command(git add)', 'command(git commit)', 'command(git push)',
+    # CLI 1.3.2 treats unsandboxed Deny rules as ordinary-command denials too.
+    # Keep --sandbox forced and reject all inherited unsandboxed Allow grants;
+    # the CLI's default/headless policy rejects requests to bypass the sandbox.
+    denies = ['command(sudo)', 'command(git)', 'command(git add)', 'command(git commit)', 'command(git push)',
               'command(git reset)', 'command(git checkout)', 'command(git switch)',
               'command(docker)', 'command(orb)',
               'write_file('+boundary['common_git_dir']+')',

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import runpy
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,34 @@ from providers import effective_permissions, permission_preflight
 
 
 class ScopedWorkerTests(unittest.TestCase):
+    def test_boundary_control_requires_exact_command_and_immutable_test(self):
+        from scoped_worker_smoke import boundary_control
+        from orchestrate import Stop
+        command=['python3','-B','-m','unittest','-v','test_boundary']
+        for mode in ('pass','wrong_command','wrong_cwd','missing_init','test_modified','exit_zero_denial'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary);test=root/'test_boundary.py';test.write_text('# immutable\n')
+                job=dict(job_path=str(root/'job.json'),cwd=str(root),model='gemini-3.8-flash-medium',route={})
+                outcome=dict(worker_project=dict(id='disposable',sha256='policy hash'))
+                actual=command if mode!='wrong_command' else ['echo','forged output']
+                events=[dict(event='init',init=dict(cwd=str(root))),
+                    dict(event='step_update',step_update=dict(state='DONE',step_type='tool',tool_name='run_command',
+                    tool_info=dict(parameters=dict(CommandLine=shlex.join(actual)),output='test_protected_writes_denied ... ok\nRan 1 test\nOK\n'))),
+                    dict(event='result',result=dict(status='SUCCESS',response='done'))]
+                if mode=='exit_zero_denial':events[-1]['result']['denied_actions']=[dict(action='command')]
+                if mode=='wrong_cwd':events[1]['step_update']['tool_info']['parameters']['Cwd']='/elsewhere'
+                if mode=='missing_init':events=events[1:]
+                process=subprocess.CompletedProcess([],0,'\n'.join(json.dumps(e) for e in events),'')
+                def run(*args,**kwargs):
+                    self.assertIn('--sandbox',args[0]);self.assertNotIn('--dangerously-skip-permissions',args[0])
+                    if mode=='test_modified':test.write_text('# changed\n')
+                    return process
+                with patch('scoped_worker_smoke.selected_project_policy'), patch(
+                        'scoped_worker_smoke.snapshot',return_value={}), patch('scoped_worker_smoke.bounded_process',side_effect=run):
+                    if mode=='pass':self.assertTrue(boundary_control(job,outcome,command,root)['passed'])
+                    else:
+                        with self.assertRaises(Stop):boundary_control(job,outcome,command,root)
+
     def test_project_failure_and_cleanup_failure_still_write_fallback_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary).resolve(); path=root/'job.json'
@@ -76,6 +105,8 @@ class ScopedWorkerTests(unittest.TestCase):
             actual=Path(sys.executable).resolve().parent.parent
             self.assertIn('read_file('+str(actual)+')',rules['allow'])
             self.assertNotIn('write_file('+str(actual)+')',rules['allow'])
+            self.assertFalse(any(rule.startswith('unsandboxed(') for rule in rules['allow']))
+            self.assertNotIn('unsandboxed(*)',rules['deny'])
             self.assertIn('write_file('+str(repo/'.git')+')',rules['deny'])
             self.assertIn('write_file('+str(root/'receipt.json')+')',rules['deny'])
             self.assertEqual(project['git_boundary']['common_git_dir'],str(repo/'.git'))

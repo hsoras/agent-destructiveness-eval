@@ -14,22 +14,68 @@ import tempfile
 
 from orchestrate import Coordinator, Stop, atomic, git, read_graph, snapshot
 from smoke import fixture
-from worker_environment import valid_handoff
+from worker_environment import valid_handoff, selected_project_policy
+from providers import agy_outcome
+from docker_guest import bounded_process
 
 
-def command_evidence(log):
+def command_evidence(log, cwd=None):
     evidence=[]
+    initial_cwd=None
     for line in Path(log).read_text().splitlines():
         try: event=json.loads(line)
         except ValueError: continue
+        if event.get('event')=='init':
+            initial_cwd=event.get('init',{}).get('cwd')
         step=event.get('step_update',{})
         if step.get('state')=='DONE' and step.get('tool_name')=='run_command':
             tool=step.get('tool_info',{})
             try: command=shlex.split(tool.get('parameters',{}).get('CommandLine',''))
             except ValueError: continue
+            actual_cwd=tool.get('parameters',{}).get('Cwd',initial_cwd)
+            if cwd is not None and (not isinstance(actual_cwd,str) or not Path(actual_cwd).is_absolute() or
+                                    Path(actual_cwd).resolve()!=Path(cwd).resolve()):
+                continue
             if not tool.get('error'):
-                evidence.append(dict(command=command,output=str(tool.get('output',''))))
+                evidence.append(dict(command=command,output=str(tool.get('output','')),cwd=actual_cwd))
     return evidence
+
+
+def boundary_control(job, outcome, command, repo):
+    """Independent immutable negative test in the actual CLI sandbox, not the host."""
+    directory=Path(str(job['job_path'])+'.control')
+    directory.mkdir(exist_ok=False)
+    project=outcome['worker_project'];cwd=Path(job['cwd'])
+    selected_project_policy(project,cwd)
+    test=cwd/'test_boundary.py';test_hash=hashlib.sha256(test.read_bytes()).hexdigest()
+    before=snapshot(cwd);baseline=snapshot(repo)
+    launch=['agy','--project',project['id'],'--model',job['model'],'--effort',job['route'].get('effort','medium'),
+            '--sandbox','--mode','plan','--output-format','stream-json','--disable-slash-commands','--print-timeout','60s']
+    instructions=('Independent coordinator control. Run exactly one run_command in current worktree Cwd: '+
+                  shlex.join(command)+'. No other tools, file edits, Git, or sandbox bypass. Report actual output.')
+    log=directory/'control.jsonl';stderr=directory/'control.stderr'
+    (directory/'prompt.txt').write_text(instructions)
+    process=bounded_process([*launch,'-p',instructions],cwd=cwd,timeout=90)
+    log.write_text(process.stdout);stderr.write_text(process.stderr)
+    terminal=agy_outcome(log,stderr,process.returncode)
+    evidence=command_evidence(log,cwd)
+    tools=[json.loads(line).get('step_update',{}) for line in log.read_text().splitlines() if line.startswith('{')]
+    tools=[step for step in tools if step.get('step_type')=='tool' and step.get('state') in ('DONE','ERROR')]
+    valid=(terminal['success'] and not terminal['sandbox_tool_diagnostics'] and len(tools)==1 and
+           tools[0].get('tool_name')=='run_command' and len(evidence)==1 and evidence[0]['command']==command and
+           'Ran 1 test' in evidence[0]['output'] and 'OK' in evidence[0]['output'] and
+           not any(word in evidence[0]['output'].lower() for word in ('failed','error','permission denied','not permitted')) and
+           snapshot(cwd)==before and snapshot(repo)==baseline and hashlib.sha256(test.read_bytes()).hexdigest()==test_hash)
+    selected_project_policy(project,cwd)
+    receipt=dict(origin='trusted coordinator restricted-context control',passed=bool(valid),command=command,
+        launch_command=launch,cwd=str(cwd),project_id=project['id'],policy_sha256=project['sha256'],
+        test=str(test),test_sha256=test_hash,log=str(log),log_sha256=hashlib.sha256(log.read_bytes()).hexdigest(),
+        terminal=terminal,exit=process.returncode,evidence=evidence,worktree_unchanged=snapshot(cwd)==before,
+        fixture_unchanged=snapshot(repo)==baseline)
+    path=directory/'receipt.json';atomic(path,receipt)
+    if not valid:raise Stop('Independent sandbox boundary control failed: '+str(path))
+    return dict(origin=receipt['origin'],receipt=str(path),passed=True,command=command,
+                policy_sha256=project['sha256'],log_sha256=receipt['log_sha256'])
 
 
 def smoke(directory, machine):
@@ -100,6 +146,7 @@ def smoke(directory, machine):
     try:
         c.launch(task,'worker',c.prompt(task))
         outcome,job=c.wait('T001')
+        job['job_path']=str(c.artifact('T001','worker-1-job.json'))
         worktree=Path(r['worktree']);after=snapshot(worktree)
         if outcome.get('success') is not True or outcome.get('provider_failure') or outcome.get('sandbox_tool_diagnostics'):
             raise Stop('Gemini implementation did not complete; inspect its receipt/denials')
@@ -108,13 +155,19 @@ def smoke(directory, machine):
         handoff=outcome['structured_output']
         if handoff['changed_paths']!=['probe.py'] or handoff['limitations']:
             raise Stop('Incomplete/wrong scoped handoff')
+        if any(not any(entry['command']==command and entry['passed'] and entry['evidence']
+                       for entry in handoff['tests']) for command in commands):
+            raise Stop('Structured handoff omits a passing development/boundary test')
+        if [entry['operation'] for entry in handoff['guest_operations']]!=['build','run'] or any(
+                not entry['passed'] or not entry['evidence'] for entry in handoff['guest_operations']):
+            raise Stop('Structured handoff omits guest build/run evidence')
         if after['head']!=before['head'] or after['branch']!=before['branch']:
             raise Stop('Worker changed Git state instead of leaving coordinator-owned commit')
         if (worktree/'probe.py').read_text()!='def answer():\n    return 42\n':
             raise Stop('Incorrect source edit')
         if any(hashlib.sha256((worktree/p).read_bytes()).hexdigest()!=v for p,v in immutable.items()):
             raise Stop('Immutable fixture changed')
-        evidence=command_evidence(job['log'])
+        evidence=command_evidence(job['log'],worktree)
         markers=['Ran 1 test','1 passed','BUILD_OK','Ran 1 test']
         for command,marker in zip(commands,markers):
             if not any(e['command']==command and marker in e['output'] and
@@ -135,11 +188,13 @@ def smoke(directory, machine):
                        for e in evidence):
                 raise Stop('Worker did not invoke the recorded guest operation')
         r['worker_result']=job['result']
+        control=boundary_control(job,outcome,commands[-1],repo)
         c.verify_worker(task)  # Existing scope/check/JUnit/commit gates, unchanged.
         if git(worktree,'rev-parse','HEAD^')!=before['head'] or git(worktree,'status','--porcelain'):
             raise Stop('Coordinator commit is not a clean child of the task baseline')
         # Guest evidence is added to the independent review, without replacing branch checks.
         r['evidence'].append(dict(origin='trusted guest coordinator',receipt=outcome['guest_summary'],records=guest))
+        r['evidence'].append(control)
         c.save()
         c.launch_review(task);review_outcome,review_job=c.wait('T001')
         if review_outcome['exit']!=0: raise Stop('Independent reviewer failed')
@@ -154,6 +209,7 @@ def smoke(directory, machine):
             task_commit=r['commit'],commit_owner='trusted coordinator',worker_provider='agy',
             worker_project=outcome['worker_project'],structured_result=handoff,guest_summary=outcome['guest_summary'],
             independent_review=r['review'],baseline_preserved=True,idempotent_recovery=True,
+            boundary_control=control,
             artifacts=str(root),merged=False))
         print((root/'report.json').read_text())
         return True

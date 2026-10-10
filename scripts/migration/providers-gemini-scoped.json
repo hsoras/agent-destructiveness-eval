@@ -1,0 +1,21 @@
+{
+  "primary": {
+    "backend": "agy",
+    "model": "gemini-3.8-flash-medium",
+    "effort": "medium",
+    "check_permissions": true,
+    "scoped_worker_permissions": true
+  },
+  "fallback": {
+    "backend": "codex",
+    "model": "gpt-6-luna",
+    "effort": "medium"
+  },
+  "reviewer": {
+    "backend": "codex",
+    "model": "gpt-6.1-sol",
+    "effort": "medium"
+  },
+  "mixed_parallel": true,
+  "preflight_seconds": 30
+}

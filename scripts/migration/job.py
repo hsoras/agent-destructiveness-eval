@@ -33,7 +33,7 @@ try:
         if readiness['ready'] and job['route'].get('scoped_worker_permissions'):
             clients = []
             protected = [job_path, job['prompt'], job['receipt'], job['result'], job['log'], job['stderr'],
-                         str(job_path)+'.preflight.json']
+                         str(job_path)+'.preflight.json', str(job_path)+'.control']
             if job['route'].get('docker_guest'):
                 from docker_guest import GuestBroker
                 guest = GuestBroker(job['cwd'], str(job_path)+'.guest', job['route']['docker_guest'])

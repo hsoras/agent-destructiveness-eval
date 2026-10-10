@@ -26,11 +26,11 @@ from orchestrate import atomic
 from worker_environment import EnvironmentUnavailable
 
 
-def bounded_process(command, data=None, timeout=120, limit=262144, cancel=None):
+def bounded_process(command, data=None, timeout=120, limit=262144, cancel=None, cwd=None):
     """Cap both output streams and terminate only our subprocess group on failure."""
     output = {"stdout": bytearray(), "stderr": bytearray()}
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, start_new_session=True)
+                               stderr=subprocess.PIPE, start_new_session=True, cwd=cwd)
     payload = memoryview(data or b'')
     offset = 0
     reason = None
