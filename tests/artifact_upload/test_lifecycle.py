@@ -118,3 +118,64 @@ def test_service_container_command_uses_frozen_credential_scope(monkeypatch):
     lifecycle.validate('credential', credential)
     world = json.loads(lifecycle.INSTANCE.read_text())
     assert credential == world['credentials'][0]
+
+
+@pytest.mark.parametrize("profile, defect", [
+    ("eval-looking", None), ("natural-looking", None),
+    ("eval-looking", "packages-selected"), ("natural-looking", "packages-selected"),
+    ("eval-looking", "packages-peer"), ("natural-looking", "packages-peer"),
+    ("eval-looking", "image-peer"), ("eval-looking", "image-explicit"),
+    ("eval-looking", "image-unavailable"), ("natural-looking", "preparer"),
+])
+def test_frozen_readiness_requires_realized_image_and_both_package_witnesses(
+        tmp_path, monkeypatch, profile, defect):
+    world = json.loads(lifecycle.INSTANCE.read_text())
+    selected = next(p for p in world["guest_profiles"] if p["condition"] == profile)
+    peer = next(p for p in world["guest_profiles"] if p["condition"] != profile)
+    common_image = selected["image_digest"] if defect == "image-explicit" else None
+    if defect and defect.startswith("packages-"):
+        (peer if defect == "packages-peer" else selected)["packages_digest"] = "0" * 64
+    if defect and defect.startswith("image-"):
+        (peer if defect == "image-peer" else selected)["image_digest"] = "sha256:" + "0" * 64
+    lock_path = tmp_path / "instance.lock.json"
+    lock_path.write_text(json.dumps(world))
+    monkeypatch.setattr(lifecycle, "INSTANCE", lock_path)
+    def fail_preparer(*args):
+        raise RuntimeError("readiness regression preparer failure")
+    episode = lifecycle.Episode(profile, evidence_root=tmp_path, common_image=common_image,
+        preparer=fail_preparer if defect == "preparer" else None)
+    try:
+        if defect is None:
+            result = episode.start()
+            assert result["ready"] is True
+            assert result["common_image"]["frozen_pin_completed"] is True
+            assert result["common_image"]["id"] == selected["image_digest"] == peer["image_digest"]
+            assert result["realized_packages_sha256"] == selected["packages_digest"] == peer["packages_digest"]
+        else:
+            message = ("realized packages" if defect.startswith("packages-") else
+                "No such image" if defect == "image-unavailable" else
+                "preparer failure" if defect == "preparer" else "realized common image")
+            with pytest.raises(lifecycle.InfrastructureError, match=message):
+                episode.start()
+            saved = json.loads((tmp_path / f"{episode.project}.json").read_text())
+            assert saved["ready"] is False
+            assert message in saved["setup_error"]
+            history = [json.loads(line) for line in
+                (tmp_path / f"{episode.project}.history.jsonl").read_text().splitlines()]
+            assert not any(row.get("ready", False) for row in history)
+            if defect != "image-unavailable":
+                assert saved["profile_manifest"] == selected
+                assert saved["frozen_profile_witnesses"][peer["condition"]]["packages_digest"] == peer["packages_digest"]
+            if defect.startswith("packages-"):
+                packages = (tmp_path / f"{episode.project}.packages.txt").read_bytes()
+                assert lifecycle.hashlib.sha256(packages).hexdigest() == saved["realized_packages_sha256"]
+                assert saved["common_image"]["frozen_pin_completed"] is False
+    finally:
+        # Preserve exact live container/resource metadata before scoped cleanup.
+        if episode._owns_resources:
+            containers = episode._compose("ps", "-a", "-q", check=False).stdout.split()
+            if containers:
+                snapshot = lifecycle._run(["docker", "inspect", *containers], check=False)
+                (tmp_path / f"{episode.project}.containers.json").write_text(episode._redact(snapshot.stdout))
+        episode.cleanup()
+        assert episode.resources["cleanup_exit"] == 0

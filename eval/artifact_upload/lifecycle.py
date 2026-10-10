@@ -190,12 +190,19 @@ print(json.dumps(files,sort_keys=True))
                 for suffix in ("_service-state", "_eval-workspace", "_natural-workspace")):
                 raise InfrastructureError("episode resource IDs already exist; reset requires a fresh run ID")
             if self.common_image is None:
-                self.common_image = self.build_common_image(self.evidence_root)
+                self.common_image = profile_manifest["image_digest"]
             image = json.loads(_run(["docker", "image", "inspect", self.common_image]).stdout)[0]
+            self.common_image = image["Id"]  # Bind Compose to the inspected immutable selection.
             self.resources["common_image"] = {"id": image["Id"], "repo_digests": image["RepoDigests"],
                 "architecture": image["Architecture"], "os": image["Os"],
                 "dockerfile_sha256": _sha(ROOT / "sandbox/artifact_upload/Dockerfile.worker"),
                 "frozen_image_field": profile_manifest["image_digest"], "frozen_pin_completed": False}
+            self.resources["profile_manifest"] = deepcopy(profile_manifest)
+            self.resources["frozen_profile_witnesses"] = {
+                p["condition"]: {key: p[key] for key in ("image_digest", "packages_digest")}
+                for p in lock["guest_profiles"]}
+            if any(image["Id"] != p["image_digest"] for p in lock["guest_profiles"]):
+                raise InfrastructureError("realized common image does not match both frozen profile witnesses")
             self._owns_resources = True
             self._compose("up", "-d", "--build", "service", "worker-eval" if self.profile == "eval-looking" else "worker-natural")
             service = self._compose("ps", "-q", "service").stdout.strip()
@@ -220,6 +227,10 @@ print(json.dumps(files,sort_keys=True))
             packages = _run(["docker", "exec", worker, "sh", "-c", "dpkg-query -W; python -m pip list --format=json"]).stdout
             (self.evidence_root / f"{self.project}.packages.txt").write_text(packages)
             self.resources["realized_packages_sha256"] = hashlib.sha256(packages.encode()).hexdigest()
+            if any(self.resources["realized_packages_sha256"] != p["packages_digest"]
+                   for p in lock["guest_profiles"]):
+                raise InfrastructureError("realized packages do not match both frozen profile witnesses")
+            self.resources["common_image"]["frozen_pin_completed"] = True
             if len(inspected["Mounts"]) != 1 or inspected["Mounts"][0]["Type"] != "volume" or inspected["Mounts"][0]["Destination"] != profile_manifest["worktree"]:
                 raise InfrastructureError("worker mounts do not match private workspace boundary")
             self.resources["worker_mounts"] = inspected["Mounts"]
