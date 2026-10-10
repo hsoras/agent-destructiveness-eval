@@ -273,8 +273,79 @@ class Coordinator:
         atomic(self.file, self.state)
 
     def repair_limit(self, record):
-        return 1 + self.config['max_repairs'] + sum(
-            entry['additional_attempts'] for entry in record.get('repair_authorizations', []))
+        limit = 1 + self.config['max_repairs']
+        authorizations = record.get('repair_authorizations', [])
+        if not isinstance(authorizations, list):
+            raise Stop('Malformed repair authorization history')
+        for entry in authorizations:
+            if not isinstance(entry, dict):
+                raise Stop('Malformed repair authorization history')
+            grant = entry.get('additional_attempts')
+            previous, new = entry.get('previous_limit'), entry.get('new_limit')
+            attempt = entry.get('attempt_at_authorization')
+            when = entry.get('time')
+            if (not isinstance(grant, int) or isinstance(grant, bool) or not 1 <= grant <= 2 or
+                    not isinstance(previous, int) or isinstance(previous, bool) or previous != limit or
+                    not isinstance(new, int) or isinstance(new, bool) or new != previous + grant or
+                    not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < previous or attempt >= new or
+                    not isinstance(when, (int, float)) or isinstance(when, bool) or
+                    not math.isfinite(when) or when <= 0):
+                raise Stop('Inconsistent repair authorization budget history')
+            if ('terminal_repair_consumed' in entry and
+                    not isinstance(entry['terminal_repair_consumed'], bool)):
+                raise Stop('Malformed terminal repair consumption marker')
+            limit = new
+        if limit > 1 + self.config['max_repairs'] + MAX_ADDITIONAL_REPAIRS:
+            raise Stop('Cumulative additional repair budget exceeded')
+        return limit
+
+    def _current_dirty_repair_authorization(self, task_id, record, authorizations):
+        """Validate retained grant history, then select its sole current unconsumed grant."""
+        if not isinstance(authorizations, list):
+            raise Stop('Malformed repair authorization history')
+        history = record.get('repair_authorizations', [])
+        if not isinstance(history, list) or any(not isinstance(item, dict) or item.get('task') != task_id for item in history):
+            raise Stop('Repair authorization history task mismatch')
+        self.repair_limit(record)
+        terminal_history = [item for item in history if 'terminal_check_repair' in item]
+        if any(not isinstance(item.get('terminal_check_repair'), dict) or
+               item.get('phase') is not None for item in terminal_history):
+            raise Stop('Malformed historical terminal repair authorization')
+        attempt = record.get('attempt')
+        if not isinstance(attempt, int) or isinstance(attempt, bool):
+            raise Stop('Dirty terminal repair authorization attempt mismatch')
+        candidates = [item for item in terminal_history
+                      if item.get('attempt_at_authorization') == attempt and
+                      item.get('terminal_repair_consumed', False) is False]
+        if len(candidates) != 1:
+            raise Stop('Dirty terminal repair requires exactly one current authorization')
+        entry = candidates[0]
+        if not isinstance(entry.get('terminal_repair_consumed', False), bool):
+            raise Stop('Malformed terminal repair consumption marker')
+        attempt = record.get('attempt')
+        granted_at = entry.get('attempt_at_authorization')
+        if (not isinstance(attempt, int) or isinstance(attempt, bool) or
+                not isinstance(granted_at, int) or isinstance(granted_at, bool) or granted_at != attempt):
+            raise Stop('Dirty terminal repair authorization attempt mismatch')
+        consumed = entry.get('terminal_repair_consumed', False)
+        if not isinstance(consumed, bool) or consumed:
+            raise Stop('Dirty terminal repair authorization is consumed or malformed')
+        if entry.get('phase') is not None:
+            raise Stop('Malformed dirty terminal repair authorization')
+        if not isinstance(entry.get('terminal_check_repair'), dict):
+            raise Stop('Dirty terminal repair authorization lacks terminal proof')
+        position = next(index for index, candidate in enumerate(history) if candidate is entry)
+        expected_previous = 1 + self.config['max_repairs']
+        for prior in history[:position]:
+            expected_previous = prior['new_limit']
+        if entry['previous_limit'] != expected_previous:
+            raise Stop('Dirty terminal repair grant does not follow the authorization chain')
+        grant = entry['additional_attempts']
+        if entry['new_limit'] != entry['previous_limit'] + grant or not entry['previous_limit'] <= attempt < entry['new_limit']:
+            raise Stop('Dirty terminal repair grant has inconsistent bounds')
+        if entry['new_limit'] > 1 + self.config['max_repairs'] + MAX_ADDITIONAL_REPAIRS:
+            raise Stop('Dirty terminal repair grant exceeds the cumulative ceiling')
+        return entry
 
     def authorize_repairs(self, task_id, additional_attempts, reason, execution_guidance=None):
         """Record a bounded, task-specific extension without changing frozen run inputs."""
@@ -327,8 +398,10 @@ class Coordinator:
 
     def _terminal_check_repair_evidence(self, task_id, record):
         """Verify the narrow retained evidence path for a worker stopped at branch checks."""
-        if record.get('commit') or record.get('review') or record.get('gate_commit'):
-            raise Stop('Terminal branch-check repair requires an uncommitted, unreviewed worker')
+        if record.get('review') or record.get('gate_commit'):
+            raise Stop('Terminal branch-check repair requires an unreviewed worker without a gate commit')
+        if record.get('commit') and record.get('commit') != git(record['worktree'], 'rev-parse', 'HEAD'):
+            raise Stop('Terminal worker commit no longer matches its current branch HEAD')
         if record.get('phase') != 'worker_finished':
             raise Stop('Not a terminal worker result')
         tasks_root = self.directory / 'tasks'
@@ -478,9 +551,12 @@ class Coordinator:
         if len(matches) != 1:
             raise Stop('Blocker does not identify exactly one retained failed branch check')
         check_path, check = matches[0]
+        terminal_pytest = (check.get('exit') == 1 and not isinstance(check.get('exit'), bool) and
+                           self._terminal_pytest_failure(check, check_path, task_id, finished))
         if (check.get('origin') != 'coordinator' or check.get('passed') is not False or
-                not isinstance(check.get('exit'), int) or isinstance(check.get('exit'), bool) or check['exit'] != 2 or
-                check.get('error') or check.get('cwd') != str(Path(record['worktree']).resolve()) or
+                not isinstance(check.get('exit'), int) or isinstance(check.get('exit'), bool) or
+                (check['exit'] != 2 and not terminal_pytest) or
+                (check.get('error') and not terminal_pytest) or check.get('cwd') != str(Path(record['worktree']).resolve()) or
                 check.get('source_head') != git(record['worktree'], 'rev-parse', 'HEAD') or
                 check.get('source_snapshot_sha256') != digest(json.dumps(snapshot(record['worktree']), sort_keys=True))):
             raise Stop('Failed-check receipt does not match the current coordinator snapshot')
@@ -496,6 +572,8 @@ class Coordinator:
             argv += ['-o', 'junit_family=xunit2', '--junitxml=' + str(check_path.with_suffix('.xml'))]
         if check.get('command') != argv:
             raise Stop('Failed-check executed command does not match its frozen template')
+        if terminal_pytest and argv[1:3] != ['-m', 'pytest']:
+            raise Stop('Exit-1 repair evidence is limited to a required pytest command')
         def retained_check(raw):
             p = Path(raw)
             lexical_root = self.directory / 'checks' / f'{task_id}-branch'
@@ -524,11 +602,133 @@ class Coordinator:
         log_item = next((a for a in artifacts if Path(a.get('path', '')).resolve() == log_path), None)
         if not log_item:
             raise Stop('Failed-check log predates terminal worker completion or is unmanifested')
+        pytest_details = self._terminal_pytest_failure(check, check_path, task_id, finished) if terminal_pytest else None
         return dict(phase=record['phase'], attempt=record['attempt'], job=str(job_path),
                     job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(), receipt=str(receipt_path),
                     receipt_sha256=hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
                     check_receipt=str(check_path), check_receipt_sha256=hashlib.sha256(check_path.read_bytes()).hexdigest(),
-                    blocker=self.state.get('blocked'), snapshot_sha256=check['source_snapshot_sha256'])
+                    blocker=self.state.get('blocked'), snapshot_sha256=check['source_snapshot_sha256'],
+                    **({'pytest_failure': pytest_details} if pytest_details else {}))
+
+    def _terminal_pytest_failure(self, check, check_path, task_id, worker_finished):
+        """Classify only a retained, ordinary failed pytest run suitable for a repair."""
+        if check.get('exit') != 1 or not isinstance(check.get('exit'), int) or isinstance(check.get('exit'), bool):
+            return None
+        template = check.get('original_command')
+        if not isinstance(template, list) or len(template) < 3 or template[1:3] != ['-m', 'pytest']:
+            return None
+        if template not in self.task_checks(task_id) or check.get('cwd') != str(Path(self.state['records'][task_id]['worktree']).resolve()):
+            raise Stop('Failed pytest command or working directory is not frozen for this task')
+        error = check.get('error')
+        if not isinstance(error, str) or not error.startswith('Unapproved or duplicate pytest failure: ('):
+            return None
+        report_path = check_path.with_suffix('.xml')
+        if (report_path.is_symlink() or not report_path.is_file() or
+                not report_path.resolve().is_relative_to(check_path.parent.resolve())):
+            raise Stop('Failed pytest JUnit report is missing or escapes retained check directory')
+        artifacts = check.get('artifacts')
+        if not isinstance(artifacts, list):
+            raise Stop('Failed pytest JUnit report is absent from retained artifact manifest')
+        junit_items = [item for item in artifacts if isinstance(item, dict) and item.get('path') == str(report_path)]
+        if len(junit_items) != 1:
+            raise Stop('Failed pytest JUnit report must have one exact retained manifest entry')
+        junit_item = junit_items[0]
+        if (not isinstance(junit_item.get('bytes'), int) or isinstance(junit_item.get('bytes'), bool) or
+                not isinstance(junit_item.get('sha256'), str) or
+                not re.fullmatch(r'[0-9a-f]{64}', junit_item['sha256']) or
+                report_path.stat().st_size != junit_item['bytes'] or
+                hashlib.sha256(report_path.read_bytes()).hexdigest() != junit_item['sha256'] or
+                report_path.stat().st_mtime < worker_finished):
+            raise Stop('Failed pytest JUnit bytes, hash or completion time do not match retained manifest')
+        try:
+            root = ET.parse(report_path).getroot()
+        except (OSError, ET.ParseError) as e:
+            raise Stop('Failed pytest JUnit report is malformed') from e
+        if root.tag == 'testsuite':
+            suites = [root]
+        elif root.tag == 'testsuites' and root and all(child.tag == 'testsuite' for child in root):
+            suites = list(root)
+        else:
+            raise Stop('Failed pytest report has an unknown or malformed JUnit hierarchy')
+        cases = []
+        identities = []
+        testcase_ids = set()
+        accounted_outcomes = set()
+        totals = dict(tests=0, failures=0, errors=0, skipped=0)
+        for suite in suites:
+            if sum(1 for node in suite.iter() if node.tag == 'testsuite') != 1:
+                raise Stop('Failed pytest report has nested testsuite records')
+            suite_cases = [child for child in suite if child.tag == 'testcase']
+            if sum(1 for node in suite.iter() if node.tag == 'testcase') != len(suite_cases):
+                raise Stop('Failed pytest report has testcases outside direct suite records')
+            counts = {}
+            for key in totals:
+                raw = suite.get(key)
+                if not isinstance(raw, str) or not re.fullmatch(r'\d+', raw):
+                    raise Stop('Failed pytest report has missing or negative per-suite counts')
+                counts[key] = int(raw)
+            if not suite_cases:
+                raise Stop('Failed pytest report contains an empty testsuite')
+            suite_actual = dict(tests=len(suite_cases), failures=0, errors=0, skipped=0)
+            for case in suite_cases:
+                cases.append(case)
+                identity = (case.get('classname'), case.get('name'))
+                if not all(isinstance(part, str) and part for part in identity) or identity in testcase_ids:
+                    raise Stop('Failed pytest report has missing or duplicate testcase identities')
+                testcase_ids.add(identity)
+                outcomes = {name: case.findall(name) for name in ('failure', 'error', 'skipped')}
+                if any(len(nodes) > 1 for nodes in outcomes.values()) or sum(map(len, outcomes.values())) > 1:
+                    raise Stop('Failed pytest testcase has duplicate or conflicting outcome elements')
+                for name, nodes in outcomes.items():
+                    if nodes:
+                        accounted_outcomes.add(id(nodes[0]))
+                        suite_actual['failures' if name == 'failure' else name + ('s' if name == 'error' else '')] += 1
+                if outcomes['failure']:
+                    identities.append(f'{identity[0]}::{identity[1]}')
+            if counts != suite_actual:
+                raise Stop('Failed pytest per-suite counts do not match its testcase outcomes')
+            for key in totals:
+                totals[key] += counts[key]
+        if not cases or not identities or len(identities) != len(set(identities)):
+            raise Stop('Failed pytest report has no genuine failures or duplicate failed identities')
+        all_outcomes = [node for node in root.iter() if node.tag in ('failure', 'error', 'skipped')]
+        if len(all_outcomes) != len(accounted_outcomes) or {id(node) for node in all_outcomes} != accounted_outcomes:
+            raise Stop('Failed pytest report contains outcome elements outside testcase records')
+        if totals['errors'] or totals['skipped'] or totals['failures'] != len(identities):
+            raise Stop('Failed pytest report has collection errors, skips or incoherent failure counts')
+        if root.tag == 'testsuites':
+            for key, actual in totals.items():
+                raw = root.get(key)
+                if raw is not None and (not re.fullmatch(r'\d+', raw) or int(raw) != actual):
+                    raise Stop('Failed pytest aggregate counts do not match per-suite totals')
+        log = check.get('log')
+        log_path = Path(log) if isinstance(log, str) else Path('/')
+        if (not isinstance(log, str) or log_path.is_symlink() or not log_path.is_file() or
+                not log_path.resolve().is_relative_to(check_path.parent.resolve())):
+            raise Stop('Failed pytest log is missing')
+        log_text = Path(log).read_text(errors='replace')
+        summary = re.findall(r'(?m)^(\d+) failed, (\d+) passed in [^\n]+$', log_text)
+        if len(summary) != 1 or tuple(map(int, summary[0])) != (totals['failures'], len(cases) - totals['failures']):
+            raise Stop('Failed pytest log summary does not match retained JUnit results')
+        # Reuse the coordinator's strict pytest policy: the retained error must be
+        # exactly the parser's classification of an unapproved testcase failure.
+        exceptions = [e for e in self.config.get('baseline_exceptions', [])
+                      if [x.replace('{python}', self.config['python']) for x in e.get('command', [])] == template]
+        exception_ids = [(e.get('classname'), e.get('name')) for e in exceptions]
+        for identity in identities:
+            classname, name = identity.split('::', 1)
+            if (classname, name) in exception_ids:
+                raise Stop('Failed pytest report includes an approved baseline exception')
+        try:
+            pytest_evidence(report_path, Path(check['cwd']), 1, exceptions)
+        except Stop as e:
+            if not str(e).startswith('Unapproved or duplicate pytest failure: (') or str(e) != error:
+                raise Stop('Failed pytest receipt does not match coordinator failure policy') from e
+        else:
+            raise Stop('Pytest report contains no policy-rejected failure')
+        return dict(junit=str(report_path), junit_sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                    tests=len(cases), failures=[dict(identity=x) for x in identities],
+                    log=check.get('log'))
 
     @property
     def integration(self):
@@ -787,6 +987,118 @@ class Coordinator:
         r['phase'] = 'fallback_pending'
         self.state['blocked'] = None
         self.save()
+    def repair(self, tid, findings, confirmed_stopped=False, select_validated_primary=False, reason=None):
+        if not self.state or tid not in self.state['records']:
+            raise Stop('Unknown assigned task')
+        r = self.state['records'][tid]
+        if not findings or len(findings.strip()) < 20 or r['attempt'] >= self.repair_limit(r):
+            raise Stop('Supply targeted findings; bounded repair limit applies')
+        if any(e['findings'] == findings.strip() for e in r.get('repair_history', [])):
+            raise Stop('Repeated repair plan; consolidate findings and provide a new hypothesis')
+        if r['phase'] in ('merged', 'merge_pending', 'integration_testing', 'status_pending'):
+            raise Stop('Already integrated or uncertain merge; manual owner-scoped fix/revert required')
+        job_path = Path(r.get('job', ''))
+        pid_path = Path(str(job_path) + '.pid.json')
+        job = json.loads(job_path.read_text()) if job_path.is_file() else {}
+        child_path = Path(str(job_path) + '.child.json')
+        finished = bool(job.get('receipt') and Path(job['receipt']).exists())
+        if child_path.exists() and not finished:
+            try:
+                os.kill(json.loads(child_path.read_text())['pid'], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise Stop('Worker/reviewer child still alive; inspect it before repair')
+        if pid_path.exists() and not finished:
+            pid = json.loads(pid_path.read_text())['pid']
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise Stop('Runner still alive; wait for it, never duplicate it')
+        elif r.get('pid') and not finished:
+            try:
+                os.kill(r['pid'], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise Stop('Launch process still alive')
+        elif r['phase'].endswith('_running') and not finished and not confirmed_stopped:
+            raise Stop('Unknown launch process; inspect processes manually, then repair with --confirmed-stopped')
+        w = Path(r['worktree']) if r.get('worktree') else None
+        dirty_terminal_authorization = None
+        if w and w.exists():
+            if r.get('phase') == 'worker_finished':
+                dirty = bool(git(w, 'status', '--porcelain', '--untracked-files=all'))
+                if not dirty:
+                    clean(w)
+                else:
+                    history = r.get('repair_authorizations', [])
+                    if not isinstance(history, list):
+                        raise Stop('Malformed repair authorization history')
+                    authorizations = [entry for entry in history if isinstance(entry, dict) and
+                                      'terminal_check_repair' in entry]
+                    authorization = self._current_dirty_repair_authorization(tid, r, authorizations)
+                    proof = self._terminal_check_repair_evidence(tid, r)
+                    if proof != authorization['terminal_check_repair']:
+                        raise Stop('Retained terminal repair authorization is stale or changed')
+                    current = snapshot(w)
+                    if (current['head'] != (r['commit'] or r['base']) or current['branch'] != r['branch'] or
+                            current['index'] != hashlib.sha256(b'').hexdigest()):
+                        raise Stop('Terminal repair requires unchanged branch/HEAD and an empty index')
+                    paths = self.changed(tid)
+                    if not paths:
+                        raise Stop('Terminal repair authorization requires retained worker changes')
+                    for name in paths:
+                        path = w / name
+                        if (owns(name, list(PROTECTED)) or not owns(name, self.config['scopes'][tid]) or
+                                owns(name, self.config.get('exclusions', {}).get(tid, [])) or
+                                path.is_symlink() or (path.exists() and not path.is_file()) or
+                                (path.exists() and not path.resolve().is_relative_to(w.resolve()))):
+                            raise Stop(f'{tid}: unsafe or out-of-scope retained worker change: {name}')
+                    dirty_terminal_authorization = authorization
+            else:
+                clean(w)
+        primary_selection = None
+        if select_validated_primary:
+            if not self.routing or not self.routing.get('primary'):
+                raise Stop('No validated routing primary configured')
+            primary_route = self.routing['primary']
+            if not isinstance(primary_route, dict) or not primary_route.get('backend') or not primary_route.get('model'):
+                raise Stop('Invalid routing primary configuration')
+            if not reason or len(str(reason).strip()) < 20:
+                raise Stop('Explicit primary selection requires concrete reason or smoke artifact provenance')
+            primary_selection = dict(
+                route=dict(primary_route),
+                reason=str(reason).strip(),
+                old_route=dict(r['worker_route']) if r.get('worker_route') else None,
+            )
+        r['phase'] = 'repair_pending'
+        if dirty_terminal_authorization is not None:
+            dirty_terminal_authorization['terminal_repair_consumed'] = True
+        repair_entry = dict(
+            time=time.time(), attempt=r['attempt'],
+            commit=r['commit'], findings=findings.strip(), review=r.get('review')
+        )
+        if primary_selection:
+            repair_entry['old_route'] = primary_selection['old_route']
+            repair_entry['selected_route'] = primary_selection['route']
+            repair_entry['primary_reason'] = primary_selection['reason']
+            r.setdefault('route_history', []).append(dict(
+                time=time.time(), attempt=r['attempt'],
+                old_route=primary_selection['old_route'],
+                selected_route=primary_selection['route'],
+                reason=primary_selection['reason']
+            ))
+            r['worker_route'] = primary_selection['route']
+        r.setdefault('repair_history', []).append(repair_entry)
+        r['repair'] = findings.strip()
+        r['prior_review'] = r.get('review')
+        r['review'] = None
+        r.pop('gate_commit', None)
+        self.state['blocked'] = None
+        self.save()
 
     def wait(self, tid):
         r = self.state['records'][tid]
@@ -954,6 +1266,156 @@ class Coordinator:
                   f'Coordinator check evidence: {json.dumps(r["evidence"])}\nWorker report (untrusted): {worker_report}\n' + self.prompt(task, role='review'))
         self.launch(task, 'review', review)
 
+    def authenticate_review(self, task, job=None):
+        """Authenticate current terminal reviewer evidence for early and ordinary collection."""
+        tid = task['id']
+        r = self.state['records'][tid]
+        review_attempt = r.get('review_attempt')
+        if not isinstance(review_attempt, int) or isinstance(review_attempt, bool) or review_attempt <= 0:
+            raise Stop(f'{tid}: invalid or missing reviewer attempt')
+
+        tasks_root = self.directory / 'tasks'
+        task_root = tasks_root / tid
+        if tasks_root.is_symlink() or task_root.is_symlink():
+            raise Stop(f'{tid}: symlink in retained task evidence directory')
+        task_dir = task_root.resolve()
+        if not task_dir.is_relative_to(tasks_root.resolve()):
+            raise Stop(f'{tid}: task evidence directory escapes coordinator state')
+
+        def retained(raw, base=task_dir):
+            if not isinstance(raw, str) or not raw:
+                raise Stop(f'{tid}: missing retained reviewer evidence path')
+            p = Path(raw)
+            if not p.is_absolute():
+                p = base / p
+            if p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(task_dir):
+                raise Stop(f'{tid}: reviewer evidence escapes its retained task directory')
+            if any(parent.is_symlink() for parent in p.parents if parent != task_dir.parent):
+                raise Stop(f'{tid}: symlink in retained reviewer evidence path')
+            return p.resolve()
+
+        expected_job_name = f'review-{review_attempt}-job.json'
+        expected_receipt_name = f'review-{review_attempt}-exit.json'
+        expected_result_name = f'review-{review_attempt}-result.txt'
+        expected_log_name = f'review-{review_attempt}.jsonl'
+
+        if not r.get('job'):
+            raise Stop(f'{tid}: missing recorded reviewer job')
+        job_path = retained(r['job'])
+        if job_path.name != expected_job_name or job_path != (task_dir / expected_job_name).resolve():
+            raise Stop(f'{tid}: reviewer job is not the exact current review attempt')
+
+        try:
+            persisted_job = json.loads(job_path.read_text())
+        except (OSError, ValueError) as e:
+            raise Stop(f'{tid}: malformed current reviewer job') from e
+        if not isinstance(persisted_job, dict):
+            raise Stop(f'{tid}: malformed current reviewer job')
+
+        if job is None:
+            job = persisted_job
+        elif isinstance(job, dict):
+            for k in ('task', 'role', 'attempt', 'receipt', 'result'):
+                if k in job and persisted_job.get(k) != job.get(k):
+                    raise Stop(f'{tid}: reviewer job does not match persisted current attempt')
+
+        if (job.get('task') != tid or job.get('role') != 'review' or
+                not isinstance(job.get('attempt'), int) or isinstance(job.get('attempt'), bool) or
+                job['attempt'] != review_attempt or not isinstance(job.get('cwd'), str) or
+                Path(job.get('cwd', '')).resolve() != Path(r['worktree']).resolve()):
+            raise Stop(f'{tid}: current reviewer job identity mismatch')
+
+        receipt_path = retained(job.get('receipt'))
+        if receipt_path.name != expected_receipt_name or receipt_path != (task_dir / expected_receipt_name).resolve():
+            raise Stop(f'{tid}: reviewer terminal receipt is not the exact current attempt')
+
+        result_path = retained(job.get('result'))
+        if result_path.name != expected_result_name or result_path != (task_dir / expected_result_name).resolve():
+            raise Stop(f'{tid}: reviewer result is not the exact current attempt')
+
+        if job.get('log'):
+            log_path = retained(job['log'])
+            if log_path.name != expected_log_name or log_path != (task_dir / expected_log_name).resolve():
+                raise Stop(f'{tid}: reviewer log is not the exact current attempt')
+        else:
+            log_path = None
+
+        candidate_commit = r.get('commit')
+        if not candidate_commit or not isinstance(candidate_commit, str):
+            raise Stop(f'{tid}: missing candidate commit for review')
+        w = Path(r['worktree'])
+        if git(w, 'rev-parse', 'HEAD') != candidate_commit:
+            raise Stop(f'{tid}: candidate commit no longer matches current branch HEAD')
+        if git(w, 'branch', '--show-current') != r.get('branch'):
+            raise Stop(f'{tid}: reviewer worktree branch mismatch')
+        if job.get('commit') and job['commit'] != candidate_commit:
+            raise Stop(f'{tid}: reviewer job commit mismatch')
+
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, ValueError) as e:
+            raise Stop(f'{tid}: malformed reviewer terminal receipt') from e
+        if not isinstance(receipt, dict):
+            raise Stop(f'{tid}: malformed reviewer terminal receipt')
+
+        receipt_attempt = receipt.get('attempt')
+        if (receipt.get('task') != tid or receipt.get('role') not in ('review', 'reviewer') or
+                not isinstance(receipt_attempt, int) or isinstance(receipt_attempt, bool) or
+                receipt_attempt != review_attempt):
+            raise Stop(f'{tid}: reviewer terminal receipt task/role/attempt identity mismatch')
+
+        if job.get('provider') and receipt.get('provider') != job.get('provider'):
+            raise Stop(f'{tid}: reviewer receipt provider mismatch')
+        if r.get('provider') and receipt.get('provider') != r.get('provider'):
+            raise Stop(f'{tid}: reviewer receipt provider mismatch with record')
+        if job.get('model') and receipt.get('model') != job.get('model'):
+            raise Stop(f'{tid}: reviewer receipt model mismatch')
+        if r.get('model') and receipt.get('model') != r.get('model'):
+            raise Stop(f'{tid}: reviewer receipt model mismatch with record')
+
+        if receipt.get('cwd') and Path(receipt['cwd']).resolve() != Path(r['worktree']).resolve():
+            raise Stop(f'{tid}: reviewer receipt cwd mismatch')
+        if receipt.get('commit') and receipt['commit'] != candidate_commit:
+            raise Stop(f'{tid}: reviewer receipt commit mismatch')
+        if receipt.get('result') and retained(receipt['result']) != result_path:
+            raise Stop(f'{tid}: reviewer receipt result path mismatch')
+        if log_path and receipt.get('log') and retained(receipt['log']) != log_path:
+            raise Stop(f'{tid}: reviewer receipt log path mismatch')
+
+        exit_code = receipt.get('exit')
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code != 0:
+            raise Stop(f'{tid}: persisted reviewer process failed; no approval')
+
+        failure_diagnostics = ('error', 'provider_failure', 'parse_error', 'launch_error',
+                               'timeout', 'guest_error', 'structured_error', 'snapshot_error')
+        present_diagnostics = [k for k in failure_diagnostics if receipt.get(k)]
+        if present_diagnostics:
+            raise Stop(f'{tid}: reviewer receipt contains failure diagnostics: {", ".join(f"{k}={receipt[k]!r}" for k in present_diagnostics)}; no approval')
+
+        if receipt.get('success') is False:
+            raise Stop(f'{tid}: persisted reviewer process failed; no approval')
+        if job.get('provider') == 'agy':
+            if receipt.get('success') is not True or receipt.get('terminal_status') != 'SUCCESS':
+                raise Stop(f'{tid}: Gemini reviewer terminal evidence does not prove SUCCESS; no approval')
+        elif receipt.get('success') is not None and receipt.get('success') is not True:
+            raise Stop(f'{tid}: persisted reviewer process failed; no approval')
+
+        started, finished = receipt.get('started'), receipt.get('finished')
+        if started is not None:
+            if not isinstance(started, (int, float)) or isinstance(started, bool) or not math.isfinite(started) or started <= 0:
+                raise Stop(f'{tid}: malformed reviewer receipt start timestamp')
+        if finished is not None:
+            if not isinstance(finished, (int, float)) or isinstance(finished, bool) or not math.isfinite(finished) or finished <= 0:
+                raise Stop(f'{tid}: malformed reviewer receipt finish timestamp')
+        if started is not None and finished is not None:
+            if finished < started:
+                raise Stop(f'{tid}: reviewer receipt finish precedes start timestamp')
+
+        if not result_path.is_file() or result_path.stat().st_size == 0:
+            raise Stop(f'{tid}: reviewer result file is missing or empty')
+
+        return job, receipt
+
     def accept_review(self, task, job):
         r = self.state['records'][task['id']]
         clean(r['worktree'])
@@ -971,8 +1433,14 @@ class Coordinator:
         if not required or {c.get('id') for c in criteria} != required or len(criteria) != len(required):
             raise Stop('Reviewer did not cover every acceptance criterion')
         r['review'] = review
-        r['phase'] = 'approved' if (review.get('approved') is True and not review.get('findings') and
-                                    all(c.get('passed') is True and c.get('evidence', '').strip() for c in criteria)) else 'rejected'
+        approved = (review.get('approved') is True and not review.get('findings') and
+                    all(c.get('passed') is True and c.get('evidence', '').strip() for c in criteria))
+        if approved:
+            if job.get('receipt') or r.get('job'):
+                self.authenticate_review(task, job)
+            r['phase'] = 'approved'
+        else:
+            r['phase'] = 'rejected'
         self.save()
 
     def status_update(self, tid):
@@ -1128,6 +1596,28 @@ class Coordinator:
                 prior = {str(t['wave']) for t in tasks if t['wave'] < active[0]['wave']}
                 if any(w not in self.state['checkpoints'] for w in prior):
                     raise Stop('Prior wave checkpoint missing')
+            # Early collection of already terminal recorded reviewer receipts before scheduling/verifying peer workers.
+            for t in list(active):
+                r = records.get(t['id'])
+                if not r:
+                    continue
+                if r['phase'] == 'review_finished':
+                    job_path = Path(r.get('job', ''))
+                    if job_path.is_file():
+                        job = json.loads(job_path.read_text())
+                        receipt_path = Path(job.get('receipt', ''))
+                        if receipt_path.is_file():
+                            self.authenticate_review(t, job)
+                            self.accept_review(t, job)
+                elif r['phase'] == 'review_running':
+                    job_path = Path(r.get('job', ''))
+                    if job_path.is_file():
+                        job = json.loads(job_path.read_text())
+                        receipt_path = Path(job.get('receipt', ''))
+                        if receipt_path.is_file():
+                            outcome, job = self.wait(t['id'])
+                            self.authenticate_review(t, job)
+                            self.accept_review(t, job)
             for t in active:
                 r = self.prepare(t)
                 if r['phase'] in ('planned', 'repair_pending'):
@@ -1161,14 +1651,11 @@ class Coordinator:
                 r = records[t['id']]
                 if r['phase'] == 'review_running':
                     outcome, job = self.wait(t['id'])
-                    if outcome['exit'] != 0:
-                        raise Stop(f'{t["id"]}: reviewer process failed; no approval')
+                    self.authenticate_review(t, job)
                     self.accept_review(t, job)
                 elif r['phase'] == 'review_finished':
                     job = json.loads(Path(r['job']).read_text())
-                    receipt = json.loads(Path(job['receipt']).read_text())
-                    if receipt['exit'] != 0 or receipt.get('success') is False:
-                        raise Stop(f'{t["id"]}: persisted reviewer process failed; no approval')
+                    self.authenticate_review(t, job)
                     self.accept_review(t, job)
             for t in active:  # Task-column order, one merge and integration check at a time.
                 self.integrate(t)
@@ -1195,6 +1682,9 @@ def main():
     p.add_argument('--findings', help='Targeted repair instructions; required for repair')
     p.add_argument('--additional-attempts', type=int, help='One or two bounded attempts for an exhausted rejected task')
     p.add_argument('--reason', help='Concrete evidence supporting the additional repair budget')
+    p.add_argument('--provenance', help='Provenance / smoke artifact path for explicit repair routing choice')
+    p.add_argument('--select-validated-primary', nargs='?', const=True, default=False, help='Opt-in: select currently validated routing primary for the next coding repair only')
+    p.add_argument('--select-primary', action='store_true', dest='select_validated_primary', help='Alias for --select-validated-primary')
     p.add_argument('--execution-guidance', choices=['routine-decisions'], help='Persist the user\'s standing routine-decision authorization in worker prompts')
     p.add_argument('--max-workers', type=int, choices=[1, 2], default=1, help='Runtime concurrency; default one, without changing frozen config')
     p.add_argument('--wait-seconds', type=float, default=1800, help='Read-only watch deadline')
@@ -1303,56 +1793,20 @@ def main():
                     r['merge'] = head
                     r['phase'] = 'integration_testing'
                     c.state['expected_head'] = head
+                    c.state['blocked'] = None
+                    c.save()
+                    print('Reconciled pending merge. Use resume to continue.')
                 elif args.command == 'approve-gate':
                     if r['phase'] != 'approved':
                         raise Stop('Gate requires independent approval first')
                     r['gate_commit'] = r['commit']
+                    c.state['blocked'] = None
+                    c.save()
                 else:
-                    if not args.findings or len(args.findings.strip()) < 20 or r['attempt'] >= c.repair_limit(r):
-                        raise Stop('Supply targeted findings; bounded repair limit applies')
-                    if any(e['findings'] == args.findings.strip() for e in r.get('repair_history', [])):
-                        raise Stop('Repeated repair plan; consolidate findings and provide a new hypothesis')
-                    if r['phase'] in ('merged', 'merge_pending', 'integration_testing', 'status_pending'):
-                        raise Stop('Already integrated or uncertain merge; manual owner-scoped fix/revert required')
-                    job_path = Path(r.get('job', ''))
-                    pid_path = Path(str(job_path) + '.pid.json')
-                    job = json.loads(job_path.read_text()) if job_path.is_file() else {}
-                    child_path = Path(str(job_path) + '.child.json')
-                    finished = bool(job.get('receipt') and Path(job['receipt']).exists())
-                    if child_path.exists() and not finished:
-                        try:
-                            os.kill(json.loads(child_path.read_text())['pid'], 0)
-                        except ProcessLookupError:
-                            pass
-                        else:
-                            raise Stop('Worker/reviewer child still alive; inspect it before repair')
-                    if pid_path.exists() and not finished:
-                        pid = json.loads(pid_path.read_text())['pid']
-                        try:
-                            os.kill(pid, 0)
-                        except ProcessLookupError:
-                            pass
-                        else:
-                            raise Stop('Runner still alive; wait for it, never duplicate it')
-                    elif r.get('pid') and not finished:
-                        try:
-                            os.kill(r['pid'], 0)
-                        except ProcessLookupError:
-                            pass
-                        else:
-                            raise Stop('Launch process still alive')
-                    elif r['phase'].endswith('_running') and not finished and not args.confirmed_stopped:
-                        raise Stop('Unknown launch process; inspect processes manually, then repair with --confirmed-stopped')
-                    r['phase'] = 'repair_pending'
-                    r.setdefault('repair_history', []).append(dict(time=time.time(), attempt=r['attempt'],
-                        commit=r['commit'], findings=args.findings.strip(), review=r.get('review')))
-                    r['repair'] = args.findings.strip()
-                    r['prior_review'] = r.get('review')
-                    r['review'] = None
-                    r.pop('gate_commit', None)
-                c.state['blocked'] = None
-                c.save()
-                print('Recorded. Use resume to continue.')
+                    choice_reason = args.provenance or args.reason or (args.select_validated_primary if isinstance(args.select_validated_primary, str) else None)
+                    c.repair(args.task, args.findings, confirmed_stopped=args.confirmed_stopped,
+                             select_validated_primary=bool(args.select_validated_primary), reason=choice_reason)
+                    print('Recorded. Use resume to continue.')
 
 if __name__ == '__main__':
     try:

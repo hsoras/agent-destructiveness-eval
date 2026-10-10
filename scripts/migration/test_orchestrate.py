@@ -406,13 +406,15 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(Stop, 'branch/HEAD changed'):
             self.c.authorize_repairs('T001', 1, reason)
 
-    def terminal_check_failure_fixture(self):
+    def terminal_check_failure_fixture(self, attempt=3, preserve_run=False):
         # Each subtest gets a fresh retained-evidence tree even when it shares
         # the surrounding temporary coordinator/worktree fixture.
         task_dir = self.c.directory / 'tasks' / 'T001'
         check_dir = self.c.directory / 'checks' / 'T001-branch'
         for old in (task_dir, check_dir):
-            if old.is_symlink():
+            if preserve_run:
+                shutil.rmtree(old, ignore_errors=True)
+            elif old.is_symlink():
                 old.unlink()
             else:
                 shutil.rmtree(old, ignore_errors=True)
@@ -420,25 +422,30 @@ class SafetyTests(unittest.TestCase):
         if worktree:
             for path in Path(worktree).glob('untracked_mutation.txt'):
                 path.unlink()
-        if self.c.state:
+        if self.c.state and not preserve_run:
             prior = self.c.state.get('records', {}).get('T001')
             if prior:
                 prior['commit'] = None
                 prior.pop('gate_commit', None)
                 prior['review'] = None
-        self.c.initialize(self.tasks)
-        r = self.c.prepare(self.tasks[0])
+        if preserve_run:
+            r = self.c.state['records']['T001']
+        else:
+            self.c.initialize(self.tasks)
+            r = self.c.prepare(self.tasks[0])
         task_dir.mkdir(parents=True, exist_ok=True)
-        r.update(phase='worker_finished', attempt=3, exit=None, pid=99999998,
-                 commit=None, review=None, repair_authorizations=[])
+        r.update(phase='worker_finished', attempt=attempt, exit=None, pid=99999998,
+                 commit=git(r['worktree'], 'rev-parse', 'HEAD'), review=None)
+        if not preserve_run:
+            r['repair_authorizations'] = []
         r.pop('gate_commit', None)
-        job_path = task_dir / 'worker-3-job.json'
-        log = task_dir / 'worker-3.jsonl'
-        result = task_dir / 'worker-3-result.txt'
+        job_path = task_dir / f'worker-{attempt}-job.json'
+        log = task_dir / f'worker-{attempt}.jsonl'
+        result = task_dir / f'worker-{attempt}-result.txt'
         log.write_text('{}\n')
         result.write_text('finished')
         now = time.time() - 10
-        job = dict(task='T001', role='worker', attempt=3, cwd=r['worktree'], receipt=str(task_dir/'worker-3-exit.json'),
+        job = dict(task='T001', role='worker', attempt=attempt, cwd=r['worktree'], receipt=str(task_dir/f'worker-{attempt}-exit.json'),
                    log=str(log), result=str(result), provider='codex', model='gpt-6-luna')
         atomic(job_path, job)
         # Model job.py's durable job write before the runner and receipt starts.
@@ -467,7 +474,7 @@ class SafetyTests(unittest.TestCase):
         check_path = check_dir / (stem + '.json')
         atomic(check_path, check)
         receipt = dict(exit=0, error=None, started=now, finished=now+1, log=str(log), result=str(result),
-                       task='T001', role='worker', attempt=3, provider='codex', model='gpt-6-luna')
+                       task='T001', role='worker', attempt=attempt, provider='codex', model='gpt-6-luna')
         atomic(job['receipt'], receipt)
         r['exit'] = receipt
         self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {' '.join(argv)}; see {check_log}"
@@ -489,6 +496,382 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(self.c.repair_limit(r), 4)
         persisted = Coordinator(self.repo, self.root/'state', self.config)
         self.assertEqual(persisted.state['records']['T001']['repair_authorizations'], [entry])
+
+    def terminal_pytest_failure_fixture(self, attempt=3, preserve_run=False):
+        passing_test = self.root / 'terminal_repair_check.py'
+        passing_test.write_text('def test_terminal_repair_check():\n    assert True\n')
+        self.config['checks']['T001'] = [['{python}', '-m', 'pytest', '-q', str(passing_test)]]
+        r = self.terminal_check_failure_fixture(attempt, preserve_run)
+        check_dir = self.c.directory / 'checks' / 'T001-branch'
+        check_path = next(check_dir.glob('*.json'))
+        check = json.loads(check_path.read_text())
+        template = self.c.task_checks('T001')[0]
+        report = check_path.with_suffix('.xml')
+        report.write_text('''<?xml version="1.0"?>
+<testsuites><testsuite name="pytest" tests="3" failures="2" errors="0" skipped="0">
+<testcase classname="tests.example" name="test_one"><failure message="assertion">actual failure</failure></testcase>
+<testcase classname="tests.example" name="test_two"><failure message="assertion">another failure</failure></testcase>
+<testcase classname="tests.example" name="test_pass" />
+</testsuite></testsuites>''')
+        check['original_command'] = template
+        argv = [x.replace('{python}', self.config['python']).replace('$USER', check_path.stem).replace(
+            '{output}', str(check_path.parent / check_path.stem)) for x in template]
+        if argv[0] == '.venv/bin/python':
+            argv[0] = self.config['python']
+        argv += ['-o', 'junit_family=xunit2', '--junitxml=' + str(report)]
+        check['command'] = argv
+        check['exit'] = 1
+        check['error'] = "Unapproved or duplicate pytest failure: ('tests.example', 'test_one')"
+        check['log'] = str(check_path.with_suffix('.log'))
+        Path(check['log']).write_text('FAILED tests/example.py::test_one\nFAILED tests/example.py::test_two\n2 failed, 1 passed in 0.01s\n')
+        check['artifacts'] = []
+        for path in (Path(check['log']), report):
+            check['artifacts'].append(dict(path=str(path), bytes=path.stat().st_size,
+                                           sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+        atomic(check_path, check)
+        self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(argv)}; see {check['log']}"
+        self.c.save()
+        return r
+
+    def test_terminal_pytest_failure_allows_bounded_authorization_and_records_junit(self):
+        r = self.terminal_pytest_failure_fixture()
+        r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+        self.c.save()
+        reason = 'Retained pytest failures identify concrete worker defects requiring bounded repair.'
+        blocker = self.c.state['blocked']
+        with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+            entry = self.c.authorize_repairs('T001', 1, reason)
+        proof = entry['terminal_check_repair']['pytest_failure']
+        self.assertEqual(proof['tests'], 3)
+        self.assertEqual([x['identity'] for x in proof['failures']],
+                         ['tests.example::test_one', 'tests.example::test_two'])
+        self.assertEqual(r['phase'], 'worker_finished')
+        self.assertEqual(self.c.state['blocked'], blocker)
+        self.assertEqual(self.c.repair_limit(r), 4)
+
+    def test_dirty_terminal_repair_authorization_preserves_bytes_then_runs_normal_lifecycle(self):
+        r = self.terminal_pytest_failure_fixture()
+        r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+        owned = Path(r['worktree']) / 'docs/smoke-alpha.md'
+        owned.write_text('# Retained alpha\n\nUncommitted worker bytes for bounded repair.\n')
+        original = owned.read_bytes()
+        check_path = next((self.c.directory / 'checks' / 'T001-branch').glob('*.json'))
+        check = json.loads(check_path.read_text())
+        check['source_snapshot_sha256'] = digest(json.dumps(snapshot(r['worktree']), sort_keys=True))
+        atomic(check_path, check)
+        # Bind the retained check receipt to the exact dirty source snapshot.
+        self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(check['command'])}; see {check['log']}"
+        blocker = self.c.state['blocked']
+        self.c.save()
+        with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+            self.c.authorize_repairs('T001', 1, 'Retained failed pytest evidence identifies a specific worker defect.')
+        index_before = git(r['worktree'], 'diff', '--cached', '--binary')
+        self.c.repair('T001', 'Fix the concrete worker defect recorded by retained failed pytest evidence.')
+        self.assertEqual(owned.read_bytes(), original)
+        self.assertEqual(git(r['worktree'], 'diff', '--cached', '--binary'), index_before)
+        auth = r['repair_authorizations'][-1]
+        self.assertTrue(auth['terminal_repair_consumed'])
+        self.assertEqual(r['phase'], 'repair_pending')
+        self.assertIsNone(self.c.state['blocked'])
+        self.assertNotEqual(blocker, self.c.state['blocked'])
+
+        # The regular worker, check, review, and integration path consumes repair_pending.
+        self.c.execute(self.tasks)
+        self.assertIn(r['phase'], ('merged', 'integration_testing'))
+        self.assertTrue(r.get('evidence'))
+        self.assertTrue(r.get('review', {}).get('approved'))
+
+    def test_dirty_terminal_repair_two_grant_chain_selects_only_current_unconsumed_grant(self):
+        r = self.terminal_pytest_failure_fixture()
+        owned = Path(r['worktree']) / 'docs/smoke-alpha.md'
+        owned.write_text('# Retained alpha\n\nFirst bounded worker bytes.\n')
+        first_bytes = owned.read_bytes()
+        check_path = next((self.c.directory / 'checks' / 'T001-branch').glob('*.json'))
+        check = json.loads(check_path.read_text())
+        check['source_snapshot_sha256'] = digest(json.dumps(snapshot(r['worktree']), sort_keys=True))
+        atomic(check_path, check)
+        self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(check['command'])}; see {check['log']}"
+        self.c.save()
+        with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+            first = self.c.authorize_repairs('T001', 1, 'Retained failed pytest evidence identifies a specific worker defect for bounded repair.')
+        self.assertEqual((first['previous_limit'], first['new_limit'], first['attempt_at_authorization']), (3, 4, 3))
+        index_before = git(r['worktree'], 'diff', '--cached', '--binary')
+        self.c.repair('T001', 'Repair the concrete defect shown by the retained pytest evidence in cycle one.')
+        self.assertEqual(owned.read_bytes(), first_bytes)
+        self.assertEqual(git(r['worktree'], 'diff', '--cached', '--binary'), index_before)
+        self.assertTrue(first['terminal_repair_consumed'])
+        self.assertEqual(r['phase'], 'repair_pending')
+
+        # Emit a fresh attempt-4 job, receipt, current-head snapshot, failed
+        # check log, and JUnit manifest while preserving prior coordinator state.
+        owned.write_text('# Retained alpha\n\nSecond worker attempt bytes.\n')
+        second_bytes = owned.read_bytes()
+        r = self.terminal_pytest_failure_fixture(attempt=4, preserve_run=True)
+        check_path = next((self.c.directory / 'checks' / 'T001-branch').glob('*.json'))
+        check = json.loads(check_path.read_text())
+        check['source_snapshot_sha256'] = digest(json.dumps(snapshot(r['worktree']), sort_keys=True))
+        atomic(check_path, check)
+        self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(check['command'])}; see {check['log']}"
+        self.c.save()
+        with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+            second = self.c.authorize_repairs('T001', 1, 'Fresh retained pytest failures identify a second bounded worker repair.')
+        self.assertEqual((second['previous_limit'], second['new_limit'], second['attempt_at_authorization']), (4, 5, 4))
+        self.assertEqual([x.get('terminal_repair_consumed', False) for x in r['repair_authorizations']], [True, False])
+        self.assertEqual([x['attempt_at_authorization'] for x in r['repair_authorizations']], [3, 4])
+
+        # A stale old grant cannot displace the current grant; malformed
+        # consumption and duplicate current proof candidates fail closed.
+        history = json.loads(json.dumps(r['repair_authorizations']))
+        history[0]['terminal_repair_consumed'] = False
+        r['repair_authorizations'] = history
+        selected = self.c._current_dirty_repair_authorization('T001', r, history)
+        self.assertEqual(selected['attempt_at_authorization'], 4)
+        self.assertIs(selected, history[1])
+        history[0]['terminal_repair_consumed'] = True
+        duplicate = json.loads(json.dumps(history[1]))
+        duplicate.update(previous_limit=5, new_limit=6)
+        history.append(duplicate)
+        r['repair_authorizations'] = history
+        self.c.save()
+        state_before = self.c.file.read_bytes()
+        source_before = owned.read_bytes()
+        with self.assertRaisesRegex(Stop, 'authorization budget history'):
+            self.c.repair('T001', 'Repair the concrete defect shown by retained pytest evidence with duplicate proof.')
+        self.assertEqual(self.c.file.read_bytes(), state_before)
+        self.assertEqual(owned.read_bytes(), source_before)
+        history = json.loads(json.dumps(r['repair_authorizations'][:2]))
+        history[0]['terminal_repair_consumed'] = 'false'
+        r['repair_authorizations'] = history
+        self.c.save()
+        state_before = self.c.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'Malformed terminal repair consumption marker'):
+            self.c.repair('T001', 'Repair the concrete defect shown by retained pytest evidence with malformed history.')
+        self.assertEqual(self.c.file.read_bytes(), state_before)
+        self.assertEqual(owned.read_bytes(), source_before)
+        history[0]['terminal_repair_consumed'] = True
+        r['repair_authorizations'] = history
+        self.c.save()
+
+        index_before = git(r['worktree'], 'diff', '--cached', '--binary')
+        self.c.repair('T001', 'Repair the concrete defect shown by the retained pytest evidence in cycle two.')
+        self.assertEqual(owned.read_bytes(), second_bytes)
+        self.assertEqual(git(r['worktree'], 'diff', '--cached', '--binary'), index_before)
+        self.assertEqual(r['phase'], 'repair_pending')
+        self.assertTrue(all(x['terminal_repair_consumed'] for x in r['repair_authorizations']))
+        self.assertEqual(len(r['repair_authorizations']), 2)
+
+    def test_clean_terminal_repair_needs_no_terminal_authorization_and_runs_lifecycle(self):
+        r = self.terminal_pytest_failure_fixture()
+        r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+        r['attempt'] = 2  # Existing configured budget is three attempts.
+        task_dir = self.c.directory / 'tasks' / 'T001'
+        for path in task_dir.glob('worker-3-*'):
+            path.unlink()
+        r.pop('job', None)
+        r.pop('exit', None)
+        r.pop('pid', None)
+        self.assertEqual(r['repair_authorizations'], [])
+        self.c.repair('T001', 'Repair the concrete defect shown by the retained failed check evidence.')
+        self.assertEqual(r['phase'], 'repair_pending')
+        self.c.execute(self.tasks)
+        self.assertIn(r['phase'], ('merged', 'integration_testing'))
+        self.assertTrue(r.get('review', {}).get('approved'))
+
+    def test_dirty_terminal_repair_refusals_preserve_state_and_source_bytes(self):
+        for index, defect in enumerate(('stale_authorization', 'out_of_scope', 'staged', 'evidence', 'ref')):
+            with self.subTest(defect=defect):
+                if index:
+                    self.tearDown()
+                self.setUp()
+                r = self.terminal_pytest_failure_fixture()
+                r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+                target = Path(r['worktree']) / 'docs/smoke-alpha.md'
+                target.write_text('retained bytes\n')
+                check_path = next((self.c.directory / 'checks' / 'T001-branch').glob('*.json'))
+                check = json.loads(check_path.read_text())
+                check['source_snapshot_sha256'] = digest(json.dumps(snapshot(r['worktree']), sort_keys=True))
+                atomic(check_path, check)
+                self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(check['command'])}; see {check['log']}"
+                self.c.save()
+                with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+                    self.c.authorize_repairs('T001', 1, 'Retained failed pytest evidence identifies a specific worker defect.')
+                if defect == 'stale_authorization':
+                    target.write_text('changed after authorization\n')
+                elif defect == 'out_of_scope':
+                    (Path(r['worktree']) / 'README.md').write_text('unowned\n')
+                elif defect == 'staged':
+                    git(r['worktree'], 'add', 'docs/smoke-alpha.md')
+                elif defect == 'evidence':
+                    check['log'] = str(self.c.directory / 'checks' / 'T001-branch' / 'altered.log')
+                    atomic(check_path, check)
+                else:
+                    git(r['worktree'], 'config', 'user.name', 'Migration Test')
+                    git(r['worktree'], 'config', 'user.email', 'migration-test@example.invalid')
+                    git(r['worktree'], 'commit', '--allow-empty', '-m', 'unexpected ref movement')
+                source_before = {p.relative_to(r['worktree']).as_posix(): p.read_bytes()
+                                 for p in Path(r['worktree']).rglob('*') if p.is_file() and '.git' not in p.parts}
+                state_before = self.c.file.read_bytes()
+                with self.assertRaises(Stop):
+                    self.c.repair('T001', 'Repair the concrete defect shown by the retained failed check evidence.')
+                self.assertEqual(state_before, self.c.file.read_bytes())
+                source_after = {p.relative_to(r['worktree']).as_posix(): p.read_bytes()
+                                for p in Path(r['worktree']).rglob('*') if p.is_file() and '.git' not in p.parts}
+                self.assertEqual(source_before, source_after)
+
+    def test_dirty_terminal_repair_authorization_metadata_refusals_preserve_bytes(self):
+        for defect in ('missing', 'multiple', 'consumed', 'wrong_task', 'wrong_attempt',
+                       'grant_arithmetic', 'grant_time', 'proof_phase'):
+            with self.subTest(defect=defect):
+                if defect != 'missing':
+                    self.tearDown()
+                    self.setUp()
+                r = self.terminal_pytest_failure_fixture()
+                r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+                target = Path(r['worktree']) / 'docs/smoke-alpha.md'
+                target.write_text('retained bytes\n')
+                check_path = next((self.c.directory / 'checks' / 'T001-branch').glob('*.json'))
+                check = json.loads(check_path.read_text())
+                check['source_snapshot_sha256'] = digest(json.dumps(snapshot(r['worktree']), sort_keys=True))
+                atomic(check_path, check)
+                self.c.state['blocked'] = f"T001-branch: required check failed/missing/skipped: {__import__('shlex').join(check['command'])}; see {check['log']}"
+                self.c.save()
+                with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+                    self.c.authorize_repairs('T001', 1, 'Retained failed pytest evidence identifies a specific worker defect.')
+                entry = r['repair_authorizations'][-1]
+                if defect == 'missing':
+                    r['repair_authorizations'] = []
+                elif defect == 'multiple':
+                    duplicate = dict(entry)
+                    duplicate['previous_limit'] = entry['new_limit']
+                    duplicate['new_limit'] = duplicate['previous_limit'] + duplicate['additional_attempts']
+                    r['repair_authorizations'].append(duplicate)
+                elif defect == 'consumed':
+                    entry['terminal_repair_consumed'] = True
+                elif defect == 'wrong_task':
+                    entry['task'] = 'T002'
+                elif defect == 'wrong_attempt':
+                    entry['attempt_at_authorization'] = 1
+                elif defect == 'grant_arithmetic':
+                    entry['additional_attempts'] = 2
+                elif defect == 'grant_time':
+                    entry['time'] = float('inf')
+                else:
+                    entry['terminal_check_repair']['phase'] = 'rejected'
+                self.c.save()
+                state_before = self.c.file.read_bytes()
+                source_before = target.read_bytes()
+                index_before = git(r['worktree'], 'diff', '--cached', '--binary')
+                with self.assertRaises(Stop):
+                    self.c.repair('T001', 'Repair the concrete defect shown by the retained failed check evidence.')
+                self.assertEqual(state_before, self.c.file.read_bytes())
+                self.assertEqual(source_before, target.read_bytes())
+                self.assertEqual(index_before, git(r['worktree'], 'diff', '--cached', '--binary'))
+
+    def test_terminal_failure_refuses_commit_that_differs_from_branch_head(self):
+        r = self.terminal_check_failure_fixture()
+        r['commit'] = '1' * 40
+        self.c.save()
+        before = self.c.file.read_bytes()
+        with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+            with self.assertRaisesRegex(Stop, 'branch/HEAD changed'):
+                self.c.authorize_repairs('T001', 1, 'A concrete branch-check failure needs a bounded repair.')
+        self.assertEqual(before, self.c.file.read_bytes())
+
+    def test_terminal_pytest_exit_one_refusals_preserve_state_bytes(self):
+        reason = 'Retained pytest failure requires a specific bounded repair effort.'
+        for defect, mutate in (
+            ('other-exit', lambda check, report: check.update(exit=3, error=None)),
+            ('non-pytest', lambda check, report: check.update(original_command=['python', 'tool.py'])),
+            ('count-mismatch', lambda check, report: report.write_text('<testsuite tests="4" failures="2" errors="0" skipped="0"><testcase classname="x" name="a"><failure/></testcase></testsuite>')),
+            ('skip', lambda check, report: report.write_text('<testsuite tests="1" failures="1" errors="0" skipped="1"><testcase classname="x" name="a"><failure/></testcase><testcase classname="x" name="b"><skipped/></testcase></testsuite>')),
+            ('bad-classification', lambda check, report: check.update(error='Docker build failed')),
+            ('unmanifested-junit', lambda check, report: check.update(artifacts=[a for a in check['artifacts'] if a['path'] != str(report)])),
+            ('junit-hash-mismatch', lambda check, report: next(a for a in check['artifacts'] if a['path'] == str(report)).update(sha256='0' * 64)),
+            ('junit-size-mismatch', lambda check, report: next(a for a in check['artifacts'] if a['path'] == str(report)).update(bytes=report.stat().st_size + 1)),
+            ('junit-stale', lambda check, report: os.utime(report, (1, 1))),
+            ('duplicate-failure-elements', lambda check, report: report.write_text('<testsuite tests="3" failures="2" errors="0" skipped="0"><testcase classname="tests.example" name="test_one"><failure/><failure/></testcase><testcase classname="tests.example" name="test_pass"/><testcase classname="tests.example" name="test_other"/></testsuite>')),
+            ('duplicate-testcase-identity', lambda check, report: (report.write_text('<testsuite tests="3" failures="1" errors="0" skipped="0"><testcase classname="tests.example" name="test_one"><failure/></testcase><testcase classname="tests.example" name="test_one"/><testcase classname="tests.example" name="test_pass"/></testsuite>'), Path(check['log']).write_text('FAILED tests/example.py::test_one\n1 failed, 2 passed in 0.01s\n'))),
+        ):
+            with self.subTest(defect=defect):
+                self.terminal_pytest_failure_fixture()
+                check_path = next((self.c.directory/'checks'/'T001-branch').glob('*.json'))
+                check = json.loads(check_path.read_text())
+                report = check_path.with_suffix('.xml')
+                mutate(check, report)
+                if defect not in ('unmanifested-junit', 'junit-hash-mismatch',
+                                  'junit-size-mismatch', 'junit-stale'):
+                    check['artifacts'] = [dict(path=check['log'], bytes=Path(check['log']).stat().st_size,
+                                               sha256=hashlib.sha256(Path(check['log']).read_bytes()).hexdigest()),
+                                           dict(path=str(report), bytes=report.stat().st_size,
+                                               sha256=hashlib.sha256(report.read_bytes()).hexdigest())]
+                atomic(check_path, check)
+                before = self.c.file.read_bytes()
+                with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+                    with self.assertRaises(Stop):
+                        self.c.authorize_repairs('T001', 1, reason)
+                self.assertEqual(before, self.c.file.read_bytes())
+
+    def test_terminal_pytest_rejects_incoherent_junit_hierarchy_and_counts(self):
+        cases = {
+            'negative-empty-suite': (
+                '<testsuites><testsuite tests="-1" failures="-1" errors="-1" skipped="-1" />'
+                '<testsuite tests="4" failures="3" errors="1" skipped="1">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_two"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '</testsuite></testsuites>', '2 failed, 1 passed'),
+            'orphan-failure': (
+                '<testsuite tests="3" failures="2" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_two"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '<failure /></testsuite>', '2 failed, 1 passed'),
+            'unknown-root': (
+                '<junit><testsuite tests="3" failures="2" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_two"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '</testsuite></junit>', '2 failed, 1 passed'),
+            'wrong-per-suite-counts': (
+                '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '</testsuite><testsuite tests="2" failures="1" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_two"><failure/></testcase>'
+                '</testsuite></testsuites>', '2 failed, 1 passed'),
+            'duplicate-failed-identity-across-suites': (
+                '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '</testsuite><testsuite tests="2" failures="1" errors="0" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '</testsuite></testsuites>', '2 failed, 1 passed'),
+            'suite-error-total-disagrees': (
+                '<testsuite tests="3" failures="2" errors="1" skipped="0">'
+                '<testcase classname="tests.example" name="test_one"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_two"><failure/></testcase>'
+                '<testcase classname="tests.example" name="test_pass" />'
+                '</testsuite>', '2 failed, 1 passed'),
+        }
+        reason = 'Malformed retained JUnit accounting needs a bounded review before repair.'
+        for defect, (xml, summary) in cases.items():
+            with self.subTest(defect=defect):
+                self.terminal_pytest_failure_fixture()
+                check_path = next((self.c.directory/'checks'/'T001-branch').glob('*.json'))
+                check = json.loads(check_path.read_text())
+                report = check_path.with_suffix('.xml')
+                report.write_text(xml)
+                Path(check['log']).write_text(f'FAILED tests/example.py::test_one\n{summary} in 0.01s\n')
+                check['artifacts'] = [dict(path=check['log'], bytes=Path(check['log']).stat().st_size,
+                                           sha256=hashlib.sha256(Path(check['log']).read_bytes()).hexdigest()),
+                                         dict(path=str(report), bytes=report.stat().st_size,
+                                           sha256=hashlib.sha256(report.read_bytes()).hexdigest())]
+                atomic(check_path, check)
+                before = self.c.file.read_bytes()
+                with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
+                    with self.assertRaises(Stop):
+                        self.c.authorize_repairs('T001', 1, reason)
+                self.assertEqual(before, self.c.file.read_bytes())
 
     def test_terminal_authorization_refusal_leaves_state_bytes_unchanged(self):
         self.terminal_check_failure_fixture()
@@ -860,7 +1243,9 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(p.read_bytes(), content)
 
     def test_ordinary_repair_resume_fresh_checks_and_independent_review_lifecycle(self):
-        r = self.terminal_check_failure_fixture()
+        r = self.terminal_pytest_failure_fixture()
+        r['commit'] = git(r['worktree'], 'rev-parse', 'HEAD')
+        self.c.save()
         reason = 'Failed mandatory branch check is traced to a concrete local prerequisite mismatch.'
         with patch('orchestrate.os.kill', side_effect=ProcessLookupError):
             entry = self.c.authorize_repairs('T001', 1, reason)
@@ -918,6 +1303,521 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(Stop, 'Cumulative additional repair budget exceeded'):
             self.c.authorize_repairs('T001', 1, 'Another concrete hypothesis after all six extensions are used.')
         self.assertEqual(before, self.c.file.read_bytes())
+
+    def test_repair_default_retains_historical_worker_route(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='rejected', attempt=1,
+                 worker_route={'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'})
+        self.c.save()
+        self.c.routing = {
+            'primary': {'backend': 'agy', 'model': 'gemini-3.8-flash-medium', 'effort': 'medium', 'scoped_worker_permissions': True},
+            'fallback': {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'},
+            'reviewer': {'backend': 'codex', 'model': 'gpt-6-sol', 'effort': 'medium'},
+        }
+        findings = 'Implement the missing AC2 rollback and verify transaction boundaries.'
+        self.c.repair('T001', findings)
+        repaired = self.c.state['records']['T001']
+        self.assertEqual(repaired['phase'], 'repair_pending')
+        self.assertEqual(repaired['worker_route'], {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'})
+        self.assertNotIn('route_history', repaired)
+
+    def test_repair_explicit_opt_in_selects_validated_primary_with_history(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='rejected', attempt=1,
+                 worker_route={'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'})
+        self.c.save()
+        scoped_agy = {'backend': 'agy', 'model': 'gemini-3.8-flash-medium', 'effort': 'medium', 'scoped_worker_permissions': True}
+        self.c.routing = {
+            'primary': scoped_agy,
+            'fallback': {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'},
+            'reviewer': {'backend': 'codex', 'model': 'gpt-6-sol', 'effort': 'medium'},
+        }
+        findings = 'Implement the missing AC2 rollback and verify transaction boundaries.'
+        provenance = 'Verified integrated smoke artifact: .scenario/migration-readiness/smoke-summary.json'
+        self.c.repair('T001', findings, select_validated_primary=True, reason=provenance)
+        repaired = self.c.state['records']['T001']
+        self.assertEqual(repaired['phase'], 'repair_pending')
+        self.assertEqual(repaired['worker_route'], scoped_agy)
+        self.assertEqual(repaired['route_history'], [{
+            'time': repaired['route_history'][0]['time'],
+            'attempt': 1,
+            'old_route': {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'},
+            'selected_route': scoped_agy,
+            'reason': provenance,
+        }])
+        self.assertEqual(repaired['repair_history'][-1]['old_route'], {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'})
+        self.assertEqual(repaired['repair_history'][-1]['selected_route'], scoped_agy)
+        self.assertEqual(repaired['repair_history'][-1]['primary_reason'], provenance)
+
+    def test_repair_explicit_opt_in_refusals_leave_state_unchanged(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        r.update(phase='rejected', attempt=1,
+                 worker_route={'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'})
+        self.c.save()
+        findings = 'Implement the missing AC2 rollback and verify transaction boundaries.'
+        provenance = 'Verified integrated smoke artifact: .scenario/migration-readiness/smoke-summary.json'
+        # 1. Reject absent routing
+        self.c.routing = None
+        before = self.c.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'No validated routing primary configured'):
+            self.c.repair('T001', findings, select_validated_primary=True, reason=provenance)
+        self.assertEqual(before, self.c.file.read_bytes())
+
+        # 2. Reject invalid primary route
+        self.c.routing = {'primary': {'invalid': True}}
+        with self.assertRaisesRegex(Stop, 'Invalid routing primary configuration'):
+            self.c.repair('T001', findings, select_validated_primary=True, reason=provenance)
+        self.assertEqual(before, self.c.file.read_bytes())
+
+        # 3. Reject missing / too short reason
+        self.c.routing = {'primary': {'backend': 'agy', 'model': 'gemini-3.8-flash-medium'}}
+        with self.assertRaisesRegex(Stop, 'Explicit primary selection requires concrete reason'):
+            self.c.repair('T001', findings, select_validated_primary=True, reason='short')
+        self.assertEqual(before, self.c.file.read_bytes())
+
+        # 4. Reject live process without state writes
+        task_dir = self.c.directory / 'tasks' / 'T001'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        job_path = task_dir / 'worker-1-job.json'
+        atomic(job_path, {'task': 'T001', 'role': 'worker', 'attempt': 1, 'receipt': str(task_dir / 'worker-1-exit.json')})
+        atomic(str(job_path) + '.pid.json', {'pid': 99999999})
+        r['job'] = str(job_path)
+        self.c.save()
+        before = self.c.file.read_bytes()
+        with patch('orchestrate.os.kill', return_value=None):
+            with self.assertRaisesRegex(Stop, 'Runner still alive'):
+                self.c.repair('T001', findings, select_validated_primary=True, reason=provenance)
+        self.assertEqual(before, self.c.file.read_bytes())
+
+    def test_early_review_collection_with_failed_peer_and_no_terminal_refusals(self):
+        self.c.initialize(self.tasks)
+        t001 = self.tasks[0]
+        t002 = self.tasks[1]
+        r1 = self.c.prepare(t001)
+        r2 = self.c.prepare(t002)
+
+        w1 = Path(r1['worktree'])
+        (w1 / 'docs/smoke-alpha.md').write_text('# Smoke alpha\n\nThis is the alpha orchestration smoke document.\n')
+        git(w1, 'add', 'docs/smoke-alpha.md')
+        git(w1, 'commit', '-m', 'migration: T001 attempt 1')
+        r1['commit'] = git(w1, 'rev-parse', 'HEAD')
+        r1['attempt'] = 1
+        r1['review_attempt'] = 1
+
+        task1_dir = self.c.directory / 'tasks' / 'T001'
+        task1_dir.mkdir(parents=True, exist_ok=True)
+        job1_path = task1_dir / 'review-1-job.json'
+        receipt1_path = task1_dir / 'review-1-exit.json'
+        result1_path = task1_dir / 'review-1-result.txt'
+        now = time.time()
+        atomic(job1_path, dict(task='T001', role='review', attempt=1, receipt=str(receipt1_path), result=str(result1_path),
+                               cwd=r1['worktree'], provider='codex', model=self.config['reviewer_model']))
+        atomic(receipt1_path, dict(exit=0, success=True, started=now - 5, finished=now,
+                                  task='T001', role='review', attempt=1, provider='codex', model=self.config['reviewer_model'],
+                                  result=str(result1_path)))
+        review_data = dict(
+            approved=False,
+            findings=['AC2 rollback incomplete: database connection was not closed'],
+            criteria=[dict(id='AC1', passed=True, evidence='exact bytes checked'),
+                      dict(id='AC2', passed=False, evidence='unclosed connection on error')]
+        )
+        atomic(result1_path, review_data)
+        r1['phase'] = 'review_running'
+        r1['job'] = str(job1_path)
+
+        task2_dir = self.c.directory / 'tasks' / 'T002'
+        task2_dir.mkdir(parents=True, exist_ok=True)
+        job2_path = task2_dir / 'worker-1-job.json'
+        receipt2_path = task2_dir / 'worker-1-exit.json'
+        atomic(job2_path, dict(task='T002', role='worker', attempt=1, receipt=str(receipt2_path), cwd=r2['worktree']))
+        atomic(receipt2_path, dict(exit=1, success=False, started=now - 5, finished=now))
+        r2['attempt'] = 1
+        r2['phase'] = 'worker_finished'
+        r2['exit'] = dict(exit=1, success=False)
+        r2['job'] = str(job2_path)
+        self.c.save()
+
+        with self.assertRaises(Stop):
+            self.c.execute(self.tasks)
+
+        state1 = self.c.state['records']['T001']
+        self.assertEqual(state1['phase'], 'rejected')
+        self.assertEqual(state1['review']['approved'], False)
+        self.assertEqual(state1['review']['findings'], ['AC2 rollback incomplete: database connection was not closed'])
+
+        state2 = self.c.state['records']['T002']
+        self.assertEqual(state2['phase'], 'rejected')
+        self.assertIn('Worker exited 1', state2['repair'])
+
+        # Subtest: no-terminal / live review remains untouched
+        r1['phase'] = 'review_running'
+        receipt1_path.unlink()
+        r1['review'] = None
+        self.c.save()
+        active = [t001]
+        for t in list(active):
+            r = self.c.state['records'][t['id']]
+            if r['phase'] == 'review_running':
+                jp = Path(r.get('job', ''))
+                if jp.is_file():
+                    j = json.loads(jp.read_text())
+                    rp = Path(j.get('receipt', ''))
+                    if rp.is_file():
+                        self.fail('Live reviewer should not have a receipt')
+        self.assertEqual(self.c.state['records']['T001']['phase'], 'review_running')
+        self.assertIsNone(self.c.state['records']['T001']['review'])
+
+        # Subtest: reviewer exit nonzero retains normal refusal
+        atomic(receipt1_path, dict(exit=1, success=False, started=now - 5, finished=now,
+                                  task='T001', role='review', attempt=1, provider='codex', model=self.config['reviewer_model'],
+                                  result=str(result1_path)))
+        r1['phase'] = 'review_finished'
+        self.c.state['blocked'] = None
+        self.c.save()
+        with self.assertRaisesRegex(Stop, 'persisted reviewer process failed; no approval'):
+            self.c.execute(self.tasks)
+        self.assertEqual(self.c.state['records']['T001']['phase'], 'review_finished')
+
+        # Subtest: invalid / malformed reviewer output retains normal refusal
+        atomic(receipt1_path, dict(exit=0, success=True, started=now - 5, finished=now,
+                                  task='T001', role='review', attempt=1, provider='codex', model=self.config['reviewer_model'],
+                                  result=str(result1_path)))
+        result1_path.write_text('{malformed-json')
+        self.c.state['blocked'] = None
+        self.c.save()
+        with self.assertRaisesRegex(Stop, 'Invalid reviewer output'):
+            self.c.execute(self.tasks)
+        self.assertEqual(self.c.state['records']['T001']['phase'], 'review_finished')
+
+    def test_review_terminal_authentication_regressions(self):
+        """Cover early and ordinary review terminal authentication, typed outcomes, diagnostics, and confinement."""
+        now = time.time()
+        for initial_phase in ('review_running', 'review_finished'):
+            with self.subTest(initial_phase=initial_phase):
+                self.setUp()
+                self.c.initialize(self.tasks)
+                t001, t002 = self.tasks[0], self.tasks[1]
+                r1, r2 = self.c.prepare(t001), self.c.prepare(t002)
+
+                w1 = Path(r1['worktree'])
+                (w1 / 'docs/smoke-alpha.md').write_text('# Smoke alpha\n\nThis is the alpha orchestration smoke document.\n')
+                git(w1, 'add', 'docs/smoke-alpha.md')
+                git(w1, 'commit', '-m', 'migration: T001 attempt 1')
+                r1['commit'] = git(w1, 'rev-parse', 'HEAD')
+                r1['attempt'] = 1
+                r1['review_attempt'] = 2
+
+                task1_dir = self.c.directory / 'tasks' / 'T001'
+                task1_dir.mkdir(parents=True, exist_ok=True)
+                job1_path = task1_dir / 'review-2-job.json'
+                receipt1_path = task1_dir / 'review-2-exit.json'
+                result1_path = task1_dir / 'review-2-result.txt'
+                log1_path = task1_dir / 'review-2.jsonl'
+                log1_path.write_text('{}\n')
+
+                approved_review = dict(
+                    approved=True,
+                    findings=[],
+                    criteria=[
+                        dict(id='AC1', passed=True, evidence='exact bytes verified'),
+                        dict(id='AC2', passed=True, evidence='Git diff verified')
+                    ]
+                )
+                atomic(result1_path, approved_review)
+
+                base_job = dict(
+                    task='T001', role='review', attempt=2,
+                    cwd=r1['worktree'], receipt=str(receipt1_path), result=str(result1_path),
+                    log=str(log1_path), provider='codex', model='gpt-6-sol'
+                )
+                base_receipt = dict(
+                    task='T001', role='review', attempt=2,
+                    exit=0, success=True, started=now - 5, finished=now,
+                    provider='codex', model='gpt-6-sol', result=str(result1_path), log=str(log1_path)
+                )
+
+                task2_dir = self.c.directory / 'tasks' / 'T002'
+                task2_dir.mkdir(parents=True, exist_ok=True)
+                job2_path = task2_dir / 'worker-1-job.json'
+                receipt2_path = task2_dir / 'worker-1-exit.json'
+                atomic(job2_path, dict(task='T002', role='worker', attempt=1, receipt=str(receipt2_path), cwd=r2['worktree']))
+                atomic(receipt2_path, dict(exit=1, success=False, started=now - 5, finished=now))
+                r2['attempt'] = 1
+                r2['phase'] = 'worker_finished'
+                r2['exit'] = dict(exit=1, success=False)
+                r2['job'] = str(job2_path)
+
+                r1['phase'] = initial_phase
+                r1['job'] = str(job1_path)
+                r1['review'] = None
+                self.c.save()
+
+                adversarial_cases = [
+                    ('boolean_exit_false', lambda j, r: r.update(exit=False)),
+                    ('boolean_exit_true', lambda j, r: r.update(exit=True)),
+                    ('float_exit_zero', lambda j, r: r.update(exit=0.0)),
+                    ('nonzero_exit', lambda j, r: r.update(exit=1)),
+                    ('string_exit', lambda j, r: r.update(exit='0')),
+                    ('diag_provider_failure', lambda j, r: r.update(provider_failure='authentication')),
+                    ('diag_error', lambda j, r: r.update(error='authentication required')),
+                    ('diag_parse_error', lambda j, r: r.update(parse_error='bad terminal output')),
+                    ('diag_launch_error', lambda j, r: r.update(launch_error='failed to spawn')),
+                    ('diag_timeout', lambda j, r: r.update(timeout=True)),
+                    ('diag_guest_error', lambda j, r: r.update(guest_error='broker failed')),
+                    ('diag_structured_error', lambda j, r: r.update(structured_error='bad handoff')),
+                    ('diag_snapshot_error', lambda j, r: r.update(snapshot_error='git diff failed')),
+                    ('success_false', lambda j, r: r.update(success=False)),
+                    ('stale_receipt_attempt', lambda j, r: r.update(attempt=1)),
+                    ('stale_job_attempt', lambda j, r: j.update(attempt=1)),
+                    ('task_mismatch_receipt', lambda j, r: r.update(task='T002')),
+                    ('task_mismatch_job', lambda j, r: j.update(task='T002')),
+                    ('role_mismatch_receipt', lambda j, r: r.update(role='worker')),
+                    ('role_mismatch_job', lambda j, r: j.update(role='worker')),
+                    ('provider_mismatch', lambda j, r: r.update(provider='other')),
+                    ('model_mismatch', lambda j, r: r.update(model='other')),
+                    ('cwd_mismatch_job', lambda j, r: j.update(cwd=str(self.repo))),
+                    ('cwd_mismatch_receipt', lambda j, r: r.update(cwd=str(self.repo))),
+                    ('stale_result_path', lambda j, r: r.update(result=str(task1_dir / 'review-1-result.txt'))),
+                ]
+
+                for name, mutate in adversarial_cases:
+                    with self.subTest(case=name, phase=initial_phase):
+                        j = dict(base_job)
+                        rec = dict(base_receipt)
+                        mutate(j, rec)
+                        atomic(job1_path, j)
+                        atomic(receipt1_path, rec)
+                        r1['phase'] = initial_phase
+                        r1['review'] = None
+                        r1['commit'] = git(w1, 'rev-parse', 'HEAD')
+                        self.c.state['blocked'] = None
+                        self.c.save()
+
+                        with self.assertRaises(Stop):
+                            self.c.execute(self.tasks)
+
+                        state = json.loads(self.c.file.read_text())
+                        self.assertNotEqual(state['records']['T001'].get('phase'), 'approved')
+                        self.assertFalse((state['records']['T001'].get('review') or {}).get('approved', False))
+
+                # Commit identity mismatch
+                with self.subTest(case='commit_mismatch', phase=initial_phase):
+                    atomic(job1_path, base_job)
+                    atomic(receipt1_path, base_receipt)
+                    r1['phase'] = initial_phase
+                    r1['review'] = None
+                    (w1 / 'docs/unauthorized.md').write_text('tampered\n')
+                    git(w1, 'add', 'docs/unauthorized.md')
+                    git(w1, 'commit', '-m', 'tampered commit')
+                    self.c.state['blocked'] = None
+                    self.c.save()
+                    with self.assertRaises(Stop):
+                        self.c.execute(self.tasks)
+                    state = json.loads(self.c.file.read_text())
+                    self.assertNotEqual(state['records']['T001'].get('phase'), 'approved')
+                    git(w1, 'reset', '--hard', 'HEAD~1')
+
+                # Stale job file pointing to review-1
+                with self.subTest(case='stale_job_file', phase=initial_phase):
+                    stale_job_path = task1_dir / 'review-1-job.json'
+                    atomic(stale_job_path, dict(base_job, attempt=1))
+                    atomic(job1_path, base_job)
+                    atomic(receipt1_path, base_receipt)
+                    r1['job'] = str(stale_job_path)
+                    r1['phase'] = initial_phase
+                    r1['review'] = None
+                    self.c.state['blocked'] = None
+                    self.c.save()
+                    with self.assertRaises(Stop):
+                        self.c.execute(self.tasks)
+                    state = json.loads(self.c.file.read_text())
+                    self.assertNotEqual(state['records']['T001'].get('phase'), 'approved')
+                    r1['job'] = str(job1_path)
+
+                # Stale receipt file in job
+                with self.subTest(case='stale_receipt_file', phase=initial_phase):
+                    stale_receipt_path = task1_dir / 'review-1-exit.json'
+                    atomic(stale_receipt_path, dict(base_receipt, attempt=1))
+                    atomic(job1_path, dict(base_job, receipt=str(stale_receipt_path)))
+                    atomic(receipt1_path, base_receipt)
+                    r1['phase'] = initial_phase
+                    r1['review'] = None
+                    self.c.state['blocked'] = None
+                    self.c.save()
+                    with self.assertRaises(Stop):
+                        self.c.execute(self.tasks)
+                    state = json.loads(self.c.file.read_text())
+                    self.assertNotEqual(state['records']['T001'].get('phase'), 'approved')
+
+                # Confinement symlink in receipt
+                with self.subTest(case='symlink_receipt', phase=initial_phase):
+                    atomic(job1_path, base_job)
+                    real_receipt = task1_dir / 'real_receipt.json'
+                    atomic(real_receipt, base_receipt)
+                    receipt1_path.unlink(missing_ok=True)
+                    receipt1_path.symlink_to(real_receipt)
+                    r1['phase'] = initial_phase
+                    r1['review'] = None
+                    self.c.state['blocked'] = None
+                    self.c.save()
+                    with self.assertRaises(Stop):
+                        self.c.execute(self.tasks)
+                    state = json.loads(self.c.file.read_text())
+                    self.assertNotEqual(state['records']['T001'].get('phase'), 'approved')
+                    receipt1_path.unlink()
+                    atomic(receipt1_path, base_receipt)
+                    real_receipt.unlink()
+
+                # Legitimate reviewer receipt succeeds
+                with self.subTest(case='legitimate_approval', phase=initial_phase):
+                    atomic(job1_path, base_job)
+                    atomic(receipt1_path, base_receipt)
+                    r1['phase'] = initial_phase
+                    r1['review'] = None
+                    r1['commit'] = git(w1, 'rev-parse', 'HEAD')
+                    self.c.state['blocked'] = None
+                    self.c.save()
+
+                    with self.assertRaises(Stop):
+                        self.c.execute(self.tasks)
+
+                    state = json.loads(self.c.file.read_text())
+                    self.assertIn(state['records']['T001']['phase'], ('approved', 'merge_pending', 'integration_testing', 'merged'))
+                    self.assertTrue(state['records']['T001']['review']['approved'])
+
+    def test_reconcile_persists_state_and_preserves_refusals(self):
+        """Reconcile durably saves verified integration_testing phase and expected_head, clearing blocker."""
+        self.c.initialize(self.tasks)
+        t = self.tasks[0]
+        r = self.c.prepare(t)
+        base = self.c.state['baseline']
+
+        w = Path(r['worktree'])
+        (w / 'docs/smoke-alpha.md').write_text('# Smoke alpha\n\nThis is the alpha orchestration smoke document.\n')
+        git(w, 'add', 'docs/smoke-alpha.md')
+        git(w, 'commit', '-m', 'migration: T001 attempt 1')
+        candidate = git(w, 'rev-parse', 'HEAD')
+
+        r['attempt'] = 1
+        r['commit'] = candidate
+        r['pre_merge'] = base
+        r['phase'] = 'merge_pending'
+
+        # Create authentic merge commit on integration worktree
+        git(self.c.integration, 'merge', '--no-ff', '--no-edit', candidate)
+        merge_head = git(self.c.integration, 'rev-parse', 'HEAD')
+
+        self.c.state['blocked'] = 'T001 merge_pending requires reconciliation'
+        self.c.save()
+
+        # 1. Success case: CLI reconcile saves state and clears blocker
+        res = self.recovery_command('reconcile', '--task', 'T001')
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        state = json.loads(self.c.file.read_text())
+        record = state['records']['T001']
+        self.assertEqual(record['phase'], 'integration_testing')
+        self.assertEqual(record['merge'], merge_head)
+        self.assertEqual(state['expected_head'], merge_head)
+        self.assertIsNone(state['blocked'])
+
+        # 2. Refusal case: wrong phase leaves state bytes unchanged
+        before = self.c.file.read_bytes()
+        res = self.recovery_command('reconcile', '--task', 'T001')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Reconcile only handles a completed pending merge', res.stderr)
+        self.assertEqual(self.c.file.read_bytes(), before)
+
+        # 3. Refusal case: wrong parents
+        record['phase'] = 'merge_pending'
+        atomic(self.c.file, state)
+        (self.c.integration / 'extra.txt').write_text('extra\n')
+        git(self.c.integration, 'add', 'extra.txt')
+        git(self.c.integration, 'commit', '-m', 'non-merge')
+        before = self.c.file.read_bytes()
+        res = self.recovery_command('reconcile', '--task', 'T001')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Pending merge is not complete with the recorded parents', res.stderr)
+        self.assertEqual(self.c.file.read_bytes(), before)
+
+        # 4. Refusal case: conflict resolution changed tree
+        git(self.c.integration, 'reset', '--hard', merge_head)
+        (self.c.integration / 'tampered.txt').write_text('tampered\n')
+        git(self.c.integration, 'add', 'tampered.txt')
+        git(self.c.integration, 'commit', '--amend', '--no-edit')
+        before = self.c.file.read_bytes()
+        res = self.recovery_command('reconcile', '--task', 'T001')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('Conflict resolution changed the reviewed merge result', res.stderr)
+        self.assertEqual(self.c.file.read_bytes(), before)
+
+    def test_continue_fallback_persists_intent_and_preserves_refusals(self):
+        self.c.initialize(self.tasks)
+        r = self.c.prepare(self.tasks[0])
+        task_dir = self.c.directory / 'tasks' / 'T001'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        job_path = task_dir / 'worker-1-job.json'
+        receipt_path = task_dir / 'worker-1-exit.json'
+        provenance_path = task_dir / 'worker-1-partial.json'
+        current = snapshot(r['worktree'])
+        job = dict(task='T001', role='worker', attempt=1, receipt=str(receipt_path),
+                   before_snapshot=dict(current))
+        atomic(job_path, job)
+        atomic(receipt_path, dict(exit=124, success=False, started=10, finished=20))
+        atomic(provenance_path, dict(reason='timeout', job=str(job_path), receipt=str(receipt_path),
+                                     provider='agy', model='gemini-3.8-flash-medium', attempt=1,
+                                     before=dict(current), after=dict(current)))
+        fallback = {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'medium'}
+        self.c.routing = {
+            'primary': {'backend': 'agy', 'model': 'gemini-3.8-flash-medium', 'effort': 'medium',
+                        'scoped_worker_permissions': True},
+            'fallback': fallback,
+            'reviewer': {'backend': 'codex', 'model': 'gpt-6-sol', 'effort': 'medium'},
+        }
+        r.update(phase='provider_blocked', attempt=1, job=str(job_path), branch=current['branch'],
+                 provider_failure=dict(reason='timeout', provenance=str(provenance_path), diff='retained.patch'))
+        self.c.state['blocked'] = 'T001: provider timeout; continuation not yet recorded'
+        self.c.save()
+
+        plan = 'Continue the retained task from its verified partial worktree and preserve all existing changes.'
+        self.c.continue_fallback('T001', plan)
+
+        # Reopening from disk is the continuation boundary used by a later resume.
+        resumed = Coordinator(self.repo, self.c.directory, self.config, routing=self.c.routing)
+        record = resumed.state['records']['T001']
+        self.assertEqual(record['phase'], 'fallback_pending')
+        self.assertEqual(record['fallback_plan']['plan'], plan)
+        self.assertEqual(record['fallback_plan']['provenance'], str(provenance_path))
+        self.assertEqual(record['fallback_plan']['snapshot'], current)
+        self.assertEqual(record['fallback_plan']['route'], fallback)
+        self.assertIsNone(resumed.state['blocked'])
+
+        # A second continuation request is refused without rewriting durable state.
+        before = resumed.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'explicit 40–6000 character continuation plan'):
+            resumed.continue_fallback('T001', plan)
+        self.assertEqual(resumed.file.read_bytes(), before)
+
+        # A missing terminal receipt is refused without any state mutation.
+        r['phase'] = 'provider_blocked'
+        self.c.state['blocked'] = 'original blocker'
+        self.c.save()
+        receipt_path.unlink()
+        before = self.c.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'No terminal receipt'):
+            self.c.continue_fallback('T001', plan)
+        self.assertEqual(self.c.file.read_bytes(), before)
+        atomic(receipt_path, dict(exit=124, success=False, started=10, finished=20))
+
+        # A changed retained worktree is likewise refused byte-for-byte.
+        (Path(r['worktree']) / 'unreviewed-change.txt').write_text('changed after timeout\n')
+        before = self.c.file.read_bytes()
+        with self.assertRaisesRegex(Stop, 'changed since failure'):
+            self.c.continue_fallback('T001', plan)
+        self.assertEqual(self.c.file.read_bytes(), before)
 
     def test_coordinator_interruption_does_not_duplicate_workers(self):
         atomic(self.root/'config.json',self.config)
