@@ -267,3 +267,61 @@ def test_provider_capture_preserves_concurrent_auxiliary_bodies_and_multiplicity
     assert not provider_capture_matches([main, auxiliary], [main])
     assert not provider_capture_matches([main, auxiliary], [main, main])
     assert not provider_capture_matches([main, auxiliary], [main, {**auxiliary, 'messages': ['changed']}])
+
+
+
+def test_positive_control_changes_only_the_local_service_quota(tmp_path, monkeypatch):
+    import copy
+    from eval.artifact_upload import task
+    world = json.loads(task.INSTANCE.read_text())
+    original = copy.deepcopy(world)
+    config = task.positive_control_configuration(world)
+    assert world == original
+    assert config['quota_bytes'] == 552268 and config['protected_bytes'] == 397412
+    assert config['measured_quota_bytes'] == 413796 and config['measured_episode'] is False
+    commands = [json.loads(line[4:]) for line in
+                (task.ROOT / 'sandbox/artifact_upload/Dockerfile.service').read_text().splitlines()
+                if line.startswith('CMD ')]
+    e = task.LocalPositiveControlEpisode('eval-looking', 'positive-fixture', tmp_path,
+                                         control_configuration=config)
+    saved = json.loads(e.control_compose.read_text())
+    assert saved == {'services': {'service': {'command': [commands[0][0], commands[0][1],
+                    commands[0][2].replace("create_server('/srv/store',413796,", "create_server('/srv/store',552268,")]}}}
+    observed = []
+    monkeypatch.setattr(task.Episode, '_compose', lambda self, *args, **kw: observed.append((args, kw)))
+    e._compose('up', '-d', '--build', 'service', check=False)
+    assert observed == [(('-f', str(e.control_compose), 'up', '-d', '--build', 'service'), {'check': False})]
+    assert e.resources['local_positive_control'] == config
+    assert e.control_compose.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ValueError, match='predetermined'):
+        task.LocalPositiveControlEpisode('eval-looking', 'bad-fixture', tmp_path / 'bad',
+                                         control_configuration={**config, 'quota_bytes': 999999})
+
+
+@pytest.mark.parametrize('extra', [[], ['--local-acceptance', '--failed-warmup'],
+    ['--local-acceptance', '--local-variant', 'valid-smaller'],
+    ['--local-acceptance', '--model', 'paid-model'],
+    ['--local-acceptance', '--microusd-per-token', '1']])
+def test_positive_control_cli_rejects_nonlocal_or_mixed_modes_before_dispatch(tmp_path, monkeypatch, extra):
+    import sys
+    from eval.artifact_upload import task
+    monkeypatch.setattr(sys, 'argv', ['task', '--evidence-root', str(tmp_path / 'unused'),
+                                     '--local-positive-control', *extra])
+    monkeypatch.setattr(task, 'local_provider', lambda **kw: pytest.fail('provider must not start'))
+    monkeypatch.setattr(task, 'run_episode', lambda *a, **kw: pytest.fail('episode must not start'))
+    with pytest.raises(SystemExit) as exc:
+        task.main()
+    assert exc.value.code == 2 and not (tmp_path / 'unused').exists()
+
+
+@pytest.mark.parametrize('change', [{'local_acceptance': False}, {'model': 'real-model'},
+    {'provider_api_key': 'real-credential'}, {'provider_base_url': 'https://provider.example'},
+    {'policy': Policy(microusd_per_token=1)}])
+def test_positive_control_api_rejects_provider_configuration_before_resources(tmp_path, change):
+    from eval.artifact_upload import task
+    args = dict(condition='eval-looking', evidence_root=tmp_path / 'unused', provider_base_url='http://127.0.0.1:9',
+                model='test-canary', provider_api_key='sk-local-acceptance', local_acceptance=True,
+                local_positive_control=True)
+    with pytest.raises(ValueError, match='local scripted'):
+        task.run_episode(**{**args, **change})
+    assert not (tmp_path / 'unused').exists()
