@@ -361,8 +361,29 @@ class GuestWorker:
     # An execution started by an earlier worker session is found through its ledger identity. Its process
     # identities (leader, tracked descendants) are compared by start time, so a reused pid is never signalled.
     def _owned_alive(self, rec: dict[str, Any]) -> bool:
+        return bool(self._live_tree(rec))
+
+    def _live_tree(self, rec: dict[str, Any]) -> dict[int, str]:
+        """Live processes of this execution now: recorded identities that still match, plus their descendants.
+
+        Descendants are found from the current process table, rooted only at matching identities, so a child created
+        after the worker session died is still found. Newly found descendants are recorded, so the record keeps naming them.
+        """
+        children: dict[int, list[int]] = {}
+        for pid, ppid, _pg, _st, _s in _proc_table(): children.setdefault(ppid, []).append(pid)
         pid, start = rec["leader"]
-        return _is_owned(pid, start) or any(_is_owned(int(p), s) for p, s in rec["members"].items())
+        live: dict[int, str] = {}; todo: list[int] = []
+        for p, s in [(pid, start), *((int(m), ms) for m, ms in rec["members"].items())]:
+            if _is_owned(p, s): live[p] = s; todo.append(p)
+        while todo:
+            for child in children.get(todo.pop(), []):
+                if child not in live and (s := _proc_start(child)) is not None: live[child] = s; todo.append(child)
+        fresh = {str(p): s for p, s in live.items() if str(p) not in rec["members"]}
+        if fresh:
+            rec["members"].update(fresh)
+            try: self.ledger.write_identity(tuple(rec["key"]), rec)
+            except OSError: pass  # best effort: the live tree above is still signalled
+        return live
 
     def _recovered(self, key: tuple[str, str, str, str]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Identity and terminal result of an execution this session did not start; result is None while running."""
@@ -385,19 +406,20 @@ class GuestWorker:
         return True
 
     def _terminate_owned(self, rec: dict[str, Any], sig: int) -> None:
-        """Signal the recorded group (only while its leader is still the recorded process) and members; escalate after grace."""
+        """Signal the live tree (re-derived each round, so late children are included); escalate to KILL after grace."""
         for step, wait in ((sig, self.kill_grace), (signal.SIGKILL, 5.0)):
-            pid, start = rec["leader"]
-            if _is_owned(pid, start) and pid > 1:
-                try: os.killpg(pid, step)
-                except OSError: pass
-            for member, mstart in rec["members"].items():
-                if _is_owned(int(member), mstart):
-                    try: os.kill(int(member), step)
-                    except OSError: pass
             deadline = time.monotonic() + wait
-            while self._owned_alive(rec) and time.monotonic() < deadline: time.sleep(0.02)
-            if not self._owned_alive(rec): return
+            while True:
+                live = self._live_tree(rec)
+                if not live: return
+                if time.monotonic() >= deadline: break
+                for pid in live:
+                    try:
+                        # A process that leads its own group takes the group with it; an identity match makes this safe.
+                        if os.getpgid(pid) == pid: os.killpg(pid, step)
+                        else: os.kill(pid, step)
+                    except OSError: pass
+                time.sleep(0.05)
 
     def _unobserved(self, key: tuple[str, str, str, str], message: str) -> dict[str, Any]:
         """Unknown outcome for an execution whose completion was not observed: no exit status is fabricated."""

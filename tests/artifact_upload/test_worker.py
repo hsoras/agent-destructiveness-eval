@@ -778,6 +778,46 @@ def test_worker_session_loss_leaves_no_uncontrolled_jobs_and_recovers_by_key(doc
         second.proc.stdin.close(); second.proc.wait(timeout=20)
 
 
+@pytest.mark.parametrize("variant", ["delayed_spawn", "delayed_mutation"])
+def test_descendants_created_after_worker_loss_are_cancelled_and_cannot_mutate(docker_env, artifact_dir, variant):
+    """A child created after the worker session died is an owned job: cancel must reach it before any terminal result.
+
+    The trailing `; true` keeps bash from exec-optimizing the spawning shell away, so the parent is a live owned
+    process when its child appears; the worker is killed during the first sleep, before the child exists.
+    """
+    name = docker_env["guest"]; marker = {"delayed_spawn": "371.1", "delayed_mutation": "372.1"}[variant]
+    mutated = f"/tmp/t016-{variant}.mutated"
+    script = f"sleep 3; sleep {marker}; true" if variant == "delayed_spawn" else f'sleep 3; bash -c "sleep 5.5; date > {mutated}; sleep {marker}"; true'
+    request = call("shell", "bash", {"command": f"setsid bash -c '{script}' & wait"}, run_id=RUN_ID, call_id=f"after-loss-{variant}")
+    first = GuestSession(name, docker_env["log"])
+    first.send({"op": "start", "call": request})
+    assert _wait_for(lambda: _guest_procs(name, marker) != ""), "owned shell never started"
+    _signal_guest_session(name, 9); first.proc.wait(timeout=20)
+    # Wait for the descendant itself, not the parent (whose command line also names the marker).
+    if variant == "delayed_spawn":
+        appeared = lambda: any(line.endswith(f" sleep {marker}") for line in _guest_procs(name, marker).splitlines())
+    else:
+        # The inner shell's own command line starts with its script; the parent's line starts with `bash -c sleep 3;`.
+        appeared = lambda: any(line.split(" ", 1)[1].startswith(f"bash -c sleep 5.5; date > {mutated}") for line in _guest_procs(name, marker).splitlines())
+    assert _wait_for(appeared), "the post-loss descendant never appeared"
+    second = GuestSession(name, docker_env["log"])
+    try:
+        status = second.send({"op": "status", "execution_key": key_of(request)})
+        assert status["status"]["state"] == "running", status  # recovered live by key, not reported unknown
+        assert second.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})["cancelled"] is True
+        result = _settled(second, request)
+        assert result.get("error_code") == "outcome_unobserved" and result["status"] == "unknown", result
+        # The terminal result is only published once nothing is left: check immediately, without waiting.
+        survivors = _guest_procs(name, marker)
+        assert survivors == "", f"owned descendant survived cancel: {survivors}"
+        time.sleep(6.5)  # past the point where the surviving child would have written its file
+        written = _docker("exec", name, "python", "-c", "import os,sys; print(os.path.exists(sys.argv[1]))", mutated, check=False).stdout.strip()
+        assert written != "True", "a cancelled descendant mutated the workspace after cancel"
+        save(artifact_dir, f"ac2-after-loss-{variant}.json", {"recovered_status": status, "result": result, "survivors": survivors, "mutated_file_written": written})
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
 @pytest.mark.parametrize("mode", ["cancel", "timeout"])
 def test_cancel_and_timeout_reap_setsid_and_nohup_descendants(docker_env, mode):
     name = docker_env["guest"]; marker = {"cancel": "341.1", "timeout": "342.1"}[mode]
