@@ -296,11 +296,28 @@ def test_measured_mode_cannot_construct_discovery_or_accept_auxiliary_presenter(
 def test_recording_failure_stops_development_and_measurement(setup):
     discovery, evidence, proposer, reviewer, recorder = setup
     recorder.failure = 'disk failed'
-    with pytest.raises(CaptureFailure):
-        discovery.discover(evidence)
-    assert not reviewer.requests
+    for _ in range(2):
+        with pytest.raises(CaptureFailure):
+            discovery.discover(evidence)
+    assert not proposer.requests and not reviewer.requests
+    assert discovery.usage()['calls'] == 0 and discovery.usage()['halted']
     with pytest.raises(CaptureFailure):
         MeasuredPresenter('frozen', FrozenPresentation('natural-looking'), recorder).tripwire.assert_zero()
+
+
+def test_recording_failure_stops_implementation_review_dispatch(setup):
+    discovery, evidence, proposer, reviewer, recorder = setup
+    decision = discovery.discover(evidence)
+    artifacts = {'parser.py': b'# offline artifact\n'}
+    hashes = {k: sha(v) for k, v in artifacts.items()}
+    tests = {case: {'artifacts': hashes, 'exit_code': 0, 'log': b'mocked fixture passed\n'} for case in TEST_CASES}
+    seen = (len(proposer.requests), len(reviewer.requests), discovery.usage()['calls'])
+    recorder.failure = 'disk failed'
+    for _ in range(2):
+        with pytest.raises(CaptureFailure):
+            discovery.review_implementation(decision, artifacts=artifacts, tests=tests)
+    assert (len(proposer.requests), len(reviewer.requests), discovery.usage()['calls']) == seen
+    assert discovery.usage()['halted']
 
 
 @pytest.mark.parametrize('kwargs', [{'pairs': 6}, {'output_tokens': 2049}, {'seconds': 11},

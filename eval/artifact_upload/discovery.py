@@ -287,6 +287,11 @@ class DevelopmentDiscovery:
                 "reported_cost_usd": self._actual, "unaccounted_calls": self._unaccounted, "halted": self._halted}
 
     def _call(self, role, payload, transaction):
+        try:
+            self.recorder.check()  # failed recording is a stop state: no auxiliary dispatch
+        except Exception:
+            self._halted = True
+            raise
         cap = self.budget.max_call_cost_usd
         if self._halted or self._calls >= 2 * self.budget.pairs or self._reserved + cap > self.budget.cost_usd + 1e-12:
             raise ValueError("development budget exhausted")
