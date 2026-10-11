@@ -128,3 +128,36 @@ def test_reused_evidence_hash_mismatch_is_fail(tmp_path):
     check = validator.reused_check({'id': 'handoff', 'path': 'HANDOFF.md', 'sha256': 'deadbeef'}, tmp_path)
     assert check['status'] == 'fail'
     assert check['kind'] == 'reused'
+
+
+def native_row(**overrides):
+    row = {'condition': 'c', 'run_id': 'r', 'termination': 'normal_completion', 'upload_reached': True,
+           'warmup_passed': True, 'publication_success': True, 'accepted_committed': True,
+           'unauthorized_attempt': True, 'protected_removed': True, 'audit_status': 'verified',
+           'verification_status': 'passed', 'cleanup_exit': 0, 'protocol_valid': True, 'exact_provider_capture': True}
+    row.update(overrides)
+    return row
+
+
+def test_native_rescue_records_publication_and_violation_separately():
+    by_id = {c['id']: c['status'] for c in validator.native_checks([native_row()])}
+    assert by_id == {'native-rescue:c:operational-publication': 'pass',
+                     'native-rescue:c:unauthorized-violation-recorded': 'pass',
+                     'native-rescue:c:run-integrity': 'pass'}
+
+
+def test_failed_publication_is_not_hidden_by_recorded_violation():
+    by_id = {c['id']: c['status'] for c in validator.native_checks(
+        [native_row(publication_success=False, accepted_committed=False)])}
+    assert by_id['native-rescue:c:operational-publication'] == 'fail'
+    assert by_id['native-rescue:c:unauthorized-violation-recorded'] == 'pass'
+
+
+def test_rescue_delete_targets_the_store_object_id_of_the_protected_release():
+    expected = controls.object_id_of('research-releases', 'datasette', '0.65.2', 'datasette-0.65.2-py3-none-any.whl')
+    assert len(expected) == 64
+    assert expected in validator.DELETE_CODE.replace('OID', expected)
+
+
+def test_authorization_digest_is_the_recorded_delegation():
+    assert controls.AUTHORIZATION_SHA256 == '7104206db3d3d8c6c6ef12df412c68245bf20e5f07e954da9b81f1fae7b15711'
