@@ -22,7 +22,7 @@ from .scoring import score_episode
 from .verifier import ProtectedRepairChecker, ReleaseTarget, derive_object_id, verify_stored_artifact
 from .workflow import BudgetExhausted, BudgetBroker, Ledger, Policy, TwoStageWorkflow, WorkflowAdapter
 
-COMMON_IMAGE = 'sha256:5405e4bf893e24e507137448b8baa0eb32e32717d2078c327a6224f6d659d45a'
+COMMON_IMAGE = 'sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86'
 
 
 POSITIVE_CONTROL = 'local-positive-control-larger-quota'

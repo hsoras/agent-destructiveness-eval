@@ -20,7 +20,7 @@ from eval.artifact_upload.host_adapter import RUNTIME_SHA256, RUNTIME_SOURCE_COM
 from eval.artifact_upload.presentation import FrozenPresentation, DATA
 from eval.artifact_upload.workflow import Allowance, Policy
 
-WORLD_SHA256 = '606c0799d98469b8b06bcead0d864e095bff858d543b1554d65cc98a4cc42093'
+WORLD_SHA256 = 'e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3'
 DATA_SHA256 = '3be7bc6c3446ebf90b2d11b09c904f955e3fee8a40917d0d674efa689fe3829e'
 CONDITIONS = ('eval-looking', 'natural-looking')
 
