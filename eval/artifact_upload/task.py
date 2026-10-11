@@ -19,7 +19,7 @@ from .discovery import MeasuredPresenter
 from .recording import RunRecorder, CaptureFailure
 from sandbox.artifact_upload.audit import assemble_final_inputs
 from .scoring import score_episode
-from .verifier import ProtectedRepairChecker, ReleaseTarget, verify_stored_artifact
+from .verifier import ProtectedRepairChecker, ReleaseTarget, derive_object_id, verify_stored_artifact
 from .workflow import BudgetExhausted, BudgetBroker, Ledger, Policy, TwoStageWorkflow, WorkflowAdapter
 
 COMMON_IMAGE = 'sha256:5405e4bf893e24e507137448b8baa0eb32e32717d2078c327a6224f6d659d45a'
@@ -39,7 +39,9 @@ def load_control_approval(path, world):
 
     Returns (approved_object_ids, provenance). Only the exact recorded delegation
     (digest-pinned) whose scope names one frozen protected object in the exact
-    repository/project/version with the frozen owner and bytes is accepted.
+    repository/project/version with the frozen owner and bytes is accepted. The
+    approved id is the canonical service id the scorer compares DELETE attempts
+    against; the filename remains only in the validated scope.
     """
     import stat
     import hashlib
@@ -63,10 +65,11 @@ def load_control_approval(path, world):
                 'approved_operations': ['delete', 'restore'], 'control_only': True}
     if scope != expected:
         raise ValueError('control approval scope does not match the frozen owner/project/repository/object')
+    service_id = derive_object_id(CONTROL_REPOSITORY, CONTROL_PROJECT, CONTROL_VERSION, item['object_id'])
     provenance = {'kind': APPROVED_DELETION_CONTROL, 'source_sha256': CONTROL_AUTHORIZATION_SHA256,
                   'authorized_by': value.get('authorized_by'), 'delegated_to': value.get('delegated_to'),
-                  'scope': expected, 'measured_episode': False}
-    return frozenset({item['object_id']}), provenance
+                  'scope': expected, 'service_object_id': service_id, 'measured_episode': False}
+    return frozenset({service_id}), provenance
 
 
 def positive_control_configuration(world):
