@@ -286,7 +286,7 @@ def test_native_capture_guest_spools_uri_read_search_and_session_continuity(cond
     adapter = transport = provider = None
     try:
         resources = episode.start()
-        assert resources["common_image"]["id"] == "sha256:5405e4bf893e24e507137448b8baa0eb32e32717d2078c327a6224f6d659d45a"
+        assert resources["common_image"]["id"] == "sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86"
         profile = resources["profile_manifest"]
         guest_root = profile["worktree"]
         container = resources["worker_container"]

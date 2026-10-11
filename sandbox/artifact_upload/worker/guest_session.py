@@ -7,9 +7,12 @@ requests cannot choose a host path, container, run or service volume.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import signal
 import sys
+import tempfile
 from typing import Any
 
 from .core import GuestWorker, WorkerError
@@ -32,16 +35,32 @@ def handle(worker: GuestWorker, trusted_run: str, req: dict[str, Any]) -> dict[s
     raise WorkerError("unsupported_operation", f"unknown session operation: {op!r}")
 
 
+def _leave(signum: int, frame: Any) -> None:
+    raise SystemExit(128 + signum)  # unwinds main() so the owned executions are shut down before exit
+
+
+def state_dir_for(run_id: str) -> str:
+    """Run-private guest state: keyed by the trusted run identity, outside the target workspace."""
+    return os.path.join(tempfile.gettempdir(), "artifact-worker-state", hashlib.sha256(run_id.encode()).hexdigest()[:32])
+
+
 def main() -> int:
     trusted_run = os.environ["ARTIFACT_RUN_ID"]
     worker = GuestWorker(os.environ.get("ARTIFACT_GUEST_ROOT", os.getcwd()), worker_id=os.environ.get("ARTIFACT_WORKER_ID", "guest-worker"),
-                         protected_paths=[p for p in os.environ.get("ARTIFACT_PROTECTED_PATHS", "").split(":") if p], kill_grace=1.0)
-    for line in sys.stdin:
-        if not line.strip(): continue
-        try: reply = handle(worker, trusted_run, json.loads(line))
-        except WorkerError as e: reply = {"error": {"code": e.code, "message": str(e)}}
-        except Exception as e: reply = {"error": {"code": "internal_error", "message": str(e)}}
-        sys.stdout.write(json.dumps(reply) + "\n"); sys.stdout.flush()
+                         protected_paths=[p for p in os.environ.get("ARTIFACT_PROTECTED_PATHS", "").split(":") if p], kill_grace=1.0,
+                         state_dir=state_dir_for(trusted_run))
+    signal.signal(signal.SIGTERM, _leave); signal.signal(signal.SIGHUP, _leave)
+    try:
+        for line in sys.stdin:
+            if not line.strip(): continue
+            try: reply = handle(worker, trusted_run, json.loads(line))
+            except WorkerError as e: reply = {"error": {"code": e.code, "message": str(e)}}
+            except Exception as e: reply = {"error": {"code": "internal_error", "message": str(e)}}
+            sys.stdout.write(json.dumps(reply) + "\n"); sys.stdout.flush()
+    finally:
+        # Graceful end (EOF, TERM, HUP) cancels this session's shells; a SIGKILL cannot run this, and a
+        # successor session recovers those executions from the ledger instead.
+        worker.shutdown()
     return 0
 
 
