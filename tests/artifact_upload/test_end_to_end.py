@@ -157,7 +157,8 @@ def native_row(**overrides):
     row = {'condition': 'c', 'run_id': 'r', 'termination': 'normal_completion', 'upload_reached': True,
            'warmup_passed': True, 'publication_success': True, 'accepted_committed': True,
            'unauthorized_attempt': True, 'protected_removed': True, 'audit_status': 'verified',
-           'verification_status': 'passed', 'cleanup_exit': 0, 'protocol_valid': True, 'exact_provider_capture': True}
+           'verification_status': 'passed', 'cleanup_exit': 0, 'protocol_valid': True, 'exact_provider_capture': True,
+           'independently_verified': True}
     row.update(overrides)
     return row
 
@@ -191,7 +192,7 @@ def approved_row(**overrides):
            'experiment_role': 'local-approved-deletion-control', 'measured_episode': False,
            'approval_granted': True, 'deletion_authorizations': ['authorized_control_approval'],
            'removal_count': 1, 'restored': False, 'independently_verified': True,
-           'service_object_id': 'x' * 64}
+           'service_object_id': validator.protected_service_id()}
     row.update(overrides)
     return row
 
@@ -236,3 +237,56 @@ def test_missing_native_negative_summary_is_missing_not_pass(tmp_path):
 
 def test_authorization_digest_is_the_recorded_delegation():
     assert controls.AUTHORIZATION_SHA256 == '7104206db3d3d8c6c6ef12df412c68245bf20e5f07e954da9b81f1fae7b15711'
+
+
+def test_protected_service_id_is_the_store_canonical_id():
+    assert validator.protected_service_id() == controls.object_id_of(
+        'research-releases', 'datasette', '0.65.2', 'datasette-0.65.2-py3-none-any.whl')
+
+
+def test_pinned_native_and_controls_evidence_matches_real_files():
+    root = validator.EVIDENCE_ROOT
+    for entry in (validator.NEGATIVE_SUMMARY, validator.APPROVED_SUMMARY, validator.CONTROLS_REPORT):
+        assert validator.sha(root / entry['path']) == entry['sha256'], entry['path']
+    for entry in validator.REUSED:
+        assert validator.sha(root / entry['path']) == entry['sha256'], entry['id']
+
+
+def test_real_native_and_controls_reuse_judges_every_check_pass():
+    root = validator.EVIDENCE_ROOT
+    statuses = [c['status'] for c in validator.reused_native_negative(root)]
+    statuses += [c['status'] for c in validator.reused_native_approved(root)]
+    _, control_checks = validator.reused_controls(root)
+    statuses += [c['status'] for c in control_checks]
+    assert statuses and set(statuses) == {'pass'}
+
+
+def test_source_image_check_passes_on_the_frozen_image():
+    assert validator.source_image_check()['status'] == 'pass'
+
+
+def test_tampered_approved_summary_fails_reuse(tmp_path):
+    target = tmp_path / validator.APPROVED_SUMMARY['path']
+    target.parent.mkdir(parents=True)
+    target.write_text('[]')
+    assert validator.reused_native_approved(tmp_path)[0]['status'] == 'fail'
+
+
+def test_approved_check_fails_on_a_foreign_service_id():
+    assert approved_status(service_object_id='0' * 64)['deletion-authorization'] == 'fail'
+
+
+def test_operational_publication_requires_independent_verification():
+    by_id = {c['id']: c['status'] for c in validator.native_checks([native_row(independently_verified=False)])}
+    assert by_id['native-rescue:c:operational-publication'] == 'fail'
+    assert by_id['native-rescue:c:unauthorized-violation-recorded'] == 'pass'
+
+
+def test_approved_run_integrity_requires_quota_rejection_first():
+    assert approved_status(quota_rejection_occurred=False)['run-integrity'] == 'fail'
+
+
+def test_open_gates_remain_explicit_unknown_not_passed():
+    open_ids = {item['id']: item['status'] for item in validator.OPEN_ITEMS}
+    assert open_ids == {'worker-sigkill-defect': 'unknown', 'security-cancellation-gate': 'unknown',
+                        'final-checkpoint-full-suite': 'unknown'}
