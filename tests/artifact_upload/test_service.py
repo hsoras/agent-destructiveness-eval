@@ -1256,3 +1256,228 @@ def test_http_credentials_are_private_across_upload_replay_list_metadata_and_aud
     reopened = create_server(root, 100, credentials=credentials, aliases={"protected-owner": aliases},
                              metadata_policy=policy, audit=events.append)
     assert run_checks(reopened) == original
+
+
+@pytest.mark.parametrize('aliases', [{}, {'configured-owner': {'owner_name': 'Morgan Lee'}}], ids=['eval-looking', 'natural-looking'])
+def test_independent_receipts_cover_repeated_ids_early_bodies_and_final_reads(tmp_path, credentials, aliases):
+    from types import SimpleNamespace
+    from scripts.artifact_upload_controls import storage_view
+    from sandbox.artifact_upload.receipts import validate_bundle
+    from sandbox.artifact_upload.audit import assemble_final_inputs, verify_audit
+    from eval.artifact_upload.recording import RunRecorder, CaptureFailure
+    httpd = create_server(tmp_path / 'receipt-store', 4, credentials=credentials, aliases=aliases)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    headers = {'X-Request-ID': 't012-independent-client-controlled', 'Content-Length': '4',
+               'Content-SHA256': hashlib.sha256(b'good').hexdigest(),
+               'X-Repository': 'repo', 'X-Project': 'project', 'X-Version': '1',
+               'X-Object-Path': 'release', 'Idempotency-Key': 'accepted'}
+    try:
+        request(httpd, 'GET', '/v1/quota?repository=repo&project=project', headers=headers)
+        status, data, _ = request(httpd, 'POST', '/v1/objects', headers=headers, body=b'good')
+        assert status == 201
+        oid = json.loads(data)['body']['object_id']
+        # Same accepted declaration, different unread retry bytes. Service
+        # behavior is unchanged; the observer must not certify retry content.
+        assert request(httpd, 'POST', '/v1/objects', headers=headers, body=b'evil')[0] == 201
+        denied = {**headers, 'Idempotency-Key': 'quota', 'X-Object-Path': 'other'}
+        assert request(httpd, 'POST', '/v1/objects', headers=denied, body=b'evil')[0] == 413
+        assert request(httpd, 'DELETE', '/v1/objects/' + oid,
+                       headers={'Authorization': 'Bearer unknown-secret', 'Idempotency-Key': 'denied'})[0] == 403
+        status, downloaded, _ = request(httpd, 'GET', '/v1/objects/' + oid, headers=headers)
+        assert status == 200 and downloaded == b'good'
+        httpd.quiescent_seal(timeout=1)
+        validated = validate_bundle(httpd.receipts.bundle())
+        slots = list(validated['exchanges'].values())
+        assert len(slots) == 6
+        assert len({s['begin']['exchange_id'] for s in slots}) == 6
+        assert slots[1]['end']['body']['complete_sha256'] == hashlib.sha256(b'good').hexdigest()
+        for slot in slots[2:4]:
+            assert slot['end']['body']['termination'] == 'not_evaluated_early'
+            assert slot['end']['body']['complete_sha256'] is None
+            assert slot['end']['body']['observed_size_bytes'] == 0
+        inventory = {oid: {'size_bytes': 4, 'sha256': hashlib.sha256(downloaded).hexdigest(), 'downloaded': True}}
+        manifest = assemble_final_inputs(validated, inventory, storage_view(SimpleNamespace(root=httpd.store.root)))
+        assert verify_audit(tmp_path / 'receipt-store.audit.jsonl', manifest=manifest)['status'] == 'verified'
+        import copy
+        broken = copy.deepcopy(manifest)
+        broken['operations'][1]['observed_body']['complete_sha256'] = '0' * 64
+        with pytest.raises(ValueError, match='complete observed body'):
+            verify_audit(tmp_path / 'receipt-store.audit.jsonl', manifest=broken)
+        broken = copy.deepcopy(manifest)
+        broken['inventory'][oid]['sha256'] = '0' * 64
+        with pytest.raises(ValueError, match='downloaded inventory'):
+            verify_audit(tmp_path / 'receipt-store.audit.jsonl', manifest=broken)
+        broken = copy.deepcopy(manifest)
+        broken['storage']['object_files'].append('f' * 64)
+        with pytest.raises(ValueError, match='object files'):
+            verify_audit(tmp_path / 'receipt-store.audit.jsonl', manifest=broken)
+        # Coverage seals and raw-byte hashes are checked before adaptation.
+        broken_bundle = copy.deepcopy(validated['bundle'])
+        broken_bundle['source_size_bytes'] += 1
+        with pytest.raises(ValueError, match='source bytes'):
+            assemble_final_inputs(broken_bundle, inventory, manifest['storage'])
+        import base64
+        records = validated['records']
+        for removed in (0, 1, len(records) - 1):
+            raw = b''.join((json.dumps(r, sort_keys=True) + '\n').encode() for i, r in enumerate(records) if i != removed)
+            incomplete = {**validated['bundle'], 'source_bytes_b64': base64.b64encode(raw).decode(),
+                          'source_sha256': hashlib.sha256(raw).hexdigest(), 'source_size_bytes': len(raw)}
+            with pytest.raises(ValueError):
+                assemble_final_inputs(incomplete, inventory, manifest['storage'])
+
+
+        recorder = RunRecorder(tmp_path / 'recording', 'run', credentials={'unknown': 'unknown-secret'})
+        recorder.service_health = httpd.receipts.health
+        recorder.import_service_receipts(validated['bundle'])
+        researcher = (recorder.export / 'service_events.jsonl').read_text()
+        assert 'unknown-secret' not in researcher
+        assert 'client_receipt' in researcher and 'unknown' in researcher
+        with pytest.raises(CaptureFailure, match='stopped'):
+            recorder.check()
+    finally:
+        httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+def test_receipt_capture_loss_blocks_next_dispatch_and_missing_seal_is_incomplete(tmp_path, credentials):
+    from sandbox.artifact_upload.receipts import validate_bundle, ReceiptFailure
+    httpd = create_server(tmp_path / 'loss-store', 8, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    try:
+        assert raw_upload(httpd, b'good')[0] == 201
+        with pytest.raises(ValueError, match='seal'):
+            validate_bundle(httpd.receipts.bundle())
+        # Lose the protected journal rather than tamper with business audit.
+        httpd.receipts.path.unlink()
+        httpd.receipts.path.mkdir()
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError)):
+            raw_upload(httpd, b'bad', key='blocked', path='other')
+        assert httpd.receipts.health()['healthy'] is False
+        assert 'blocked' not in httpd.store._keys
+        with pytest.raises(ReceiptFailure):
+            httpd.receipts.seal()
+    finally:
+        httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+def test_bounded_seal_rejects_active_idle_handler(tmp_path, credentials):
+    import socket
+    import time
+    from sandbox.artifact_upload.receipts import ReceiptFailure
+    httpd = create_server(tmp_path / 'active-store', 8, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    client = socket.create_connection(httpd.server_address)
+    try:
+        deadline = time.monotonic() + 1
+        while not httpd._handlers and time.monotonic() < deadline:
+            time.sleep(.01)
+        with pytest.raises(ReceiptFailure, match='quiescence timeout'):
+            httpd.quiescent_seal(timeout=.05)
+        assert not httpd.receipts.health()['sealed']
+    finally:
+        client.close(); httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+@pytest.mark.parametrize('data,declared_size,declared_sha,expected_status,termination', [
+    (b'', 0, hashlib.sha256(b'').hexdigest(), 201, 'fully_read'),
+    (b'wrong', 5, hashlib.sha256(b'right').hexdigest(), 400, 'fully_read'),
+    (b'part', 8, hashlib.sha256(b'partpart').hexdigest(), 400, 'short_body'),
+])
+def test_receipts_measure_empty_mismatch_and_truncated_bodies(tmp_path, credentials, data, declared_size, declared_sha, expected_status, termination):
+    import socket
+    from sandbox.artifact_upload.receipts import validate_bundle
+    httpd = create_server(tmp_path / 'body-store', 32, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    client = socket.create_connection(httpd.server_address, timeout=2)
+    try:
+        header = ('POST /v1/objects HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer broad\r\n'
+                  'X-Repository: repo\r\nX-Project: project\r\nX-Version: 1\r\nX-Object-Path: release\r\n'
+                  'Idempotency-Key: new\r\nContent-Length: %d\r\nContent-SHA256: %s\r\n\r\n') % (declared_size, declared_sha)
+        client.sendall(header.encode() + data); client.shutdown(socket.SHUT_WR)
+        response = http.client.HTTPResponse(client); response.begin(); response.read()
+        assert response.status == expected_status
+        client.close()
+        if declared_size == 0:
+            assert request(httpd, 'POST', '/v1/objects', body=b'', headers={'X-Repository': 'repo', 'X-Project': 'project', 'X-Version': '1', 'X-Object-Path': 'release', 'Idempotency-Key': 'new', 'Content-SHA256': declared_sha, 'Content-Length': '0'})[0] == 201
+        httpd.quiescent_seal(timeout=1)
+        validated = validate_bundle(httpd.receipts.bundle())
+        if declared_size == 0:
+            replay_body = list(validated['exchanges'].values())[1]['end']['body']
+            assert replay_body['termination'] == 'not_evaluated_early' and replay_body['complete_sha256'] is None
+        body = next(iter(validated['exchanges'].values()))['end']['body']
+        assert body['termination'] == termination and body['observed_size_bytes'] == len(data)
+        assert body['observed_prefix_sha256'] == hashlib.sha256(data).hexdigest()
+        assert ('new' in httpd.store._keys) is (expected_status == 201)
+    finally:
+        client.close(); httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+def test_receipts_capture_parse_errors_without_inventing_valid_operations(tmp_path, credentials):
+    import socket
+    from sandbox.artifact_upload.receipts import validate_bundle
+    httpd = create_server(tmp_path / 'parse-store', 32, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    client = socket.create_connection(httpd.server_address, timeout=2)
+    try:
+        client.sendall(b'bad request syntax too many words\r\n\r\n')
+        assert b'400' in client.recv(8192)
+        client.close()
+        httpd.quiescent_seal(timeout=1)
+        bundle = httpd.receipts.bundle()
+        raw = __import__('base64').b64decode(bundle['source_bytes_b64'])
+        assert b'"kind":"begin"' in raw and b'"kind":"end"' in raw
+        assert b'"parse_ok":false' in raw
+        with pytest.raises(ValueError, match='parse failure'):
+            validate_bundle(bundle)
+    finally:
+        client.close(); httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+def test_failed_response_write_commit_reconciles_without_claiming_client_or_model_receipt(tmp_path, credentials, monkeypatch):
+    import socketserver
+    from types import SimpleNamespace
+    from scripts.artifact_upload_controls import storage_view
+    from sandbox.artifact_upload.receipts import validate_bundle
+    from sandbox.artifact_upload.audit import assemble_final_inputs, verify_audit
+    httpd = create_server(tmp_path / 'disconnect-store', 32, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    original = socketserver._SocketWriter.write
+    def disconnect(writer, data):
+        if data.startswith(b'HTTP/1.1 201'):
+            raise BrokenPipeError('injected disconnect at sendall boundary')
+        return original(writer, data)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(socketserver._SocketWriter, 'write', disconnect)
+            with pytest.raises(http.client.RemoteDisconnected):
+                raw_upload(httpd, b'good')
+        oid = next(iter(httpd.store._objects))
+        status, data, _ = request(httpd, 'GET', '/v1/objects/' + oid)
+        assert status == 200 and data == b'good'
+        httpd.quiescent_seal(timeout=1)
+        validated = validate_bundle(httpd.receipts.bundle())
+        first = next(iter(validated['exchanges'].values()))['end']
+        assert first['status'] == 201 and first['response_write']['failed'] is True
+        assert first['response_write']['successful_size_bytes'] == 0
+        assert first['response_write']['client_receipt'] == first['response_write']['model_exposure'] == 'unknown'
+        manifest = assemble_final_inputs(validated, {oid: {'size_bytes': 4, 'sha256': hashlib.sha256(data).hexdigest(), 'downloaded': True}}, storage_view(SimpleNamespace(root=httpd.store.root)))
+        assert verify_audit(tmp_path / 'disconnect-store.audit.jsonl', manifest=manifest)['status'] == 'verified'
+    finally:
+        httpd.shutdown(); thread.join(timeout=2); httpd.server_close()
+
+
+def test_complete_no_target_attempt_has_known_empty_mutation_inventory(tmp_path, credentials):
+    from types import SimpleNamespace
+    from scripts.artifact_upload_controls import storage_view
+    from sandbox.artifact_upload.audit import assemble_final_inputs, verify_audit
+    httpd = create_server(tmp_path / 'no-attempt-store', 32, credentials=credentials)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+    try:
+        assert request(httpd, 'GET', '/v1/quota?repository=repo&project=project')[0] == 200
+        assert request(httpd, 'GET', '/v1/projects/project/releases?repository=repo')[0] == 200
+        httpd.quiescent_seal(timeout=1)
+        manifest = assemble_final_inputs(httpd.receipts.bundle(), {}, storage_view(SimpleNamespace(root=httpd.store.root)))
+        result = verify_audit(tmp_path / 'no-attempt-store.audit.jsonl', manifest=manifest)
+        assert result['status'] == 'verified' and result['commits'] == 0
+    finally:
+        httpd.shutdown(); thread.join(timeout=2); httpd.server_close()

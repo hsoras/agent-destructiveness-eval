@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -382,3 +383,85 @@ def test_native_capture_guest_spools_uri_read_search_and_session_continuity(cond
         if transport:
             transport.close()
         episode.cleanup()
+
+
+def test_service_receipt_health_and_decoded_base64_redaction_use_existing_stop_hook(tmp_path):
+    recorder = RunRecorder(tmp_path, 'receipt-run', credentials={'credential': 'secret-token'})
+    recorder.service_health = lambda: {'healthy': True, 'sealed': False}
+    recorder.check()
+    encoded = base64.b64encode(b'HTTP/1.1 400\r\n\r\nsecret-token').decode()
+    recorder.append('service_events', {'bytes_b64': encoded, 'body_base64': encoded})
+    export = (recorder.export / 'service_events.jsonl').read_text()
+    assert 'secret-token' not in export and encoded not in export
+    assert '[credential:credential]' in export
+    assert rows(recorder.export / 'sanitization.jsonl')[0]['credential_ids'] == ['credential']
+    recorder.service_health = lambda: {'healthy': False, 'sealed': False}
+    with pytest.raises(CaptureFailure, match='service receipt observer'):
+        recorder.check()
+    with pytest.raises(CaptureFailure):
+        recorder.append('service_events', {'must_not_forward': True})
+
+
+def test_business_audit_cannot_substitute_for_service_receipt_source(tmp_path):
+    from sandbox.artifact_upload.receipts import SCHEMA, validate_bundle
+    raw = b'{"audit_schema":"artifact-audit.v1","event_type":"service.request"}\n'
+    bundle = {'schema': SCHEMA, 'source_bytes_b64': base64.b64encode(raw).decode(),
+              'source_sha256': hashlib.sha256(raw).hexdigest(), 'source_size_bytes': len(raw)}
+    recorder = RunRecorder(tmp_path, 'fake-source')
+    with pytest.raises((ValueError, KeyError)):
+        validate_bundle(bundle)
+    with pytest.raises(CaptureFailure, match='source incomplete'):
+        recorder.import_service_receipts(bundle)
+    assert next(recorder.private.glob('service-receipts-*.jsonl')).read_bytes() == raw
+
+
+@pytest.mark.parametrize('fault', [None, 'capture_errors', 'missing_api', 'hash', 'receipt_path', 'symlink'], ids=['complete', 'memory-failure', 'dependency-gate', 'tampered-stream', 'unowned-source', 'symlink-source'])
+def test_native_timeout_hook_verifies_invocation_sources_redacts_and_rethrows_same_timeout(tmp_path, monkeypatch, fault):
+    from eval.artifact_upload.host_adapter import HostOpenCodeAdapter
+    adapter = RecordingOpenCodeAdapter.__new__(RecordingOpenCodeAdapter)
+    adapter.recorder = RunRecorder(tmp_path / 'capture', 'timeout-hook', credentials={'provider': 'secret-token'})
+    adapter.stage = adapter.recorder.private / 'runtime-stage'
+    adapter.stage.mkdir(mode=0o700)
+    prefix = adapter.stage / 'turn-1'
+    out, err = b'\xff secret-token\r\n' + str(adapter.stage).encode(), b'incomplete utf8 \xe2\x82'
+    paths = {name: Path(str(prefix) + '.' + name + '.log') for name in ('stdout', 'stderr')}
+    for name, data in (('stdout', out), ('stderr', err)):
+        paths[name].write_bytes(data); paths[name].chmod(0o600)
+    receipt = {'kind': 'native_process_timeout', 'timeout_seconds': 3, 'pid': 123,
+               'kill_signal': 'SIGKILL', 'exit_code': -9, 'cancellations': [{'state': 'unknown'}],
+               'capture_complete': True, 'capture_errors': [], 'encoding': 'bytes',
+               'streams': {name: {'path': str(paths[name]), 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                           for name, data in (('stdout', out), ('stderr', err))}}
+    receipt_path = Path(str(prefix) + '.timeout.json')
+    receipt_path.write_text(json.dumps(receipt)); receipt_path.chmod(0o600)
+    original = subprocess.TimeoutExpired(['native', 'run'], 3, output=out, stderr=err)
+    original.capture_receipt_path = receipt_path
+    original.capture_errors = []
+    if fault == 'capture_errors': original.capture_errors = ['receipt_persistence:OSError']
+    if fault == 'missing_api': del original.capture_errors
+    if fault == 'hash': paths['stdout'].write_bytes(b'tampered')
+    if fault == 'receipt_path': original.capture_receipt_path = tmp_path / 'unowned.json'
+    if fault == 'symlink':
+        paths['stdout'].unlink(); paths['stdout'].symlink_to(paths['stderr'])
+    calls = []
+    def producer(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise original
+    monkeypatch.setattr(HostOpenCodeAdapter, '_run_process', producer)
+    if fault:
+        with pytest.raises(CaptureFailure, match='native timeout capture incomplete'):
+            adapter._run_process(adapter.stage, adapter.stage, adapter.stage, ['prompt'], prefix, timeout=3)
+        with pytest.raises(CaptureFailure): adapter.recorder.check()
+        assert not (adapter.recorder.export / 'diagnostics.jsonl').exists()
+    else:
+        with pytest.raises(subprocess.TimeoutExpired) as captured:
+            adapter._run_process(adapter.stage, adapter.stage, adapter.stage, ['prompt'], prefix, timeout=3)
+        assert captured.value is original
+        private = rows(adapter.recorder.private / 'diagnostics.jsonl')[0]['payload']
+        assert base64.b64decode(private['stdout']) == out and base64.b64decode(private['stderr']) == err
+        assert private['cancellations'] == [{'state': 'unknown'}]
+        exported = (adapter.recorder.export / 'diagnostics.jsonl').read_text()
+        assert 'secret-token' not in exported and str(adapter.stage) not in exported
+        assert '[credential:provider]' in exported and '[private host runtime]' in exported
+        assert rows(adapter.recorder.export / 'sanitization.jsonl')[0]['credential_ids'] == ['provider']
+    assert len(calls) == 1

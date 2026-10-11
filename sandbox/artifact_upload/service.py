@@ -9,20 +9,97 @@ import hashlib
 import re
 import time
 import uuid
+import threading
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .audit import AppendOnlyAudit
-from .storage import ArtifactStore, StoreError
+from .storage import ArtifactStore, StoreError, normalize_object_path
+from .receipts import ServiceReceipts, ReceiptFailure, ReadObserver, WriteObserver
 
 
 class ArtifactHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, store: ArtifactStore):
+    def __init__(self, address, store: ArtifactStore, receipt_sink):
         self.store = store
+        self.receipts = receipt_sink
+        self.mutations_stopped = False
+        self._handlers = 0
+        self._handler_condition = threading.Condition()
+        self.control_path = receipt_sink.path.with_suffix('.control.json')
+        self._sealed_control = False
         super().__init__(address, ArtifactRequestHandler)
+
+    def process_request(self, request, client_address):
+        with self._handler_condition:
+            self._handlers += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._handler_condition:
+                self._handlers -= 1
+                self._handler_condition.notify_all()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._handler_condition:
+                self._handlers -= 1
+                self._handler_condition.notify_all()
+
+    def quiescent_seal(self, timeout=5):
+        started = time.time()
+        self.mutations_stopped = True
+        self.shutdown()
+        self.server_close()
+        deadline = time.monotonic() + timeout
+        with self._handler_condition:
+            while self._handlers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.receipts.failure = 'handler quiescence timeout'
+                    self.receipts._status()
+                    raise ReceiptFailure('handler quiescence timeout')
+                self._handler_condition.wait(remaining)
+        self.receipts.seal(dispatch_stopped_at=started, quiescent_at=time.time())
+
+    def serve_forever(self, poll_interval=0.5):
+        # Protected file control is host-only; it adds no public HTTP endpoint.
+        self._control_done = threading.Event()
+        def control():
+            while not self._control_done.wait(.05):
+                if not self.control_path.exists():
+                    continue
+                try:
+                    command = json.loads(self.control_path.read_bytes())
+                    self.control_path.unlink()
+                    self.mutations_stopped = True
+                    if command['action'] == 'freeze':
+                        self.receipts.mutations_stopped = True
+                        self.receipts.emit('boundary', boundary='mutations_stopped')
+                    elif command['action'] == 'seal':
+                        self._sealed_control = True
+                        self.quiescent_seal(command['timeout'])
+                    else:
+                        raise ReceiptFailure('unknown control command')
+                except Exception:
+                    self.receipts.failure = 'service control/quiescence failed'
+                    self.receipts._status()
+        worker = threading.Thread(target=control, daemon=True)
+        worker.start()
+        try:
+            super().serve_forever(poll_interval)
+            if self._sealed_control:
+                # Keep the exact container alive for host-only evidence export.
+                threading.Event().wait()
+        finally:
+            self._control_done.set()
+            worker.join(timeout=1)
 
 
 class ArtifactRequestHandler(BaseHTTPRequestHandler):
@@ -33,16 +110,119 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         # Application audit is emitted by the store; avoid a second mutable log.
         pass
 
-    def parse_request(self):
-        # HTTP/1.1 reuses one handler for several requests.  All request-local
-        # audit state is reset exactly once per parsed request.
+    def handle_one_request(self):
+        # Same dispatch order as BaseHTTPRequestHandler, with observation before
+        # parsing (including oversized lines) and after every response path.
+        exchange = None
+        original_writer = self.wfile
+        self._receipt_status = None
+        self._receipt_error = None
+        self._receipt_headers = {}
+        self._parse_ok = False
+        self.headers = None
+        self.command = self.path = None
         self._attempt_id = uuid.uuid4().hex
         self._stable_request_id = None
         self._audit_phase = "proposal"
         self._pre_observation = None
-        self._proposal_done = False
-        self._outcome_done = False
-        return super().parse_request()
+        self._proposal_done = self._outcome_done = False
+        self._body_observer = None
+        self._completed_empty = False
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            exchange = self.server.receipts.begin(self.raw_requestline, self._attempt_id)
+            self._exchange_id = exchange
+            self.wfile = WriteObserver(original_writer, self.server.receipts, exchange)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = self.request_version = self.command = ''
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            self._parse_ok = self.parse_request()
+            self.server.receipts.emit('request', exchange_id=exchange, **self._receipt_request())
+            if not self._parse_ok:
+                return
+            if not self.server.receipts.health()['healthy']:
+                raise ReceiptFailure('observer unavailable before dispatch')
+            if self.server.mutations_stopped and self.command in ('POST', 'DELETE'):
+                self.close_connection = True
+                self._proposal()
+                self._error(StoreError('service_quiescing', 'service mutations stopped', 503))
+                return
+            method = getattr(self, 'do_' + self.command, None)
+            if method is None:
+                self.send_error(HTTPStatus.NOT_IMPLEMENTED, "Unsupported method (%r)" % self.command)
+                return
+            method()
+            self.wfile.flush()
+        except ReceiptFailure:
+            self.close_connection = True
+        except (TimeoutError, ConnectionError, OSError):
+            self.close_connection = True
+        finally:
+            if exchange is not None:
+                try:
+                    # Parse failures before the normal request event still get
+                    # terminal facts; consumers conservatively mark incomplete.
+                    body = self._body_observer or ReadObserver(self.rfile, self.server.receipts, exchange)
+                    length = self._header('Content-Length')
+                    length = int(length) if length and length.isdecimal() else None
+                    writer = self.wfile
+                    self.server.receipts.end(exchange, parse_ok=self._parse_ok,
+                        status=self._receipt_status, error_code=self._receipt_error,
+                        response_headers=self._receipt_headers,
+                        body=body.facts(length, self._completed_empty),
+                        response_write={'successful_size_bytes': writer.count,
+                            'successful_sha256': writer.digest.hexdigest(), 'failed': writer.failed,
+                            'client_receipt': 'unknown', 'model_exposure': 'unknown'})
+                except ReceiptFailure:
+                    self.close_connection = True
+            self.wfile = original_writer
+
+    def _receipt_request(self):
+        facts = {'method': self.command, 'path': self.path,
+                 'request_id': self._request_id(), 'public_request_id_declaration': self._header('X-Request-ID'),
+                 'actor_id': self._actor(),
+                 'attempt_id': self._attempt_id,
+                 'idempotency_key': self._header('Idempotency-Key'),
+                 'declared_sha256': self._header('Content-SHA256'),
+                 'declared_length': self._header('Content-Length')}
+        for field, header in (('repository', 'X-Repository'), ('project', 'X-Project'),
+                              ('version', 'X-Version'), ('object_path', 'X-Object-Path')):
+            facts[field] = self._header(header)
+        facts['protocol_version'] = getattr(self, 'request_version', None)
+        facts['effective_route'] = (self.path if self.command == 'POST' else urlsplit(self.path).path) if self.path else None
+        length = facts['declared_length']
+        facts['declared_size_bytes'] = int(length) if length and length.isdecimal() else None
+        sha = facts['declared_sha256']
+        facts['validated_declared_sha256'] = sha if sha and re.fullmatch(r'[0-9a-f]{64}', sha) else None
+        facts['canonical_identity'] = None
+        if self.command == 'POST' and self.path == '/v1/objects':
+            try:
+                identity = {k: facts[k] for k in ('repository', 'project', 'version', 'object_path')}
+                identity['object_path'] = normalize_object_path(identity['object_path'])
+                if all(isinstance(v, str) and v for v in identity.values()):
+                    from .audit import derive_object_id
+                    identity['object_id'] = derive_object_id(**identity)
+                    facts['canonical_identity'] = identity
+            except (StoreError, TypeError):
+                pass
+        elif self.path:
+            match = re.fullmatch(r'/v1/objects/([0-9a-f]{64})(?:/metadata)?', urlsplit(self.path).path)
+            if match:
+                facts['canonical_identity'] = {'object_id': match.group(1)}
+        return facts
+
+    def send_response(self, code, message=None):
+        self._receipt_status = code
+        return super().send_response(code, message)
+
+    def send_header(self, keyword, value):
+        if keyword.lower() not in ('authorization', 'set-cookie'):
+            self._receipt_headers[keyword] = value
+        return super().send_header(keyword, value)
 
     def _header(self, name):
         headers = getattr(self, "headers", None)
@@ -145,6 +325,7 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
 
     def send_error(self, code, message=None, explain=None):
         # Malformed/unsupported framing or methods are still audited attempts.
+        self._receipt_error = 'http_error'
         try:
             if not getattr(self, "_proposal_done", False):
                 self._proposal()
@@ -178,6 +359,7 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
         # The store works with the private per-attempt ID; callers see the one
         # stable public ID of this request.
         value = {**value, "request_id": self._request_id()}
+        self._receipt_error = (value.get('error') or {}).get('code')
         data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -226,13 +408,21 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
             retention = self.headers.get("X-Retention")
             if owner not in (None, policy["owner_id"]) or retention not in (None, policy["retention"]):
                 raise StoreError("invalid_request", "protected metadata is server configured", 400)
+            self._body_observer = ReadObserver(self.rfile, self.server.receipts, self._exchange_id)
             status, response = self.server.store.upload_stream(
                 credential_id=credential, repository=self.headers["X-Repository"],
                 project=self.headers["X-Project"], version=self.headers["X-Version"],
                 object_path=self.headers["X-Object-Path"], idempotency_key=self.headers["Idempotency-Key"],
                 content=size, content_sha256=self.headers["Content-SHA256"], request_id=rid,
                 owner_id=policy["owner_id"], retention=policy["retention"],
-                dependencies=policy.get("dependencies", []), _reader=self.rfile)
+                dependencies=policy.get("dependencies", []), _reader=self._body_observer)
+            if size == 0 and status == 201:
+                # New storage responses retain the installed body object;
+                # replay returns a copy. Only a newly evaluated zero-byte
+                # upload may attest the complete empty application body.
+                with self.server.store._lock:
+                    installed = self.server.store._keys.get(self.headers['Idempotency-Key'], {})
+                    self._completed_empty = response.get('body') is installed.get('body')
             self._json(status, response)
         except StoreError as e:
             self._error(e)
@@ -302,11 +492,12 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(root, quota_bytes, *, host="127.0.0.1", port=0, credentials=None,
-                  aliases=None, max_upload_bytes=64 * 1024 * 1024, metadata_policy=None, audit=None):
+                  aliases=None, max_upload_bytes=64 * 1024 * 1024, metadata_policy=None, audit=None, receipt_sink=None):
     """Create (but do not start) an HTTP server and its independent store."""
     from pathlib import Path
     root_path = Path(root)
     sink = audit or AppendOnlyAudit(root_path.parent / (root_path.name + ".audit.jsonl"))
     store = ArtifactStore(root_path, quota_bytes, credentials=credentials, aliases=aliases,
                           max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=sink)
-    return ArtifactHTTPServer((host, port), store)
+    observer = receipt_sink if receipt_sink is not None else ServiceReceipts(root_path.parent / (root_path.name + ".receipts.jsonl"))
+    return ArtifactHTTPServer((host, port), store, observer)

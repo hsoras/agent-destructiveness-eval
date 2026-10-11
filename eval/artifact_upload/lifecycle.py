@@ -290,10 +290,131 @@ print(json.dumps(files,sort_keys=True))
             self.capture_failure(exc)
             raise InfrastructureError(self._redact(str(exc))) from None
 
+    def _service_exec(self, code, *, timeout=10):
+        container = self.resources.get('service_container')
+        if not container:
+            raise InfrastructureError('exact service resource unavailable')
+        result = subprocess.run(['docker', 'exec', container, 'python', '-c', code],
+                                cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+        if result.returncode:
+            raise InfrastructureError('protected service evidence command failed')
+        return json.loads(result.stdout)
+
+    def receipt_health(self, *, timeout=5):
+        """Protected exact-resource health; unavailable/stale source is a failure."""
+        health = self._service_exec("from pathlib import Path; import json,os; h=json.loads(Path('/srv/store.receipts.health.json').read_bytes()); os.kill(h['pid'],0); print(json.dumps(h))", timeout=timeout)
+        if health.get('schema') != 'artifact-http-observer.v1':
+            raise InfrastructureError('wrong service observation boundary')
+        return health
+
+    def _receipt_control(self, action, timeout):
+        self._service_exec("from pathlib import Path; import json,os; p=Path('/srv/store.receipts.control.json'); t=p.with_suffix('.tmp'); fd=os.open(t,os.O_CREAT|os.O_TRUNC|os.O_WRONLY|os.O_NOFOLLOW,0o600); f=os.fdopen(fd,'w'); json.dump(" + repr({'action': action, 'timeout': timeout}) + ",f); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(t,p); print('{}')", timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            health = self.receipt_health(timeout=max(.05, deadline - time.monotonic()))
+            if not health.get('healthy'):
+                raise InfrastructureError('service receipt capture/quiescence failed')
+            if (action == 'seal' and health.get('sealed')) or (action == 'freeze' and health.get('mutations_stopped') and health['active'] == 0):
+                return health
+            time.sleep(.05)
+        raise InfrastructureError('bounded service receipt control timeout')
+
+    def export_service_evidence(self, final_download=None, *, timeout=5):
+        """Stop guest writers, freeze mutations, download, stop HTTP, seal and export.
+
+        ``final_download`` runs independent HTTP enumeration/download/verification
+        while reads remain available. Its result is retained as inventory. Each
+        boundary is timed; this is not a globally atomic network snapshot.
+        Missing callback or any failure preserves partial exact-resource exports.
+        """
+        directory = self.evidence_root / 'service-private'
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        result = {'complete': False, 'service_container': self.resources.get('service_container'),
+                  'started_at': time.time(), 'inventory': None}
+        try:
+            worker = self.resources.get('worker_container')
+            if worker:
+                stopped = subprocess.run(['docker', 'stop', '--time', str(max(1, int(timeout))), worker],
+                    cwd=ROOT, capture_output=True, timeout=timeout + 2)
+                if stopped.returncode:
+                    raise InfrastructureError('target writer stop failed')
+            result['target_stopped_at'] = time.time()
+            result['freeze'] = self._receipt_control('freeze', timeout)
+            if final_download is not None:
+                result['inventory'] = final_download()
+                result['downloaded_at'] = time.time()
+            result['seal'] = self._receipt_control('seal', timeout)
+            result['complete'] = final_download is not None
+        except Exception as exc:
+            result['failure'] = type(exc).__name__
+        finally:
+            try:
+                row = self._service_exec("""from pathlib import Path
+import json,base64,hashlib
+r=Path('/srv/store'); errors={}
+def source(name,path):
+ try: return path.read_bytes()
+ except FileNotFoundError:
+  if name != 'index': errors[name]='FileNotFoundError'
+  return None
+ except Exception as e: errors[name]=type(e).__name__; return None
+audit=source('audit',Path('/srv/store.audit.jsonl'))
+raw=source('receipts',Path('/srv/store.receipts.jsonl'))
+index_raw=source('index',r/'index.json')
+health_raw=source('health',Path('/srv/store.receipts.health.json'))
+health=None; storage=None
+try:
+ health=json.loads(health_raw) if health_raw is not None else None
+except Exception as e: errors['health_parse']=type(e).__name__
+try:
+ index=json.loads(index_raw) if index_raw is not None else {}
+ storage={'index_sha256':hashlib.sha256(index_raw).hexdigest() if index_raw is not None else None,
+ 'objects':{k:{'size_bytes':v['size_bytes'],'sha256':v['sha256'],'created_at':v.get('created_at')} for k,v in index.get('objects',{}).items()},
+ 'idempotency':{k:{'request_digest':v.get('request_digest'),'status':v.get('status')} for k,v in index.get('idempotency',{}).items()},
+ 'outbox':index.get('outbox',[]),'reservations':index.get('reservations',{}),
+ 'staging_files':sorted(p.name for p in (r/'staging').iterdir()),'object_files':sorted(p.name for p in (r/'objects').iterdir())}
+except Exception as e: errors['storage']=type(e).__name__
+def encoded(raw): return base64.b64encode(raw).decode() if raw is not None else None
+print(json.dumps({'audit_b64':encoded(audit),'index_b64':encoded(index_raw),
+ 'receipts':{'schema':'artifact-http-observer.v1','source_bytes_b64':encoded(raw),'source_sha256':hashlib.sha256(raw).hexdigest() if raw is not None else None,'source_size_bytes':len(raw) if raw is not None else None,'source_health':health},
+ 'storage':storage,'source_errors':errors}))
+""", timeout=timeout)
+                import base64
+                from sandbox.artifact_upload.receipts import validate_bundle
+                def private_write(path, data):
+                    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, 'wb') as stream:
+                        stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                # Retain bytes before validating, including partial setup/capture.
+                if row['audit_b64'] is not None:
+                    private_write(directory / 'audit.jsonl', base64.b64decode(row['audit_b64']))
+                    result['audit_path'] = str(directory / 'audit.jsonl')
+                if row.get('index_b64') is not None:
+                    private_write(directory / 'index.json', base64.b64decode(row['index_b64']))
+                if row['receipts']['source_bytes_b64'] is not None:
+                    private_write(directory / 'receipts.jsonl', base64.b64decode(row['receipts']['source_bytes_b64']))
+                private_write(directory / 'export.json', json.dumps(row, sort_keys=True).encode())
+                result.update({'receipts': row['receipts'], 'storage': row['storage']})
+                validate_bundle(row['receipts'])
+                if row['audit_b64'] is None or row['storage'] is None or row.get('source_errors'):
+                    result['complete'] = False
+            except Exception as exc:
+                result['complete'] = False
+                result['export_failure'] = type(exc).__name__
+            result['exported_at'] = time.time()
+            self.resources['service_evidence'] = {k: v for k, v in result.items() if k not in ('receipts', 'storage', 'inventory')}
+            self._record()
+        return result
+
     def capture_failure(self, error):
         self.resources["ready"] = False
         self.resources["setup_error"] = self._redact(f"{type(error).__name__}: {error}")
         self.resources["compose_ps"] = self._compose("ps", "-a", check=False).stdout
+        if self._owns_resources and not self.resources.get('service_container'):
+            container = self._compose('ps', '-q', 'service', check=False).stdout.strip()
+            if container:
+                self.resources['service_container'] = container
         self._record()
 
     def cleanup(self):
@@ -302,6 +423,8 @@ print(json.dumps(files,sort_keys=True))
             self.resources["cleanup_exit"] = 0
             self._record()
             return
+        if self.resources.get('service_container') and 'service_evidence' not in self.resources:
+            self.export_service_evidence()
         logs = self._compose("logs", "--no-color", check=False).stdout
         (self.evidence_root / f"{self.project}.compose.log").write_text(self._redact(logs))
         result = self._compose("down", "--volumes", "--remove-orphans", check=False)
