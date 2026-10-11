@@ -196,6 +196,44 @@ def _manifest_checks(manifest) -> tuple[list, dict, dict]:
     return ops, storage, inventory
 
 
+def assemble_final_inputs(validated_receipts, downloaded_inventory, storage_view):
+    """Adapt source-bound HTTP evidence to the historical declaration manifest.
+
+    Validation is repeated from retained source bytes; a caller-created operations
+    list or business journal cannot substitute for the protected observer bundle.
+    """
+    from .receipts import validate_bundle
+    validated = validate_bundle(validated_receipts.get('bundle', validated_receipts))
+    operations = []
+    for eid, slot in validated['exchanges'].items():
+        request, end = slot['request'], slot['end']
+        method, path = request['method'], request['path']
+        kind = 'upload' if method == 'POST' else 'delete' if method == 'DELETE' else 'read'
+        length = request['declared_length']
+        size = int(length) if isinstance(length, str) and length.isdecimal() else None
+        op = {'exchange_id': eid, 'attempt_id': request['attempt_id'],
+              'method': method, 'path': path, 'kind': kind,
+              'request_id': request['request_id'], 'actor_id': request['actor_id'],
+              'idempotency_key': request['idempotency_key'], 'status': end['status'],
+              'error_code': end['error_code'], 'sha256': request['declared_sha256'],
+              'size_bytes': size, 'sha256_semantics': 'declared_identity',
+              'observed_body': end['body'], 'response_write': end['response_write']}
+        for field in ('repository', 'project', 'version', 'object_path'):
+            op[field] = request[field]
+        identity = request['canonical_identity'] or {}
+        op['object_id'] = identity.get('object_id')
+        # Normalized effective coordinates currently equal valid raw coordinates;
+        # retain both so future presentation aliases cannot become canonical input.
+        op['canonical_identity'] = identity
+        operations.append(op)
+    manifest = {'operations': operations, 'inventory': downloaded_inventory,
+                'storage': storage_view, 'completeness': 'complete',
+                'receipt_source': {'schema': validated['bundle']['schema'],
+                    'run_id': validated['run_id'], 'sha256': validated['bundle']['source_sha256']}}
+    _manifest_checks(manifest)
+    return manifest
+
+
 def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None = None,
                  manifest: dict | None = None) -> dict:
     """Return a read-only reconciliation receipt.
@@ -437,7 +475,13 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
                 continue
             problems.append(f"operation receipt {op['method']} {op['path']} has no service request evidence")
             continue
-        aid = pool[sig].pop(0)
+        if manifest.get('receipt_source'):
+            aid = op.get('attempt_id')
+            if aid not in pool[sig]:
+                raise ValueError('observer private attempt identity disagrees')
+            pool[sig].remove(aid)
+        else:
+            aid = pool[sig].pop(0)
         bound[aid] = op
         request = attempts[aid].get("proposal") or attempts[aid]["outcome"]
         if (op.get("actor_id") is not None and op["actor_id"] != request.get("actor_id")
@@ -482,6 +526,14 @@ def verify_audit(path: str | os.PathLike[str], *, expected_commits: int | None =
         if not isinstance(entry, dict) or entry.get("request_digest") != commit["operation_digest"]:
             raise ValueError("commit operation digest disagrees with storage idempotency identity")
         if commit["event_type"] == "artifact.upload":
+            if manifest.get('receipt_source'):
+                measured = op.get('observed_body') or {}
+                if (measured.get('termination') != 'fully_read'
+                        or measured.get('complete_sha256') != commit['sha256']
+                        or measured.get('observed_size_bytes') != commit['size_bytes']):
+                    raise ValueError('new upload commit lacks complete observed body evidence')
+                if op.get('attempt_id') != commit['request_id']:
+                    raise ValueError('observer attempt disagrees with new commit')
             rid = closed_by_upload.get(commit["event_id"])
             acq = lifecycles[rid]["acquire"][0] if rid else None
             if acq is None:

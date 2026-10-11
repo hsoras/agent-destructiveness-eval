@@ -179,3 +179,22 @@ def test_frozen_readiness_requires_realized_image_and_both_package_witnesses(
                 (tmp_path / f"{episode.project}.containers.json").write_text(episode._redact(snapshot.stdout))
         episode.cleanup()
         assert episode.resources["cleanup_exit"] == 0
+
+
+def test_service_export_preserves_partial_sources_when_freeze_fails(tmp_path, monkeypatch):
+    import base64
+    episode = lifecycle.Episode('eval-looking', 'partial-receipts', tmp_path)
+    episode.resources['service_container'] = 'exact-service'
+    monkeypatch.setattr(episode, '_receipt_control', lambda *args: (_ for _ in ()).throw(lifecycle.InfrastructureError('freeze failed')))
+    raw = b'{"partial":"observer source"}\n'
+    audit = b'{"partial":"business source"}\n'
+    row = {'audit_b64': base64.b64encode(audit).decode(), 'receipts': {
+        'schema': 'artifact-http-observer.v1', 'source_bytes_b64': base64.b64encode(raw).decode(),
+        'source_sha256': lifecycle.hashlib.sha256(raw).hexdigest(), 'source_size_bytes': len(raw)}, 'storage': {}}
+    monkeypatch.setattr(episode, '_service_exec', lambda *args, **kwargs: row)
+    result = episode.export_service_evidence(timeout=.1)
+    assert result['complete'] is False
+    assert (tmp_path / 'service-private/receipts.jsonl').read_bytes() == raw
+    assert (tmp_path / 'service-private/audit.jsonl').read_bytes() == audit
+    assert result['service_container'] == 'exact-service'
+    assert result['failure'] == 'InfrastructureError' and result['export_failure'] == 'ValueError'

@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
+import subprocess
 import threading
 from typing import Any, Callable, Mapping
 import uuid
@@ -42,10 +44,25 @@ class RunRecorder:
             raise ValueError("credentials require nonempty IDs and secrets")
         self._lock = threading.RLock()
         self.failure: str | None = None
+        self.service_health: Callable[[], Mapping] | None = None
+        self._checking_health = False
+        self.host_paths: set[str] = set()
 
-    def check(self) -> None:
+    def check(self, *, service=True) -> None:
         if self.failure:
             raise CaptureFailure(self.failure)
+        if service and self.service_health is not None and not self._checking_health:
+            self._checking_health = True
+            try:
+                health = self.service_health()
+                if health.get('healthy') is not True or health.get('sealed') is True:
+                    self.fail('service receipt observer unhealthy or stopped')
+            except CaptureFailure:
+                raise
+            except Exception:
+                self.fail('service receipt health unavailable')
+            finally:
+                self._checking_health = False
 
     def fail(self, reason: str) -> None:
         # Do not include exception text: it may itself contain a credential.
@@ -55,6 +72,28 @@ class RunRecorder:
         except OSError:
             pass  # in-memory failure remains authoritative when the disk itself fails
         raise CaptureFailure(self.failure)
+
+    def import_service_receipts(self, bundle):
+        from sandbox.artifact_upload.receipts import validate_bundle
+        try:
+            # Preserve exact source even if validation fails, for diagnosis.
+            raw = base64.b64decode(bundle['source_bytes_b64'], validate=True)
+            source = self.private / ('service-receipts-' + hashlib.sha256(raw).hexdigest() + '.jsonl')
+            if source.exists():
+                if source.is_symlink() or source.read_bytes() != raw:
+                    raise ValueError('source retention collision')
+            else:
+                fd = os.open(source, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+            validated = validate_bundle(bundle)
+        except Exception:
+            self.fail('service receipt source incomplete')
+        # Evidence writes remain allowed after the terminal seal; dispatch and
+        # provider forwarding still call check() with live health enabled.
+        for record in validated['records']:
+            self.append('service_events', record)
+        return validated
 
     @staticmethod
     def now() -> str:
@@ -73,6 +112,8 @@ class RunRecorder:
         used: set[str] = set()
         def walk(item: Any) -> Any:
             if isinstance(item, str):
+                for path in sorted(self.host_paths, key=len, reverse=True):
+                    item = item.replace(path, '[private host runtime]')
                 for credential_id, secret in sorted(self.credentials.items(), key=lambda pair: -len(pair[1])):
                     if secret in item:
                         item = item.replace(secret, f"[credential:{credential_id}]")
@@ -80,6 +121,10 @@ class RunRecorder:
                 return item
             if isinstance(item, dict):
                 copied = dict(item)
+                for field in list(copied):
+                    if isinstance(field, str) and (field.endswith('_b64') or field.endswith('_base64')):
+                        copied[field + '_decoded'] = base64.b64decode(copied.pop(field), validate=True).decode('utf-8', errors='replace')
+                        copied['researcher_decoding'] = 'decoded; exact source retained privately'
                 if copied.get("encoding") == "base64":
                     for field in ("stdout", "stderr"):
                         if field in copied:
@@ -94,18 +139,19 @@ class RunRecorder:
 
     def append(self, stream: str, payload: Any) -> str:
         with self._lock:
-            self.check()
+            self.check(service=False)
             if stream not in self.STREAMS:
                 raise ValueError("unknown evidence stream")
             eid = uuid.uuid4().hex
             canonical = {"event_id": eid, "run_id": self.run_id, "occurred_at": self.now(), "payload": payload}
             try:
                 sanitized, ids = self.sanitize(canonical)
-                sanitized["sanitization"] = {"credential_ids": ids, "canonical_retained_privately": True}
+                sanitized["sanitization"] = {"credential_ids": ids, "canonical_retained_privately": True,
+                                              "host_path_redaction_enabled": bool(self.host_paths)}
                 self._write(self.private / f"{stream}.jsonl", canonical)
                 self._write(self.export / f"{stream}.jsonl", sanitized)
-                if ids:
-                    self._write(self.export / "sanitization.jsonl", {"event_id": eid, "stream": stream, "credential_ids": ids, "occurred_at": self.now()})
+                if ids or self.host_paths:
+                    self._write(self.export / "sanitization.jsonl", {"event_id": eid, "stream": stream, "credential_ids": ids, "host_path_redaction_enabled": bool(self.host_paths), "occurred_at": self.now()})
             except Exception:
                 self.fail("evidence persistence failed")
             return eid
@@ -144,7 +190,7 @@ class RunRecorder:
         return sorted(ids)
 
     def replay(self, event_id: str) -> bytes:
-        self.check()
+        self.check(service=False)
         for line in (self.private / "model_views.jsonl").read_text().splitlines():
             record = json.loads(line)
             if record["event_id"] == event_id:
@@ -270,6 +316,59 @@ class RecordingOpenCodeAdapter(HostOpenCodeAdapter):
         self.bridge = RecordingBridge(run_id=self.run_id, broker=self.broker, registry=self.registry, guest_profile=self.profile,
                                       presenter=presenter, events_path=self.evidence / "router-events.jsonl", recorder=self.recorder)
         old._server.server_close()  # not started: shutdown() would wait forever
+
+    def _run_process(self, root, work, config, prompt_args, log_prefix, *, session_id=None, timeout=120):
+        try:
+            return super()._run_process(root, work, config, prompt_args, log_prefix,
+                                        session_id=session_id, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                if getattr(exc, 'capture_errors', None) != []:
+                    raise ValueError('adapter timeout collection errors or missing API')
+                prefix = Path(log_prefix).absolute()
+                owner_root = Path(root).resolve()
+                if not prefix.resolve().is_relative_to(owner_root):
+                    raise ValueError('timeout prefix outside adapter invocation')
+                expected_receipt = Path(str(prefix) + '.timeout.json')
+                if Path(exc.capture_receipt_path).absolute() != expected_receipt:
+                    raise ValueError('timeout receipt is not invocation-owned')
+                def read_owned(path):
+                    # Reject symlink components as well as a symlink leaf.
+                    if path.resolve() != path or not path.is_relative_to(owner_root):
+                        raise ValueError('timeout source path escaped')
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    with os.fdopen(fd, 'rb') as stream:
+                        facts = os.fstat(stream.fileno())
+                        if not stat.S_ISREG(facts.st_mode) or facts.st_mode & 0o077:
+                            raise ValueError('timeout source must be a private regular file')
+                        return stream.read()
+                receipt = json.loads(read_owned(expected_receipt))
+                if (receipt.get('kind') != 'native_process_timeout' or receipt.get('capture_complete') is not True
+                        or receipt.get('capture_errors') != [] or receipt.get('encoding') != 'bytes'
+                        or receipt.get('timeout_seconds') != timeout):
+                    raise ValueError('timeout receipt incomplete or mismatched')
+                streams = {}
+                for name in ('stdout', 'stderr'):
+                    path = Path(str(prefix) + '.' + name + '.log')
+                    source = receipt['streams'][name]
+                    if Path(source['path']).absolute() != path:
+                        raise ValueError('timeout stream is not invocation-owned')
+                    data = read_owned(path)
+                    if len(data) != source['size_bytes'] or hashlib.sha256(data).hexdigest() != source['sha256']:
+                        raise ValueError('timeout stream size or hash mismatch')
+                    if data != (exc.output if name == 'stdout' else exc.stderr):
+                        raise ValueError('timeout exception disagrees with retained stream')
+                    streams[name] = data
+                payload = {key: receipt[key] for key in ('kind', 'timeout_seconds', 'pid', 'kill_signal', 'exit_code', 'cancellations')}
+                payload.update({'capture_complete': True, 'encoding': 'base64',
+                    'streams': {name: {'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                                for name, data in streams.items()},
+                    **{name: base64.b64encode(data).decode() for name, data in streams.items()}})
+            except Exception:
+                self.recorder.fail('native timeout capture incomplete')
+            self.recorder.host_paths.update(str(Path(path).resolve()) for path in (root, self.stage, config, work))
+            self.recorder.append('diagnostics', payload)
+            raise  # preserve the same original timeout and never redispatch
 
     def audit_request(self, body: Mapping[str, Any]) -> list[dict[str, Any]]:
         self.recorder.check()
