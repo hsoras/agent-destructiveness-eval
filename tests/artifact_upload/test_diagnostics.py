@@ -380,3 +380,123 @@ def test_local_mock_slow_response_hits_total_deadline(tmp_path, capture):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def linked_capture(tmp_path, *, body=None, secret=False):
+    """Synthetic capture shaped like the workflow's recorded named checkpoints."""
+    rec = RunRecorder(tmp_path / "linked-capture", "linked", credentials={"model-provider": "sk-synthetic-secret"})
+    body = body or {"model": MODEL, "messages": [
+        {"role": "system", "content": [{"type": "text", "text": "sys sk-synthetic-secret" if secret else "sys"}]},
+        {"role": "user", "content": "Upload the bundle"}], "tools": [{"type": "function"}],
+        "tool_choice": "auto", "stream": True, "prompt_cache_key": "k"}
+    raw = json.dumps(body).encode()
+    neighbor = rec.request(json.dumps({**body, "messages": body["messages"][:1]}).encode(), path="/v1/chat/completions")
+    event = rec.request(raw, path="/v1/chat/completions")
+    provenance = {"base_url": "http://127.0.0.1:9/v1", "model": MODEL, "model_revision": None,
+                  "model_revision_status": "unknown", "source_config": {"component": "WorkflowAdapter"}}
+    for name in ("after_request_before_attempt", "after_quota_before_action"):
+        rec.append("workflow_events", {"kind": "checkpoint", "name": name, "available": True,
+                                       "model_view_available": True, "model_view_event_id": event,
+                                       "wire_sha256": digest(raw), "route_provenance": provenance, "reason": None})
+    for name in ("warmup_before_upload", "termination"):
+        rec.append("workflow_events", {"kind": "checkpoint", "name": name, "available": True,
+                                       "model_view_available": False, "reason": None,
+                                       "model_view_reason": "no exact captured model view at this boundary"})
+    return rec, event, neighbor, raw, provenance
+
+
+def linked_runner(tmp_path, rec, request, **kwargs):
+    direct = kwargs.pop("direct_route", Route(MODEL, "declared-version", "http://127.0.0.1:9/v1",
+                                              json.dumps({"prompt_cache_key": "k"})))
+    return Diagnostics(capture=rec.root, output=tmp_path / "diag", run_id="aux", direct_route=direct,
+                       classifier_route=Route("classifier", "frozen-classifier", "http://127.0.0.1:9/v1"),
+                       request=request, **kwargs)
+
+
+def test_named_checkpoints_resolve_exact_linked_view_and_route(tmp_path):
+    rec, event, neighbor, raw, provenance = linked_capture(tmp_path)
+    original = tree_hash(rec.root)
+    calls = []
+    def request(route, body, budget):
+        calls.append(body)
+        return response(json.dumps(labels()) if route.model == "classifier" else "brief", model=route.model)
+    diagnostics = linked_runner(tmp_path, rec, request)
+    for name in ("after_request_before_attempt", "after_quota_before_action"):
+        view = checkpoint_view(rec.root, name)
+        assert (view.event_id, view.raw, view.provenance) == (event, raw, provenance)
+        direct = diagnostics.measure(view, "direct")
+        assert direct["status"] == "completed" and direct["timing"] == "checkpoint"
+        assert direct["source_event_id"] == event and direct["source_wire_sha256"] == digest(raw)
+        assert direct["route_provenance"]["model_revision_status"] == "unknown"
+        assert direct["model_version"] == "declared-version"
+        assert direct["request"]["tools"] == [] and direct["request"]["stream"] is False
+        assert direct["request"]["messages"][:-1] == json.loads(raw)["messages"]
+        classifier = diagnostics.measure(view, "classifier")
+        assert classifier["status"] == "completed" and "source_wire_base64" not in classifier
+        assert [m["id"] for m in classifier["transcript"]] == ["m0", "m1"]
+    assert len(calls) == 4 and tree_hash(rec.root) == original
+
+
+def test_skipped_boundaries_unavailable_without_dispatch(tmp_path):
+    rec, *_ = linked_capture(tmp_path)
+    diagnostics = linked_runner(tmp_path, rec, lambda *a: pytest.fail("no dispatch"))
+    for name in ("warmup_before_upload", "termination", "absent_boundary"):
+        view = checkpoint_view(rec.root, name)
+        assert view.raw is None
+        for kind in ("direct", "classifier"):
+            assert diagnostics.measure(view, kind)["status"] == "unavailable"
+    assert diagnostics.used == {"direct": 0, "classifier": 0}
+
+
+@pytest.mark.parametrize("tamper", ["link", "digest", "route_model", "revision", "missing_route", "blob"])
+def test_tampered_link_digest_or_route_fails_closed(tmp_path, tamper):
+    rec, event, neighbor, raw, _ = linked_capture(tmp_path)
+    events = rec.private / "workflow_events.jsonl"
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    for row in rows:
+        p = row["payload"]
+        if p["name"] == "after_quota_before_action":
+            if tamper == "link":
+                p["model_view_event_id"] = neighbor
+            elif tamper == "digest":
+                p["wire_sha256"] = "0" * 64
+            elif tamper == "route_model":
+                p["route_provenance"]["model"] = "other"
+            elif tamper == "revision":
+                p["route_provenance"].update(model_revision="invented", model_revision_status="verified")
+            elif tamper == "missing_route":
+                del p["route_provenance"]
+    events.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    if tamper == "blob":
+        views = rec.private / "model_views.jsonl"
+        rows = [json.loads(line) for line in views.read_text().splitlines()]
+        rows[-1]["payload"]["replay_body_base64"] = rows[0]["payload"]["replay_body_base64"]
+        views.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    view = checkpoint_view(rec.root, "after_quota_before_action")
+    assert view.raw is None
+    diagnostics = linked_runner(tmp_path, rec, lambda *a: pytest.fail("no dispatch"))
+    assert diagnostics.measure(view, "direct")["status"] == "unavailable"
+    assert diagnostics.used["direct"] == 0
+
+
+def test_forged_checkpoint_view_and_route_mismatch_never_dispatch(tmp_path):
+    rec, event, neighbor, raw, _ = linked_capture(tmp_path)
+    good = checkpoint_view(rec.root, "after_quota_before_action")
+    forged = SavedView(good.checkpoint, "checkpoint", neighbor, rec.replay(neighbor), provenance=good.provenance)
+    diagnostics = linked_runner(tmp_path, rec, lambda *a: pytest.fail("no dispatch"))
+    assert diagnostics.measure(forged, "direct")["status"] == "unavailable"
+    other = Route(MODEL, "v", "http://127.0.0.1:10/v1", json.dumps({"prompt_cache_key": "k"}))
+    mismatch = linked_runner(tmp_path, rec, lambda *a: pytest.fail("no dispatch"), direct_route=other)
+    assert mismatch.measure(good, "direct")["reason"] == "route does not match checkpoint route provenance"
+
+
+def test_declared_secret_in_linked_context_refuses_zero_dispatch(tmp_path):
+    rec, *_ = linked_capture(tmp_path, secret=True)
+    view = checkpoint_view(rec.root, "after_quota_before_action")
+    assert view.raw is not None
+    diagnostics = linked_runner(tmp_path, rec, lambda *a: pytest.fail("no dispatch"),
+                                credentials={"model-provider": "sk-synthetic-secret"})
+    for kind in ("direct", "classifier"):
+        record = diagnostics.measure(view, kind)
+        assert record["status"] == "unavailable" and "declared credentials" in record["reason"]
+    assert diagnostics.used == {"direct": 0, "classifier": 0}

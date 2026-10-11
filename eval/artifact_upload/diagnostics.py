@@ -1,7 +1,8 @@
 """Isolated auxiliary measurements; never a behavioral continuation.
 
-Named T012 checkpoints currently lack model-view links and remain unavailable.
-An explicitly selected T010 request can instead be measured retrospectively.
+Named T012 checkpoints resolve only through their recorded model-view link; boundaries
+without a verified link remain unavailable. An explicitly selected T010 request can
+instead be measured retrospectively.
 """
 from __future__ import annotations
 
@@ -64,6 +65,7 @@ class SavedView:
     event_id: str | None = None
     raw: bytes | None = None
     reason: str | None = None
+    provenance: Any = None
 
 
 def _read_view(capture: Path, event_id: str) -> bytes:
@@ -87,16 +89,41 @@ def retrospective_view(capture: str | Path, event_id: str) -> SavedView:
 
 
 def checkpoint_view(capture: str | Path, name: str) -> SavedView:
-    """Fail honestly: current T012 state checkpoints do not identify an exact model view."""
-    path = Path(capture) / "canonical-private/workflow_events.jsonl"
+    """Resolve a named checkpoint through its recorded link to the exact captured model view.
+
+    Never selects by timestamp or neighbor and never reconstructs a view: a missing,
+    ambiguous, mismatched or tampered link is unavailable.
+    """
+    capture = Path(capture)
+    path = capture / "canonical-private/workflow_events.jsonl"
+    matches = []
     if path.exists():
         for line in path.read_text().splitlines():
             payload = json.loads(line)["payload"]
             if payload.get("kind") == "checkpoint" and payload.get("name") == name:
-                reason = ("checkpoint has no immutable model-view link" if payload.get("available")
-                          else payload.get("reason") or "checkpoint unavailable")
-                return SavedView(name, "checkpoint", reason=reason)
-    return SavedView(name, "checkpoint", reason="checkpoint not captured")
+                matches.append(payload)
+    if not matches:
+        return SavedView(name, "checkpoint", reason="checkpoint not captured")
+    if len(matches) > 1:
+        return SavedView(name, "checkpoint", reason="ambiguous checkpoint records")
+    payload = matches[0]
+    if not payload.get("available"):
+        return SavedView(name, "checkpoint", reason=payload.get("reason") or "checkpoint unavailable")
+    event_id, wire, route = (payload.get("model_view_event_id"), payload.get("wire_sha256"),
+                             payload.get("route_provenance"))
+    if not (payload.get("model_view_available") and isinstance(event_id, str) and isinstance(wire, str)
+            and isinstance(route, dict)):
+        return SavedView(name, "checkpoint", reason=payload.get("model_view_reason")
+                         or "checkpoint has no immutable model-view link")
+    try:
+        raw = _read_view(capture, event_id)
+        body = json.loads(raw)
+    except (OSError, ValueError, KeyError, TypeError):
+        return SavedView(name, "checkpoint", event_id, reason="linked model view unavailable or invalid")
+    if (digest(raw) != wire or route.get("model") != body.get("model") or not route.get("base_url")
+            or route.get("model_revision") is not None or route.get("model_revision_status") != "unknown"):
+        return SavedView(name, "checkpoint", event_id, reason="checkpoint link or route provenance mismatch")
+    return SavedView(name, "checkpoint", event_id, raw, provenance=route)
 
 
 @dataclass(frozen=True)
@@ -296,11 +323,15 @@ class Diagnostics:
             if view.raw is None:
                 record["reason"] = view.reason or "checkpoint unavailable"
                 return self._save(record)
-            if view.timing != "retrospective" or view.checkpoint != "retrospective_request":
-                record["reason"] = "named checkpoint model-view linkage unavailable"
+            # Verify selection against the capture again; callers cannot smuggle probe answers.
+            if view.timing == "checkpoint":
+                if checkpoint_view(self.capture, view.checkpoint) != view:
+                    raise ValueError("view does not match immutable checkpoint link")
+                record["route_provenance"] = view.provenance
+            elif view.timing != "retrospective" or view.checkpoint != "retrospective_request":
+                record["reason"] = "unknown view timing"
                 return self._save(record)
-            # Verify selection against T010 capture again; callers cannot smuggle probe answers.
-            if not view.event_id or _read_view(self.capture, view.event_id) != view.raw:
+            elif not view.event_id or _read_view(self.capture, view.event_id) != view.raw:
                 raise ValueError("view does not match immutable T010 capture")
             body = json.loads(view.raw)
             transcript = visible_transcript(view.raw)
@@ -326,6 +357,10 @@ class Diagnostics:
             record["route_config_sha256"] = digest(encoded(record["route_config"]))
             if kind == "direct":
                 original_options = {key: value for key, value in body.items() if key not in CONTINUATION_FIELDS}
+                if view.provenance and (view.provenance["base_url"] != route.base_url
+                                        or view.provenance["model"] != route.model):
+                    record["reason"] = "route does not match checkpoint route provenance"
+                    return self._save(record)
                 if body.get("model") != route.model or options != original_options:
                     record["reason"] = "original model ID or route configuration mismatch"
                     return self._save(record)
