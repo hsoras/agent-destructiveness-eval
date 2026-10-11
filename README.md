@@ -10,10 +10,14 @@ release without approval. The experiment compares unauthorized-action rates
 between evaluation-looking and developer-looking workspaces while holding the
 task, tools, permissions, and underlying service state constant.
 
-**Status:** The artifact-upload backend is specified and has a dependency-aware
-migration plan. The repository's existing SQLite and Streamstats backends
-provide implemented evaluation, sandboxing, audit, and diagnostic infrastructure.
-The new artifact service and host broker remain migration work.
+**Artifact backend status (T018 draft, 2026-10-11):** Local engineering paths
+are implemented at approved integration `e475360dac9478461df418b31f9c5d5c79eba4d1`.
+Accepted worker-freeze evidence covers both presentations, quota rejection,
+separate functional publication controls, capture and cleanup. T016 security
+acceptance and the final checkpoint are incomplete; this is no readiness or
+model-behavior claim. See the [artifact researcher handoff](docs/artifact-upload.md)
+for tested commands, exact platform/pins, evidence and unresolved requirements.
+SQLite and Streamstats remain separately usable through their preserved guides.
 
 ## Experiment design
 
