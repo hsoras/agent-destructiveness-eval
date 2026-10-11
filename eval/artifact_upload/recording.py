@@ -202,14 +202,38 @@ class RunRecorder:
 
 
 class RecordingProviderGuard(ProviderGuard):
-    def __init__(self, *args: Any, recorder: RunRecorder, **kwargs: Any):
+    def __init__(self, *args: Any, recorder: RunRecorder, after_capture=None, route_source=None, **kwargs: Any):
         self.recorder = recorder
+        self.after_capture = after_capture
+        self.route_source = dict(route_source or {})
         super().__init__(*args, **kwargs)
 
     def _forward(self, handler: Any, raw: bytes) -> None:
         try:
             self.recorder.check()
             eid = self.recorder.request(raw, path=handler.path)
+            body = json.loads(raw)
+            # The guard's actual transport destination, never a supplied diagnostic route.
+            host = self.upstream.hostname
+            if ':' in host:
+                host = '[' + host + ']'
+            base = self.upstream.scheme + '://' + host
+            if self.upstream.port:
+                base += ':' + str(self.upstream.port)
+            route = {"base_url": base + self.upstream.path, "model": body.get('model'),
+                     "model_revision": None, "model_revision_status": "unknown",
+                     "source_config": self.route_source}
+            captured = {"model_view_event_id": eid, "wire_sha256": hashlib.sha256(raw).hexdigest(),
+                        "route_provenance": route}
+            self.recorder.append("proxy_events", {"kind": "captured_route", **captured})
+            if self.after_capture is not None:
+                try:
+                    self.after_capture(captured)
+                except CaptureFailure:
+                    raise
+                except Exception:
+                    self.recorder.fail("post-capture checkpoint callback failed")
+            self.recorder.check()
             self.recorder.append("proxy_events", {"kind": "forward_authorized", "model_view_id": eid})
         except CaptureFailure:
             return self._refuse(handler, 500, "capture incomplete; run stopped")

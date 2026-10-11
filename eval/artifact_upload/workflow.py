@@ -140,8 +140,6 @@ class BudgetGuard(RecordingProviderGuard):
                 self.ledger.stop()
             return
         try:
-            if getattr(self.ledger, 'before_forward', None):
-                self.ledger.before_forward(raw)
             return super()._forward(handler, raw)
         finally:
             if self.recorder.failure and getattr(self.ledger, 'stop', None):
@@ -164,7 +162,10 @@ class WorkflowAdapter(RecordingOpenCodeAdapter):
         super().stage_runtime()
         self.guard.close()
         self.guard = BudgetGuard(self.base_url, self.audit_request, recorder=self.recorder,
-                                 ledger=self.ledger, max_request_bytes=self.max_request_bytes).start()
+                                 ledger=self.ledger, max_request_bytes=self.max_request_bytes,
+                                 after_capture=lambda captured: self.ledger.after_capture(captured),
+                                 route_source={'component': 'WorkflowAdapter', 'configured_main_model': self.model,
+                                               'credential_id': 'model-provider'}).start()
         self._write_opencode_config(self.config_dir, self.guard.url, router=True)
         self.recorder.credentials.update({'router-bridge': self.bridge.token})
 
@@ -214,27 +215,36 @@ class TwoStageWorkflow:
     def __init__(self, adapter, ledger, world, checkpoint, snapshot):
         self.adapter, self.ledger, self.world = adapter, ledger, world
         self.checkpoint, self.snapshot = checkpoint, snapshot
-        self.ledger.before_forward = self.before_forward
+        self.ledger.after_capture = self.after_capture
         self.result = {'upload_reached': False, 'warmup': None, 'termination_reason': None,
                        'approval_requests': [], 'turns': [], 'checkpoints': {}}
 
-    def before_forward(self, raw):
+    def after_capture(self, captured):
+        raw = self.adapter.recorder.replay(captured['model_view_event_id'])
+        self.before_forward(raw, captured=captured)
+
+    def before_forward(self, raw, *, captured=None):
         if self.ledger.stage != 'upload':
             return
         body = json.loads(raw)
         if not body.get('tools'):
             return
         if 'after_request_before_attempt' not in self.result['checkpoints']:
-            self.mark('after_request_before_attempt')
+            self.mark('after_request_before_attempt', captured=captured)
         # This request contains the actual presented tool results. Combined
         # shell effects have already happened; do not invent an earlier state.
         if 'quota_exceeded' in json.dumps(body) and 'after_quota_before_action' not in self.result['checkpoints']:
-            self.mark('after_quota_before_action')
+            self.mark('after_quota_before_action', captured=captured)
 
-    def mark(self, name, *, available=True, reason=None):
+    def mark(self, name, *, available=True, reason=None, captured=None):
         value = {'available': available, 'reason': reason, 'resources': self.ledger.snapshot()}
         if available:
             value['state'] = self.snapshot()
+        value['model_view_available'] = captured is not None
+        if captured is not None:
+            value.update(captured)
+        else:
+            value['model_view_reason'] = 'no exact captured model view at this boundary'
         self.result['checkpoints'][name] = value
         self.adapter.recorder.append('workflow_events', {'kind': 'checkpoint', 'name': name, **value})
 

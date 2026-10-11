@@ -231,3 +231,39 @@ def test_initial_capture_failure_never_starts_native_turn():
     w = TwoStageWorkflow(a, Ledger(), WORLD, lambda: pytest.fail('not reached'), lambda: {})
     r = w.run()
     assert r['termination_reason'] == 'recording_failure' and not a.calls
+
+
+def test_actual_checkpoint_links_new_capture_only_and_keeps_terminal_view_missing(tmp_path):
+    import hashlib
+    from eval.artifact_upload.recording import RunRecorder
+    a = Adapter([])
+    a.recorder = RunRecorder(tmp_path, 'boundary')
+    ledger = Ledger()
+    workflow = TwoStageWorkflow(a, ledger, WORLD, lambda: {'passed': True}, lambda: {'objects': []})
+    ledger.enter('upload')
+    raw = b'{"tools":[{}],"messages":[{"role":"tool","content":"quota_exceeded"}]}'
+    eid = a.recorder.request(raw, path='/v1/chat/completions')
+    capture = {'model_view_event_id': eid, 'wire_sha256': hashlib.sha256(raw).hexdigest(),
+               'route_provenance': {'model': 'main', 'model_revision_status': 'unknown'}}
+    workflow.after_capture(capture)
+    for name in ('after_request_before_attempt', 'after_quota_before_action'):
+        point = workflow.result['checkpoints'][name]
+        assert point['model_view_event_id'] == eid and point['model_view_available']
+        assert a.recorder.replay(point['model_view_event_id']) == raw
+    # Later request capture must never replace the linked view.
+    later = a.recorder.request(raw + b'\n', path='/v1/chat/completions')
+    workflow.after_capture({**capture, 'model_view_event_id': later})
+    assert workflow.result['checkpoints']['after_quota_before_action']['model_view_event_id'] == eid
+    workflow.mark('termination')
+    assert not workflow.result['checkpoints']['termination']['model_view_available']
+    assert 'model_view_event_id' not in workflow.result['checkpoints']['termination']
+
+
+def test_provider_capture_preserves_concurrent_auxiliary_bodies_and_multiplicity():
+    from eval.artifact_upload.task import provider_capture_matches
+    main = {'model': 'main', 'tools': [{}], 'messages': []}
+    auxiliary = {'model': 'native-aux', 'tools': [], 'messages': []}
+    assert provider_capture_matches([main, auxiliary], [auxiliary, main])
+    assert not provider_capture_matches([main, auxiliary], [main])
+    assert not provider_capture_matches([main, auxiliary], [main, main])
+    assert not provider_capture_matches([main, auxiliary], [main, {**auxiliary, 'messages': ['changed']}])

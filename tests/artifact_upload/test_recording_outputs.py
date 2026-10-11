@@ -465,3 +465,43 @@ def test_native_timeout_hook_verifies_invocation_sources_redacts_and_rethrows_sa
         assert '[credential:provider]' in exported and '[private host runtime]' in exported
         assert rows(adapter.recorder.export / 'sanitization.jsonl')[0]['credential_ids'] == ['provider']
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('fault', [None, 'callback', 'capture', 'health'])
+def test_post_capture_checkpoint_hook_binds_exact_wire_and_failures_stop(tmp_path, monkeypatch, fault):
+    from urllib.parse import urlsplit
+    from eval.artifact_upload.host_adapter import ProviderGuard
+    recorder = RunRecorder(tmp_path / 'capture', 'hook', credentials={'model-provider': 'secret-token'})
+    guard = RecordingProviderGuard.__new__(RecordingProviderGuard)
+    guard.recorder = recorder
+    guard.upstream = urlsplit('https://user:secret-token@provider.example/api')
+    guard.route_source = {'component': 'fixture', 'credential_id': 'model-provider'}
+    forwarded, callbacks, refusals = [], [], []
+    raw = b'{ "model":"exact-main", "messages":[], "max_tokens":8 }\n'
+    def callback(captured):
+        assert recorder.replay(captured['model_view_event_id']) == raw
+        assert captured['wire_sha256'] == hashlib.sha256(raw).hexdigest()
+        assert set(captured) == {'model_view_event_id', 'wire_sha256', 'route_provenance'}
+        assert captured['route_provenance']['base_url'] == 'https://provider.example/api'
+        assert captured['route_provenance']['model_revision_status'] == 'unknown'
+        assert captured['route_provenance']['model_revision'] is None
+        assert not forwarded
+        callbacks.append(captured)
+        if fault == 'callback':
+            raise RuntimeError('secret-token callback failed')
+    guard.after_capture = callback
+    guard._refuse = lambda handler, code, reason: refusals.append(code)
+    monkeypatch.setattr(ProviderGuard, '_forward', lambda self, handler, body: forwarded.append(body))
+    if fault == 'capture':
+        monkeypatch.setattr(recorder, '_write', lambda *args: (_ for _ in ()).throw(OSError()))
+    if fault == 'health':
+        recorder.service_health = lambda: {'healthy': False, 'sealed': False}
+    guard._forward(SimpleNamespace(path='/v1/chat/completions'), raw)
+    if fault:
+        assert forwarded == [] and refusals == [500] and recorder.failure
+        guard._forward(SimpleNamespace(path='/v1/chat/completions'), raw)
+        assert not forwarded and len(callbacks) == (1 if fault == 'callback' else 0)
+    else:
+        assert forwarded == [raw] and len(callbacks) == 1
+        assert len(rows(recorder.private / 'model_views.jsonl')) == 1
+        assert 'secret-token' not in (recorder.export / 'proxy_events.jsonl').read_text()
