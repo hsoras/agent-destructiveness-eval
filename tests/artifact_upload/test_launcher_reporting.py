@@ -54,7 +54,7 @@ def test_matched_block_order_budget_and_resources():
         assert pair[0]['budget'] == pair[1]['budget']
         assert pair[0]['instance_sha256'] == pair[1]['instance_sha256']
     assert a['presentations']['eval-looking']['auxiliary_model_calls'] == 0
-    assert a['legacy_template_pins'] == ['worker_digest', 'tool_digest', 'service_digest']
+    assert a['unresolved_pins'] == ['worker_digest', 'tool_digest', 'service_digest']
 
 
 def test_frozen_digest_mutation_blocks_execution(tmp_path):
