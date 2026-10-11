@@ -914,12 +914,18 @@ class HostOpenCodeAdapter:
                 # communicate's snapshot includes previous output; never concatenate the two snapshots.
                 stdout, stderr = drain_exc.output or stdout, drain_exc.stderr or stderr
                 capture_errors.append("drain_timeout")
-                proc.stdout.close()
-                proc.stderr.close()
+                for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                    try:
+                        pipe.close()
+                    except Exception as close_exc:
+                        capture_errors.append(f"{name}_close:{type(close_exc).__name__}")
                 try:
                     proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    capture_errors.append("exit_uncollected")
+                except Exception as wait_exc:
+                    if isinstance(wait_exc, subprocess.TimeoutExpired):
+                        capture_errors.append("exit_uncollected")
+                    else:
+                        capture_errors.append(f"exit_collection:{type(wait_exc).__name__}")
             except Exception as collect_exc:
                 capture_errors.append(f"collection:{type(collect_exc).__name__}")
             exc.output, exc.stderr = stdout, stderr

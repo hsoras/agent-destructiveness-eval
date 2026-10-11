@@ -1134,6 +1134,61 @@ def test_process_capture_success_preserves_text_output(process_capture_adapter, 
     assert cancellations == ["called"] and adapter._active is None
 
 
+def test_process_timeout_preserves_exception_when_drain_cleanup_fails(process_capture_adapter, tmp_path, monkeypatch):
+    adapter, run, cancellations = process_capture_adapter
+    original_popen = subprocess.Popen
+    original_timeout = []
+    cleanup = []
+
+    class PipeProxy:
+        def __init__(self, pipe, name):
+            self.pipe = pipe
+            self.name = name
+        def __getattr__(self, name):
+            return getattr(self.pipe, name)
+        def close(self):
+            cleanup.append(f"{self.name}_close")
+            if self.name == "stdout":
+                raise OSError("injected close failure")
+            return self.pipe.close()
+
+    def launch(*args, **kwargs):
+        proc = original_popen(*args, **kwargs)
+        communicate = proc.communicate
+        wait = proc.wait
+        def collect(*args, **kwargs):
+            if not original_timeout:
+                try:
+                    return communicate(*args, **kwargs)
+                except subprocess.TimeoutExpired as exc:
+                    original_timeout.append(exc)
+                    proc.stdout = PipeProxy(proc.stdout, "stdout")
+                    proc.stderr = PipeProxy(proc.stderr, "stderr")
+                    raise
+            raise subprocess.TimeoutExpired(proc.args, kwargs["timeout"], output=b"partial", stderr=b"error")
+        def bounded_wait(*args, **kwargs):
+            cleanup.append("wait")
+            return wait(*args, **kwargs)
+        proc.communicate = collect
+        proc.wait = bounded_wait
+        return proc
+
+    monkeypatch.setattr(host_adapter.subprocess, "Popen", launch)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        run("import os, time\nos.write(1, b'partial')\nos.write(2, b'error')\ntime.sleep(30)\n")
+
+    assert original_timeout and caught.value is original_timeout[0]
+    assert caught.value.output == (tmp_path / "turn.stdout.log").read_bytes() == b"partial"
+    assert caught.value.stderr == (tmp_path / "turn.stderr.log").read_bytes() == b"error"
+    assert caught.value.capture_errors == ["drain_timeout", "stdout_close:OSError"]
+    assert cleanup == ["stdout_close", "stderr_close", "wait"]
+    receipt = json.loads(caught.value.capture_receipt_path.read_bytes())
+    assert receipt["capture_complete"] is False
+    assert receipt["capture_errors"] == caught.value.capture_errors
+    assert receipt["streams"]["stdout"]["size_bytes"] == len(b"partial")
+    assert cancellations == ["called"] and adapter._active is None
+
+
 @pytest.mark.parametrize("failure", ["stream", "receipt", "cancellation", "drain"])
 def test_process_timeout_capture_failure_is_explicit(process_capture_adapter, tmp_path, monkeypatch, failure):
     adapter, run, cancellations = process_capture_adapter
