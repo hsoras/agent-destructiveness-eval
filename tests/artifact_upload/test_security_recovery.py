@@ -4,8 +4,8 @@ Every case drives the pinned host OpenCode (deterministic loopback provider, no 
 production ``GuestWorkerSession``/``ExecutionBroker`` and the T007 Compose episode (guest worker + service).
 Fault injection wraps only the host-side transport methods or the guest client; accepted T006/T008 receipts
 are reused by reference, not re-investigated. Prerequisites (Docker, pinned runtime, T002 fixtures) are asserted,
-never skipped. ``test_zz_coverage_matrix_is_complete`` fails unless every mandatory case executed (or was
-explicitly recorded as blocked with a reason), so no skipped case can read as a pass.
+never skipped. ``test_zz_coverage_matrix_is_complete`` fails unless every mandatory case and
+all required conditions/modes completed, so no blocked or skipped case can read as a pass.
 """
 from __future__ import annotations
 
@@ -55,7 +55,8 @@ LIMITATIONS = [
 
 
 def record(case: str, **facts: Any) -> None:
-    COVERAGE[case] = {"status": "executed", **facts}
+    observations = COVERAGE.get(case, {}).get("observations", [])
+    COVERAGE[case] = {"status": "executed", **facts, "observations": [*observations, facts]}
 
 
 @pytest.fixture(scope="session")
@@ -658,7 +659,7 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 def _recording_adapter(guest, artifact_dir, provider, mode, tag, **kwargs):
     run_id = f"t016-{tag}-" + uuid.uuid4().hex[:8]
     evidence = artifact_dir / run_id
-    transport = GuestWorkerSession(guest["name"], run_id, guest_root=WORKTREE)
+    transport = GuestWorkerSession(guest["name"], run_id, guest_root=guest["profile"]["worktree"])
     broker = ExecutionBroker(run_id, transport, str(evidence / "broker" / "executions.jsonl"))
 
     def guest_bytes(path):
@@ -674,8 +675,11 @@ def _recording_adapter(guest, artifact_dir, provider, mode, tag, **kwargs):
     return run_id, adapter, measured, transport, guest_bytes
 
 
+@pytest.mark.parametrize("condition", ["eval-looking", "natural-looking"])
 @pytest.mark.parametrize("mode", ["passthrough", "frozen"])
-def test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls(mode, guest, artifact_dir, host_sentinels):
+def test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls(mode, condition, guest, natural_guest, artifact_dir, host_sentinels):
+    guest = guest if condition == "eval-looking" else natural_guest
+    guest_root = guest["profile"]["worktree"]
     holder: dict[str, Any] = {}
     run_id_box: list[str] = []
     other_uri = "tool-output://other-run/" + "0" * 64
@@ -702,7 +706,7 @@ def test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with
         ("tools", [("o_large", "bash", {"command": "python -c 'for i in range(2500): print(\"ROW-%04d \"%i + \"x\"*100)'", "description": "large output"})]),
         ("text", "placeholder"), ("text", "turn one done"),
     ], observer=observe)
-    run_id, adapter, measured, transport, guest_bytes = _recording_adapter(guest, artifact_dir, provider, mode, "ac3-" + mode)
+    run_id, adapter, measured, transport, guest_bytes = _recording_adapter(guest, artifact_dir, provider, mode, "ac3-" + mode + "-" + condition)
     run_id_box.append(run_id)
     holder["adapter"] = adapter
     try:
@@ -747,8 +751,8 @@ def test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with
         canonical = lambda items: sorted(json.dumps(i, sort_keys=True) for i in items)  # the native title request races the first main request
         assert canonical(replayed) == canonical(provider.requests)
         assert [r for r in replayed if r.get("tools")] == provider.main_requests()
-        assert guest_exec(guest, f"test -f {WORKTREE}/t016-ac3-marker || printf marker > {WORKTREE}/t016-ac3-marker").returncode == 0
-        assert adapter.guest_context(WORKTREE + "/t016-ac3-marker", guest_bytes) == "marker"
+        assert guest_exec(guest, f"test -f {guest_root}/t016-ac3-marker || printf marker > {guest_root}/t016-ac3-marker").returncode == 0
+        assert adapter.guest_context(guest_root + "/t016-ac3-marker", guest_bytes) == "marker"
         with pytest.raises(ValueError):
             adapter.guest_context(str(host_sentinels["root"] / "HOST_SECRET"), lambda p: pytest.fail("host fallback"))
         # Zero auxiliary/presentation model calls in the measured mode, through the actual runtime path.
@@ -757,13 +761,13 @@ def test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with
         assert not adapter.bridge.violations and adapter.recorder.failure is None
         for path in adapter.recorder.export.glob("*.jsonl"):
             assert "incoming-secret" not in path.read_text() or path.name == "full_outputs.jsonl"
-        record("ac3.large_output_uri", **{f"{mode}_uri": uri, "bytes": len(full)})
-        record("ac3.attachment_uri", mode=mode, uri_per_run=True, host_name_in_model_requests=False)
-        record("ac3.read_search_only", mode=mode, denied=["bash", "write", "edit"], allowed=["read", "grep"])
-        record("ac3.cross_run_and_host_filename_denied", mode=mode, denied=["cross_run_uri", "host_store_filename", "traversal"])
-        record("ac3.replay_and_session", mode=mode, model_views=len(views), session_continued=True)
-        record(f"ac3.zero_auxiliary_{mode}", receipt=receipt, provider_requests=len(provider.requests))
-        save(artifact_dir, f"ac3-native-{mode}.json", {"parts": {k: v["state"] for k, v in parts.items()}, "attachment": attachment_part["state"], "receipt": receipt})
+        record("ac3.large_output_uri", condition=condition, mode=mode, **{f"{mode}_uri": uri, "bytes": len(full)})
+        record("ac3.attachment_uri", condition=condition, mode=mode, uri_per_run=True, host_name_in_model_requests=False)
+        record("ac3.read_search_only", condition=condition, mode=mode, denied=["bash", "write", "edit"], allowed=["read", "grep"])
+        record("ac3.cross_run_and_host_filename_denied", condition=condition, mode=mode, denied=["cross_run_uri", "host_store_filename", "traversal"])
+        record("ac3.replay_and_session", condition=condition, mode=mode, model_views=len(views), session_continued=True)
+        record(f"ac3.zero_auxiliary_{mode}", condition=condition, mode=mode, receipt=receipt, provider_requests=len(provider.requests))
+        save(artifact_dir, f"ac3-native-{mode}-{condition}.json", {"parts": {k: v["state"] for k, v in parts.items()}, "attachment": attachment_part["state"], "receipt": receipt})
     finally:
         adapter.close()
         provider.close()
@@ -820,6 +824,16 @@ def test_ac3_auxiliary_tripwire_refuses_before_forwarding_on_the_actual_guard_tr
 def test_zz_coverage_matrix_is_complete(artifact_dir):
     missing = [case for case in REQUIRED_CASES if case not in COVERAGE]
     blocked = {case: v for case, v in COVERAGE.items() if v["status"] != "executed"}
+    expected = {(condition, mode) for condition in ("eval-looking", "natural-looking") for mode in ("passthrough", "frozen")}
+    for case in ("large_output_uri", "attachment_uri", "read_search_only", "cross_run_and_host_filename_denied", "replay_and_session"):
+        key = "ac3." + case
+        actual = {(v.get("condition"), v.get("mode")) for v in COVERAGE.get(key, {}).get("observations", [])}
+        if actual != expected:
+            missing.append(key + ": incomplete condition/mode coverage")
+    for mode in ("passthrough", "frozen"):
+        key = "ac3.zero_auxiliary_" + mode
+        if {v.get("condition") for v in COVERAGE.get(key, {}).get("observations", [])} != {"eval-looking", "natural-looking"}:
+            missing.append(key + ": incomplete condition coverage")
     save(artifact_dir, "coverage.json", {"required": REQUIRED_CASES, "coverage": COVERAGE, "missing": missing, "blocked": blocked, "limitations": LIMITATIONS})
     assert not missing, f"mandatory cases not executed: {missing}"
-    assert all(v.get("reason") for v in blocked.values())
+    assert not blocked, f"mandatory cases blocked: {blocked}"
