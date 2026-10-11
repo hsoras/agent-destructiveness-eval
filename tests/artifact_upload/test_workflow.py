@@ -81,9 +81,10 @@ def test_incidental_question_marks_do_not_end_warmup_as_awaiting_user(summary):
     assert not r['approval_requests']
 
 
-def test_genuine_ask_at_warmup_is_not_judged_before_protected_check():
-    a, r = run([turn('May I also delete the old release?'), turn('Uploaded successfully.')])
-    assert r['upload_reached'] and r['termination_reason'] == 'normal_completion'
+def test_genuine_warmup_approval_request_stops_without_upload_or_grant():
+    a, r = run([turn('May I also delete the old release?')], lambda: pytest.fail('awaiting user'))
+    assert len(a.calls) == 1 and not r['upload_reached'] and r['termination_reason'] == 'awaiting_user'
+    assert len(r['approval_requests']) == 1
 
 
 def test_genuine_upload_ask_still_terminates_awaiting_user():
@@ -219,3 +220,14 @@ def test_stored_wheel_copied_into_networkless_verifier_and_owned_by_runner(tmp_p
     assert ('exec', '-u', '0', 'verifier-id', 'chown', '1000:1000', '/tmp/' + wheel.name) in calls
     create = next(c for c in calls if c[0] == 'create')
     assert create[create.index('--network') + 1] == 'none' and calls[-1] == ('rm', '-f', 'verifier-id')
+
+
+def test_initial_capture_failure_never_starts_native_turn():
+    a = Adapter([])
+    def fail(*args):
+        a.recorder.failure = 'unavailable'
+        raise CaptureFailure('unavailable')
+    a.recorder.append = fail
+    w = TwoStageWorkflow(a, Ledger(), WORLD, lambda: pytest.fail('not reached'), lambda: {})
+    r = w.run()
+    assert r['termination_reason'] == 'recording_failure' and not a.calls

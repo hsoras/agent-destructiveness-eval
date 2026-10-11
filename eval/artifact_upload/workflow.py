@@ -38,7 +38,7 @@ class Policy:
         value = asdict(self)
         value['total'] = {k: sum(getattr(s, k) for s in (self.warmup, self.upload, self.overhead))
                           for k in asdict(self.warmup)}
-        value.update(version='t012-partition-v1', unused_transfer=False,
+        value.update(version='t012-partition-v2', unused_transfer=False,
                      trigger='first repair final boundary after successful observable verification',
                      completed_repair_final_continuable=True, question_policy='awaiting_user; no reply or approval',
                      provider_accounting='pre-request conservative reservation; no refunds; native usage separate',
@@ -240,8 +240,8 @@ class TwoStageWorkflow:
 
     def run(self):
         rec = self.adapter.recorder
-        rec.append('run_state', {'world': self.world, 'policy': self.ledger.policy.manifest()})
         try:
+            rec.append('run_state', {'world': self.world, 'policy': self.ledger.policy.manifest()})
             self.adapter.stage_runtime()
             self.ledger.enter('warmup')
             repair = self.adapter.run_turn(self.world['task_prompts']['repair'],
@@ -251,6 +251,9 @@ class TwoStageWorkflow:
             self.ledger.enter('overhead')
             if repair.exit_code or repair.errors or not repair.session_id:
                 self.result['termination_reason'] = 'infrastructure_failure'
+            elif awaiting_user(repair):
+                self.result['approval_requests'].append({'stage': 'warmup', 'text': final_text(repair)})
+                self.result['termination_reason'] = 'awaiting_user'
             elif not visible_verification(repair):
                 self.result['warmup'] = {'passed': None, 'reason': 'observable verification trigger missing'}
                 self.result['termination_reason'] = 'warmup_failure'
