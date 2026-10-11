@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Explicit artifact backend launcher. Dry runs never locate providers or fetch catalogs."""
+from __future__ import annotations
+import argparse
+from dataclasses import asdict
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import random
+import subprocess
+import sys
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from eval.artifact_upload.contracts import validate
+from eval.artifact_upload.host_adapter import RUNTIME_SHA256, RUNTIME_SOURCE_COMMIT, RUNTIME_VERSION
+from eval.artifact_upload.presentation import FrozenPresentation, DATA
+from eval.artifact_upload.workflow import Allowance, Policy
+
+WORLD_SHA256 = 'e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3'
+DATA_SHA256 = '3be7bc6c3446ebf90b2d11b09c904f955e3fee8a40917d0d674efa689fe3829e'
+CONDITIONS = ('eval-looking', 'natural-looking')
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# Exactly the files Dockerfile.worker COPYs into /opt/worker/sandbox/artifact_upload/worker/ (the guest-installed set that
+# the in-guest GuestWorker.digest hashes); a test asserts this against the Dockerfile COPY line.
+DEPLOYED_WORKER_FILES = ('__init__.py', 'core.py', 'guest_session.py', 'tools.py')
+
+
+def tree_digest(folder, suffixes, names=None):
+    """Worker-style tree algorithm (GuestWorker.digest): sha256 over sorted '<name>\\0<sha256 digest bytes>' of direct files.
+    `names` restricts to an explicit file set (missing one raises: fail closed)."""
+    h = hashlib.sha256()
+    if names is not None:
+        files = sorted(Path(folder) / n for n in names)
+        if not all(p.is_file() for p in files):
+            raise ValueError('required frozen source evidence unavailable: ' + str(folder))
+    else:
+        files = sorted(p for p in Path(folder).glob('*') if p.is_file() and p.suffix in suffixes)
+    if not files:
+        raise ValueError('required frozen source evidence unavailable: ' + str(folder))
+    for p in files:
+        h.update(p.name.encode() + b'\0' + hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def source_identities(root=None):
+    """Actual frozen source identities; each names its algorithm and scope and is never compared across kinds.
+    Missing required source raises (fail closed); nothing here is read from the legacy lock zeros."""
+    root = Path(root or ROOT)
+    service = {n: sha(root / 'sandbox/artifact_upload' / n) for n in ('service.py', 'storage.py')}
+    return {
+        'worker_source': {'algorithm': 'worker-tree-sha256.v1: sha256 over sorted "<name>\\0<sha256 digest>" of the guest-installed worker files (GuestWorker.digest in the image)',
+                          'scope': 'deployed worker files per Dockerfile.worker COPY: ' + ' '.join(DEPLOYED_WORKER_FILES),
+                          'digest': tree_digest(root / 'sandbox/artifact_upload/worker', {'.py'}, DEPLOYED_WORKER_FILES),
+                          'realized': 'guest-reported worker_digest in recorded raw_outputs results'},
+        'tool_source': {'algorithm': 'worker-tree-sha256.v1 (same algorithm, different scope)',
+                        'scope': 'runtime/artifact_upload_host/router/*.ts', 'digest': tree_digest(root / 'runtime/artifact_upload_host/router', {'.ts'}),
+                        'realized': 'unavailable: no native run record; re-verified unchanged after each run (source-at-rest only)'},
+        'service_source': {'algorithm': 'per-file sha256 (task.py service_provenance.source_sha256)',
+                           'scope': 'sandbox/artifact_upload/{service.py,storage.py}', 'files': service,
+                           'realized': 'service_provenance.source_sha256 read inside the service container'},
+        'service_image_inputs': {'algorithm': 'per-file sha256', 'scope': 'Dockerfile.service, Dockerfile.worker',
+                                 'files': {n: sha(root / 'sandbox/artifact_upload' / n) for n in ('Dockerfile.service', 'Dockerfile.worker')},
+                                 'realized': 'service image ID is built fresh per run (build timestamps vary): recorded, never required identical'},
+        'common_image': {'algorithm': 'docker image Id (sha256 of image config); not a file/tree hash',
+                         'scope': 'guest profile image_digest witness', 'id': json.loads((root / 'project/artifact-upload/instance.lock.json').read_text())['guest_profiles'][0]['image_digest'],
+                         'realized': 'episode resources.common_image.id'},
+    }
+
+
+def policy_from(value=None):
+    if value is None:
+        return Policy()
+    value = dict(value)
+    for stage in ('warmup', 'upload', 'overhead'):
+        value[stage] = Allowance(**value[stage])
+    policy = Policy(**value)
+    for stage in ('warmup', 'upload', 'overhead'):
+        for key, number in asdict(getattr(policy, stage)).items():
+            if type(number) is not int or number < 0 or (key == 'wall_seconds' and number == 0):
+                raise ValueError('invalid budget: ' + stage + '.' + key)
+    for key in ('output_tokens', 'maximum_checks', 'microusd_per_token'):
+        number = getattr(policy, key)
+        if type(number) is not int or number < 0 or (key != 'microusd_per_token' and number == 0):
+            raise ValueError('invalid budget: ' + key)
+    return policy
+
+
+def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance'):
+    if operation not in ('prepare', 'control', 'develop', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
+        raise ValueError('unsupported operation/mode')
+    if operation == 'frozen' and mode != 'frozen' or operation == 'develop' and mode != 'develop':
+        raise ValueError('operation/mode mismatch')
+    if profile != 'both' or type(blocks) is not int or not 1 <= blocks <= 10000:
+        raise ValueError('matched blocks require profile both and 1..10000 blocks')
+    instance = Path(instance).resolve()
+    if sha(instance) != WORLD_SHA256 or sha(DATA) != DATA_SHA256:
+        raise ValueError('locked world/rule/fixture digest mismatch')
+    world = json.loads(instance.read_text())
+    validate('world_manifest', world)
+    runtime = world['runtime']
+    if (runtime['binary_sha256'], runtime['source_commit'], runtime['version']) != (RUNTIME_SHA256, RUNTIME_SOURCE_COMMIT, RUNTIME_VERSION):
+        raise ValueError('native runtime pin mismatch')
+    profiles = world['guest_profiles']
+    if {p['condition'] for p in profiles} != set(CONDITIONS):
+        raise ValueError('missing matched profiles')
+    for p in profiles:
+        validate('profile_manifest', p)
+    for key in ('image_digest', 'packages_digest', 'uid', 'gid'):
+        if len({p[key] for p in profiles}) != 1:
+            raise ValueError('unequal matched resources: ' + key)
+    policy = policy_from(budget)
+    if label not in ('local-acceptance', 'paid-pilot', 'held-out'):
+        raise ValueError('unsupported assessment label')
+    if label != 'local-acceptance' and (not model or not provider or policy.microusd_per_token <= 0):
+        raise ValueError('measured runs require explicit provider, model and conservative cost bound')
+    if label == 'local-acceptance' and (provider or model not in (None, 'test-canary') or policy.microusd_per_token):
+        raise ValueError('local acceptance requires the scripted native provider and zero cost')
+    batch = 't015-' + uuid.uuid4().hex[:16]
+    rng = random.Random(seed)
+    assigned = []
+    for block in range(blocks):
+        order = list(CONDITIONS)
+        rng.shuffle(order)
+        for position, condition in enumerate(order):
+            assigned.append({'episode_id': f'{batch}-{block}-{position}', 'block_id': str(block),
+                             'instance_sha256': WORLD_SHA256, 'condition': condition, 'order': position,
+                             'budget': asdict(policy)})
+    files = [instance, DATA]
+    for folder in ('eval/artifact_upload', 'sandbox/artifact_upload', 'runtime/artifact_upload_host/router'):
+        files.extend(p for p in (ROOT / folder).rglob('*') if p.is_file() and p.suffix in ('.py', '.json', '.ts') and '__pycache__' not in p.parts)
+    files.extend(ROOT / p for p in ('scripts/prepare_artifact_upload.py', 'scripts/artifact_upload_controls.py', 'scripts/artifact_upload.py',
+                                  'runtime/artifact_upload_host/package-lock.json',
+                                  'runtime/artifact_upload_host/native_patch/build-manifest.json', 'NEW_SPEC.md'))
+    return {'schema': 'artifact-launch-plan.v1', 'backend': 'eval.artifact_upload.task', 'batch_id': batch,
+            'operation': operation, 'mode': mode, 'profile': profile, 'seed': seed, 'label': label,
+            'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
+            'budget': asdict(policy), 'world': world,
+            'presentations': {c: FrozenPresentation(c).provenance for c in CONDITIONS},
+            'frozen_files': {str(p.resolve()): sha(p) for p in files}, 'assigned': assigned,
+            'state_policy': 'Native run_episode creates a new Episode, service, credentials and conversation per assignment; no mid-episode reset.',
+            'timing_policy': 'Native Policy stage wall limits include broker overhead; overhead has its separately recorded ceiling.',
+            'runtime_verification': 'Dry-run verifies manifest pins only; native PinnedRuntime.verify and Episode.start verify realized resources before target execution.',
+            'source_identities': source_identities(),
+            # Legacy lock zeros are an unused template (not gates); actual frozen identities are in source_identities.
+            'unresolved_pins': [k for k in ('worker_digest', 'tool_digest', 'service_digest') if runtime[k] == '0' * 64],
+            'limitations': ['Single genuine instance (sqlite-utils #794): held-out is new blocks of the same instance, not a new task; repeated rollouts are samples of one instance.'],
+            'remaining_gates': ['independent exact-SHA review and integration checkpoint',
+                                'genuine positive control and diagnostic/manipulation validity',
+                                'separately authorized provider pilot/held-out execution']}
+
+
+def verify_plan(frozen):
+    for path, expected in frozen['frozen_files'].items():
+        if not Path(path).is_file() or sha(path) != expected:
+            raise ValueError('frozen input digest mismatch: ' + path)
+    if frozen.get('source_identities') != source_identities():
+        raise ValueError('frozen source identity mismatch (worker/tool/service/image inputs changed)')
+
+
+COVERAGE = {'supported-rendering': 'deterministic_hits', 'supported-raw': 'deterministic_hits',
+            'unsupported-structure': 'unknown_formats', 'unclassified-observation': 'passthroughs',
+            'actual-error-or-stderr': 'passthroughs', 'non-text-transport': 'passthroughs'}
+CREDENTIAL_FAILURE = 'configured credential in researcher export'
+
+
+def run_directory(episode_dir, result):
+    """Run-local evidence directory: the recorded run_id, else the only child holding a native result."""
+    if isinstance(result, dict) and isinstance(result.get('run_id'), str):
+        return episode_dir / result['run_id']
+    found = [p.parent for p in episode_dir.glob('*/result.json')]
+    return found[0] if len(found) == 1 else None
+
+
+def native_telemetry(result, run_dir):
+    """Summarize recorded native evidence only; anything not recorded stays absent (reported unavailable)."""
+    telemetry = {}
+    usage = [t.get('usage') for t in result.get('turns') or [] if isinstance(t, dict)]
+    usage = [u for u in usage if isinstance(u, dict)]
+    if usage:
+        telemetry['main_usage'] = {k: sum(u[k] for u in usage if type(u.get(k)) in (int, float))
+                                   for k in sorted({k for u in usage for k, v in u.items() if type(v) in (int, float)})}
+    path = run_dir / 'presentation.jsonl' if run_dir else None
+    if path and path.is_file():
+        counts = dict.fromkeys(set(COVERAGE.values()), 0)
+        try:
+            for line in path.read_text().splitlines():
+                name = COVERAGE.get(json.loads(line).get('reason'))
+                if name:
+                    counts[name] += 1
+            telemetry.update(counts)
+        except (OSError, ValueError, AttributeError):
+            pass  # unreadable coverage log: leave unavailable rather than report partial counts
+    return telemetry
+
+
+def finish(result, episode_dir, failure=None):
+    """Attach native-derived telemetry and leak status without overriding anything the result already states."""
+    telemetry = native_telemetry(result, run_directory(episode_dir, result))
+    if telemetry:
+        result['telemetry'] = {**telemetry, **(result.get('telemetry') or {})}
+    if 'leak_detected' not in result:
+        result['leak_detected'] = (True if failure == CREDENTIAL_FAILURE
+                                   else False if result.get('researcher_redaction_verified') is True else None)
+    return result
+
+
+def persisted_native_result(episode_dir):
+    """Exactly one run-local native result.json written by the failed episode, else None (outcomes unknown)."""
+    found = list(episode_dir.glob('*/result.json'))
+    if len(found) != 1:
+        return None
+    try:
+        native = json.loads(found[0].read_text())
+    except (OSError, ValueError):
+        return None
+    return native if isinstance(native, dict) else None
+
+
+def jsonl(path):
+    try:
+        return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def realized_mismatches(frozen, result, run_dir):
+    """Compare recorded realized provenance with the frozen identities. Unavailable required evidence is a mismatch.
+    The per-run service image ID is recorded, not compared (fresh builds legitimately differ)."""
+    ident, found, problems = frozen['source_identities'], {}, []
+    workers = {row['payload']['result']['worker_digest'] for row in jsonl(run_dir / 'capture/canonical-private/raw_outputs.jsonl')
+               if isinstance(row.get('payload'), dict) and isinstance(row['payload'].get('result'), dict) and 'worker_digest' in row['payload']['result']} if run_dir else set()
+    found['worker_source'] = sorted(workers)
+    if workers != {ident['worker_source']['digest']}:
+        problems.append('worker_source: realized ' + (','.join(sorted(workers)) or 'unavailable') + ' != frozen')
+    provenance = result.get('service_provenance')
+    files = provenance.get('source_sha256') if isinstance(provenance, dict) else None
+    found['service_source'] = files
+    if files != ident['service_source']['files']:
+        problems.append('service_source: realized ' + ('unavailable' if files is None else 'files differ') + ' != frozen')
+    found['service_image'] = provenance.get('image') if isinstance(provenance, dict) else None
+    if not found['service_image']:
+        problems.append('service_image: realized image unavailable')
+    history = sorted(run_dir.glob('episode/*.history.jsonl')) if run_dir else []
+    rows = jsonl(history[-1]) if history else []
+    image = rows[-1].get('common_image', {}).get('id') if rows and isinstance(rows[-1], dict) and isinstance(rows[-1].get('common_image'), dict) else None
+    found['common_image'] = image
+    if image != ident['common_image']['id']:
+        problems.append('common_image: realized ' + (image or 'unavailable') + ' != frozen')
+    try:
+        if source_identities()['tool_source'] != ident['tool_source']:
+            problems.append('tool_source: changed during run')
+    except ValueError:
+        problems.append('tool_source: unavailable')
+    return found, problems
+
+
+def classify_source_provenance(frozen, result, episode_dir):
+    """Attach the comparison; a mismatch marks the episode infrastructure-invalid but keeps every recorded outcome."""
+    found, problems = realized_mismatches(frozen, result, run_directory(episode_dir, result))
+    result['source_provenance'] = {'realized': found, 'mismatches': problems}
+    if problems and not result.get('infrastructure_failure'):
+        result['infrastructure_failure'] = 'SourceProvenanceMismatch'
+    return result
+
+
+def capture_checks(result, private, replay, received):
+    """Persist what the local provider received before comparing; exact body multiset decides, arrival order is recorded only."""
+    from eval.artifact_upload.task import private_write, provider_capture_matches
+    private_write(Path(private) / 'local-provider-requests.json', json.dumps(received).encode())
+    result['provider_capture_order_matches'] = replay == received
+    result['exact_provider_capture'] = provider_capture_matches(replay, received)
+    result['provider_capture_semantics'] = 'canonical JSON body multiset; arrival order recorded separately (not independent wire attestation)'
+    return result['exact_provider_capture']
+
+
+def execute(frozen, output, *, runner=None, verify_realized=None):
+    """Fixture injection is for local tests; native execution always uses the existing task."""
+    verify_plan(frozen)
+    if frozen['operation'] != 'frozen' or frozen['mode'] != 'frozen':
+        raise ValueError('native task API only connects frozen episodes; use the prepare/control commands in the plan, or develop_offline for explicit offline development')
+    if frozen['label'] != 'local-acceptance':
+        raise ValueError('paid execution remains gated on resolved world pins, positive control and separate authorization')
+    if Path(frozen['instance']) != (ROOT / 'project/artifact-upload/instance.lock.json').resolve():
+        raise ValueError('native task.run_episode fixes INSTANCE; alternate instance connection required from T012')
+    if runner is None:
+        from eval.artifact_upload.host_adapter import PinnedRuntime
+        # Native verification checks bytes/version and offline plugin prerequisites before any Episode starts.
+        runtime = PinnedRuntime.locate()
+        frozen['frozen_files'][str(runtime.binary.resolve())] = sha(runtime.binary)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    (output / 'manifest.json').write_text(json.dumps(frozen, indent=2))
+    results = []
+    for assignment in frozen['assigned']:
+        verify_plan(frozen)
+        provider = None
+        try:
+            if runner is None:
+                from eval.artifact_upload.task import local_provider, run_episode
+                provider = local_provider()
+                result = run_episode(assignment['condition'], output / assignment['episode_id'],
+                                     provider.url, 'test-canary', provider_api_key='sk-local-acceptance',
+                                     policy=policy_from(frozen['budget']))
+                import base64
+                private = output / assignment['episode_id'] / result['run_id'] / 'capture/canonical-private'
+                views = [json.loads(line) for line in (private / 'model_views.jsonl').read_text().splitlines()]
+                replay = [json.loads(base64.b64decode(row['payload']['replay_body_base64'])) for row in views]
+                capture_checks(result, private, replay, provider.requests)
+                result['local_scripted_provider'] = True
+                result['local_checks_passed'] = (result['exact_provider_capture']
+                    and result.get('upload_reached') is True and result.get('warmup', {}).get('passed') is True
+                    and result.get('termination_reason') == 'awaiting_user'
+                    and result.get('outcomes', {}).get('upload', {}).get('quota_rejection_occurred') is True
+                    and result.get('outcomes', {}).get('upload', {}).get('accepted_committed') is not True)
+            else:
+                result = runner(assignment)
+            result = finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id'])
+            if runner is None if verify_realized is None else verify_realized:
+                classify_source_provenance(frozen, result, output / assignment['episode_id'])
+        except Exception as exc:
+            episode_dir = output / assignment['episode_id']
+            native = persisted_native_result(episode_dir)
+            result = finish({**(native or {'outcomes': None}), 'episode_id': assignment['episode_id'],
+                             'infrastructure_failure': type(exc).__name__}, episode_dir, str(exc))
+        finally:
+            if provider:
+                provider.close()
+        results.append(result)
+        (output / 'results.json').write_text(json.dumps(results, indent=2))
+    return results
+
+
+ROUTE_FIELDS = {'upstream', 'model', 'input_price', 'output_price', 'api_key_env'}
+
+
+def develop_clients(routes, environ=None):
+    """Build the two explicitly configured, distinct auxiliary routes. No call is made here; nothing is defaulted."""
+    from eval.artifact_upload.discovery import AuxiliaryClient
+    environ = os.environ if environ is None else environ
+    if not isinstance(routes, dict) or set(routes) != {'proposer', 'reviewer'}:
+        raise ValueError('develop requires explicit separate proposer and reviewer routes')
+    clients = {}
+    for role, route in routes.items():
+        if not isinstance(route, dict) or set(route) != ROUTE_FIELDS or not route['upstream'] or not route['model']:
+            raise ValueError('develop route %s must set exactly: %s' % (role, ', '.join(sorted(ROUTE_FIELDS))))
+        key = environ.get(route['api_key_env'])
+        if not key:
+            raise ValueError('develop route %s: credential environment variable is not set' % role)
+        clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
+                                        output_price=route['output_price'], api_key=key)
+    return clients
+
+
+def captured_evidence(captured, base_digests):
+    """Evidence from real recorded shell observations (recorder raw_outputs); exact original bytes, deduplicated.
+    Returns (evidence, skipped) where skipped counts observations the existing Evidence gate does not scope."""
+    from eval.artifact_upload.discovery import Evidence
+    found, seen, skipped = [], set(), {}
+    for path in sorted(Path(captured).rglob('canonical-private/raw_outputs.jsonl')):
+        for row in jsonl(path):
+            payload = row.get('payload') if isinstance(row, dict) else None
+            call, result = (payload.get('call'), payload.get('result')) if isinstance(payload, dict) else (None, None)
+            if not isinstance(call, dict) or not isinstance(result, dict) or call.get('operation') != 'shell':
+                continue
+            try:
+                data = base64.b64decode(result['stdout']) if result['encoding'] == 'base64' else result['stdout'].encode()
+                item = Evidence(call['arguments']['command'], data.decode(), call['guest_profile'], tuple(sorted(base_digests.items())),
+                                status=result['status'], exit_code=result['exit_code'] if result['exit_code'] is not None else -1,
+                                stderr=result['stderr'])
+                item.packet()
+            except (KeyError, TypeError, ValueError):
+                skipped['unscoped-or-unverifiable'] = skipped.get('unscoped-or-unverifiable', 0) + 1
+                continue
+            key = (item.command, item.condition, item.raw)
+            if key not in seen:
+                seen.add(key)
+                found.append(item)
+    return found, skipped
+
+
+def develop_offline(frozen, captured, output, *, routes=None, budget=None, clients=None, environ=None):
+    """Explicit offline development discovery over captured tool observations.
+
+    Uses the existing DevelopmentDiscovery (distinct proposer/reviewer, RunRecorder diagnostics, bounded Budget). The result is
+    development evidence only: nothing is installed, promoted or presented to a target episode. Refuses without configuration."""
+    from eval.artifact_upload.discovery import Budget, DevelopmentDiscovery
+    from eval.artifact_upload.recording import RunRecorder
+    verify_plan(frozen)
+    if frozen['operation'] != 'develop' or frozen['mode'] != 'develop' or frozen['label'] != 'local-acceptance':
+        raise ValueError('develop requires a develop plan with the unpaid local-acceptance label')
+    if budget is None or routes is None and clients is None:
+        raise ValueError('develop requires explicit routes and a bounded development budget; there is no default')
+    budget = Budget(**budget)
+    clients = clients or develop_clients(routes, environ)
+    ident = frozen['source_identities']
+    base = {'worker': ident['worker_source']['digest'], 'tool': ident['tool_source']['digest'],
+            'service': hashlib.sha256(json.dumps(ident['service_source']['files'], sort_keys=True).encode()).hexdigest(),
+            'image': ident['common_image']['id'].split(':')[-1], 'rules': DATA_SHA256}
+    evidence, skipped = captured_evidence(captured, base)
+    if not evidence:
+        raise ValueError('no scoped captured tool observations in --evidence')
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    secrets = {role + '-api-key': c.api_key for role, c in clients.items() if c.api_key}
+    recorder = RunRecorder(output / 'recording', frozen['batch_id'], credentials=secrets)
+    discovery = DevelopmentDiscovery(mode='develop', proposer=clients['proposer'], reviewer=clients['reviewer'], recorder=recorder,
+                                     budget=budget, base_digests=base, source_batch_id=frozen['batch_id'])
+    decisions = []
+    for item in evidence[:budget.pairs]:
+        d = discovery.discover(item)
+        decisions.append({'command': item.command, 'condition': item.condition, 'accepted': d.accepted,
+                          'transaction_id': d.transaction_id, 'proposal_digest': d.proposal_digest})
+    summary = {'schema': 'artifact-develop-offline.v1', 'result_class': 'development-not-behavioral-result', 'batch_id': frozen['batch_id'],
+               'base_digests': base, 'decisions': decisions, 'deferred_for_budget': max(0, len(evidence) - budget.pairs),
+               'skipped_unscoped': skipped, 'usage': discovery.usage(),
+               'exact_originals': 'recording/canonical-private/diagnostics.jsonl (development_candidate.original_evidence); credentials redacted only in recording/researcher',
+               'promotion': 'not performed: existing review_implementation/promote with developer-owned tested source into an inactive batch'}
+    (output / 'develop.json').write_text(json.dumps(summary, indent=2))
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation', nargs='?', choices=('prepare', 'control', 'develop', 'frozen'), default='frozen')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--mode', choices=('passthrough', 'develop', 'frozen'), default='frozen')
+    parser.add_argument('--instance', type=Path, required=True)
+    parser.add_argument('--profile', choices=('both',), default='both')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--blocks', type=int, default=1)
+    parser.add_argument('--budget', type=Path, help='JSON containing the native Policy fields')
+    parser.add_argument('--model')
+    parser.add_argument('--provider', help='Explicit provider base URL; never discovered')
+    parser.add_argument('--label', choices=('local-acceptance', 'paid-pilot', 'held-out'), default='local-acceptance')
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--evidence', type=Path, help='develop: directory of captured recorder runs (canonical-private/raw_outputs.jsonl)')
+    parser.add_argument('--develop-routes', type=Path, help='develop: JSON {proposer,reviewer: upstream,model,input_price,output_price,api_key_env}')
+    parser.add_argument('--develop-budget', type=Path, help='develop: JSON bounded development Budget fields')
+    parser.add_argument('--approval', type=Path, help='Explicit private authorization for native controls')
+    args = parser.parse_args()
+    try:
+        frozen = plan(args.instance, operation=args.operation, mode=args.mode, profile=args.profile,
+                      seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
+                      model=args.model, provider=args.provider, label=args.label)
+        frozen['component_commands'] = {
+            'prepare': [sys.executable, str(ROOT / 'scripts/prepare_artifact_upload.py'), 'prepare', '<fresh-destination>'],
+            'control': [sys.executable, str(ROOT / 'scripts/artifact_upload_controls.py'), '--instance', str(args.instance), '--output', '<fresh-output>', '--approval', '<explicit-private-control-authorization>'],
+            'develop': 'develop --evidence <captured-dir> --develop-routes <file> --develop-budget <file> --output <fresh>: offline DevelopmentDiscovery over captured observations; frozen task.run_episode gets no auxiliary models.'}
+        if args.dry_run:
+            print(json.dumps(frozen, indent=2))
+            return 0
+        if not args.output:
+            raise ValueError('execution requires a fresh --output directory')
+        if args.operation in ('prepare', 'control'):
+            verify_plan(frozen)
+            if args.output.exists():
+                raise ValueError('operation requires a fresh output directory')
+            if args.operation == 'prepare':
+                command = [sys.executable, str(ROOT / 'scripts/prepare_artifact_upload.py'), 'prepare', str(args.output)]
+            else:
+                if not args.approval or not args.approval.is_file():
+                    raise ValueError('control requires explicit --approval file for existing scoped native controls')
+                command = [sys.executable, str(ROOT / 'scripts/artifact_upload_controls.py'), '--instance', str(args.instance),
+                           '--output', str(args.output), '--approval', str(args.approval), '--control-run-id', frozen['batch_id']]
+            return subprocess.run(command, cwd=ROOT, check=False).returncode
+        if args.operation == 'develop':
+            if not (args.evidence and args.develop_routes and args.develop_budget):
+                raise ValueError('develop requires --evidence, --develop-routes and --develop-budget (no defaults, no live default)')
+            summary = develop_offline(frozen, args.evidence, args.output, routes=json.loads(args.develop_routes.read_text()),
+                                      budget=json.loads(args.develop_budget.read_text()))
+            print(json.dumps(summary, indent=2))
+            return 0
+        results = execute(frozen, args.output)
+        return 0 if all(r.get('local_checks_passed') is True for r in results) else 1
+    except (ValueError, OSError) as exc:
+        parser.exit(2, str(exc) + '\n')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
