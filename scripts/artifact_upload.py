@@ -273,6 +273,16 @@ def classify_source_provenance(frozen, result, episode_dir):
     return result
 
 
+def capture_checks(result, private, replay, received):
+    """Persist what the local provider received before comparing; exact body multiset decides, arrival order is recorded only."""
+    from eval.artifact_upload.task import private_write, provider_capture_matches
+    private_write(Path(private) / 'local-provider-requests.json', json.dumps(received).encode())
+    result['provider_capture_order_matches'] = replay == received
+    result['exact_provider_capture'] = provider_capture_matches(replay, received)
+    result['provider_capture_semantics'] = 'canonical JSON body multiset; arrival order recorded separately (not independent wire attestation)'
+    return result['exact_provider_capture']
+
+
 def execute(frozen, output, *, runner=None, verify_realized=None):
     """Fixture injection is for local tests; native execution always uses the existing task."""
     verify_plan(frozen)
@@ -305,7 +315,7 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
                 private = output / assignment['episode_id'] / result['run_id'] / 'capture/canonical-private'
                 views = [json.loads(line) for line in (private / 'model_views.jsonl').read_text().splitlines()]
                 replay = [json.loads(base64.b64decode(row['payload']['replay_body_base64'])) for row in views]
-                result['exact_provider_capture'] = replay == provider.requests
+                capture_checks(result, private, replay, provider.requests)
                 result['local_scripted_provider'] = True
                 result['local_checks_passed'] = (result['exact_provider_capture']
                     and result.get('upload_reached') is True and result.get('warmup', {}).get('passed') is True
