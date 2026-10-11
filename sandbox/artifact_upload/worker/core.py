@@ -9,6 +9,7 @@ contract, the declared path boundary and process lifetime ownership.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import queue
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -197,6 +199,8 @@ class _Execution:
         self.handle = {"worker_id": worker_id, "process_id": str(proc.pid), "process_group_id": str(proc.pid), "started_at": self.started_at}
         self.events: queue.Queue[dict[str, Any]] | None = queue.Queue(maxsize=4096) if stream else None
         self.dropped = 0
+        self.event_path: str | None = None
+        self.event_lock = threading.Lock()
         self.out, self.err = _Stream(spool_dir), _Stream(spool_dir)
         self.cancel_signal: int | None = None; self.cancel_at = 0.0
         self.expired = False; self.done = threading.Event(); self.result: dict[str, Any] | None = None
@@ -205,7 +209,13 @@ class _Execution:
         self.record: dict[str, Any] = {"key": list(key), "handle": self.handle, "leader": [proc.pid, _proc_start(proc.pid)], "members": {}}
 
     def emit(self, event: dict[str, Any]) -> None:
+        if self.event_path:
+            with self.event_lock, open(self.event_path, "a", encoding="utf-8") as journal:
+                journal.write(json.dumps(event) + "\n")
         if self.events is None: return
+        if event["type"] == "result":
+            self.events.put(event)
+            return
         try: self.events.put_nowait(event)
         except queue.Full: self.dropped += 1
 
@@ -230,6 +240,8 @@ class GuestWorker:
         self.rg = shutil.which("rg")
         self._lock = threading.RLock()
         self._execs: dict[tuple[str, str, str, str], _Execution] = {}
+        self._execution_owner = False
+        self._session_owner: list[Any] | None = None
         self._finished: set[tuple[str, str, str, str]] = set()
         # Without an explicit run-private state dir the ledger is ephemeral (direct in-process use only).
         self.ledger = _Ledger(str(state_dir) if state_dir else tempfile.mkdtemp(prefix="artifact-worker-state-"))
@@ -353,6 +365,8 @@ class GuestWorker:
         with self._lock: ex = self._execs.get(key)
         if ex is None: return self._cancel_recovered(key, sig)
         if ex.done.is_set(): return False
+        if "supervisor" in ex.record:
+            return self._cancel_recovered(key, sig)
         ex.cancel_signal = sig; ex.cancel_at = time.monotonic()
         self._signal_group(ex, sig)
         return True
@@ -361,6 +375,8 @@ class GuestWorker:
     # An execution started by an earlier worker session is found through its ledger identity. Its process
     # identities (leader, tracked descendants) are compared by start time, so a reused pid is never signalled.
     def _owned_alive(self, rec: dict[str, Any]) -> bool:
+        if "supervisor" in rec:
+            return _is_owned(*rec["supervisor"])
         return bool(self._live_tree(rec))
 
     def _live_tree(self, rec: dict[str, Any]) -> dict[int, str]:
@@ -400,7 +416,17 @@ class GuestWorker:
     def _cancel_recovered(self, key: tuple[str, str, str, str], sig: int) -> bool:
         rec = self.ledger.identity(key)
         if rec is None or self.ledger.result(key) is not None or not self._owned_alive(rec): return False
-        self._terminate_owned(rec, sig)
+        if "supervisor" in rec:
+            # Cancellation is data delivered to the identity-matched owner, never a signal to a stale group.
+            path = self.ledger._path(key, ".cancel.json")
+            tmp = path + "." + uuid.uuid4().hex
+            with open(tmp, "w") as f: json.dump({"signal": int(sig)}, f)
+            os.replace(tmp, path)
+            deadline = time.monotonic() + self.kill_grace + 10
+            while self.ledger.result(key) is None and self._owned_alive(rec) and time.monotonic() < deadline:
+                time.sleep(0.02)
+        else:
+            self._terminate_owned(rec, sig)
         if not self._owned_alive(rec):
             self.ledger.record_result_once(key, self._unobserved(key, "terminated after worker session loss; exit not observed"))
         return True
@@ -430,7 +456,9 @@ class GuestWorker:
         with self._lock: live = [ex for ex in self._execs.values() if not ex.done.is_set()]
         for ex in live:
             # A shell that already exited keeps its real result; only a still-running one is reported as cancelled.
-            if ex.proc.poll() is None:
+            if "supervisor" in ex.record:
+                if self.ledger.result(ex.key) is None: self._cancel_recovered(ex.key, signal.SIGTERM)
+            elif ex.proc.poll() is None:
                 ex.cancel_signal = ex.cancel_signal or signal.SIGTERM; ex.cancel_at = time.monotonic()
                 self._signal_group(ex, signal.SIGTERM)
         for ex in live: ex.done.wait(self.kill_grace + 10)
@@ -446,8 +474,13 @@ class GuestWorker:
         with self._lock:
             if key in self._execs or key in self._finished or self.ledger.identity(key) is not None:
                 raise WorkerError("duplicate_execution", "execution key was already used")
+            if sys.platform == "linux" and not self._execution_owner:
+                return self._launch_supervisor(call, stream)
             proc = subprocess.Popen([select_shell(), "-c", a["command"]], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             ex = _Execution(key, proc, self.worker_id, stream, self.output_dir)
+            if self._execution_owner:
+                ex.record["supervisor"] = [os.getpid(), _proc_start(os.getpid())]
+                ex.event_path = self.ledger._path(key, ".events.jsonl")
             self._execs[key] = ex
             # Durable before the handle is returned: a session that dies after this point leaves a recoverable record.
             try: self.ledger.write_identity(key, ex.record)
@@ -456,6 +489,59 @@ class GuestWorker:
                 raise WorkerError("ledger_unavailable", f"execution identity could not be recorded: {exc}") from exc
         threading.Thread(target=self._supervise, args=(call, ex, a.get("timeout", DEFAULT_SHELL_TIMEOUT_MS)), name="artifact-worker-shell", daemon=True).start()
         return ex
+
+    def _launch_supervisor(self, call, stream) -> _Execution:
+        key = self._key(call)
+        spec_path = self.ledger._path(key, ".launch.json")
+        spec = {"call": call, "root": str(self.root), "worker_id": self.worker_id,
+                "output_dir": self.output_dir, "state_dir": self.ledger.root,
+                "protected_paths": self.protected, "kill_grace": self.kill_grace,
+                "session_owner": [os.getpid(), _proc_start(os.getpid())]}
+        # Exclusive key reservation also covers concurrent sessions and a lost start reply.
+        try:
+            with open(spec_path, "x") as f: json.dump(spec, f)
+        except FileExistsError:
+            raise WorkerError("duplicate_execution", "execution key was already used")
+        # The supervisor gets the trusted worker environment; command env applies only to its shell.
+        with open(self.ledger._path(key, ".supervisor.log"), "ab") as log:
+            proc = subprocess.Popen([sys.executable, "-m", "sandbox.artifact_upload.worker.core", spec_path],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=log, start_new_session=True)
+        deadline = time.monotonic() + 10
+        while (rec := self.ledger.identity(key)) is None:
+            if proc.poll() is not None or time.monotonic() >= deadline:
+                raise WorkerError("supervisor_unavailable", "execution owner did not publish its identity")
+            time.sleep(0.01)
+        ex = _Execution(key, proc, self.worker_id, stream, self.output_dir)
+        ex.record, ex.handle = rec, rec["handle"]
+        self._execs[key] = ex
+        threading.Thread(target=self._follow_supervisor, args=(ex,), name="artifact-worker-follow", daemon=True).start()
+        return ex
+
+    def _follow_supervisor(self, ex: _Execution) -> None:
+        path = self.ledger._path(ex.key, ".events.jsonl")
+        offset = 0
+        while True:
+            try:
+                with open(path) as f:
+                    f.seek(offset)
+                    while line := f.readline():
+                        if not line.endswith("\n"): break
+                        offset = f.tell()
+                        event = json.loads(line)
+                        if event["type"] != "result": ex.emit(event)
+            except FileNotFoundError:
+                pass
+            result = self.ledger.result(ex.key)
+            if result is None and not self._owned_alive(ex.record):
+                result = self.ledger.record_result_once(ex.key, self._unobserved(ex.key, "execution owner ended without a recorded outcome"))
+            if result is not None:
+                ex.result = result
+                ex.done.set()
+                ex.emit({"type": "result", "result": result})
+                ex.proc.wait()
+                return
+            time.sleep(0.02)
 
     def _failed(self, call, key, message, code, stream) -> _Execution:
         with self._lock:
@@ -482,10 +568,18 @@ class GuestWorker:
         for r in readers: r.start()
         deadline = time.monotonic() + (timeout_ms + 100) / 1000
         term_at = 0.0; escalated = False
+        cancel_request = None
         try:
             while proc.poll() is None:
                 now = time.monotonic()
-                self._track(ex)
+                if self._execution_owner:
+                    request = self.ledger._read(ex.key, ".cancel.json")
+                    if request is not None and request != cancel_request:
+                        cancel_request = request
+                        ex.cancel_signal = request["signal"]; ex.cancel_at = now
+                        self._signal_group(ex, ex.cancel_signal)
+                else:
+                    self._track(ex)
                 if not ex.expired and now >= deadline:
                     ex.expired = True; term_at = now
                     self._signal_group(ex, signal.SIGTERM)
@@ -503,15 +597,19 @@ class GuestWorker:
                 except OSError: pass
         finally:
             ex.out.close(); ex.err.close()
-        ex.result = self._finish(call, ex)
+        ex.result = (self._unobserved(ex.key, "worker session ended before this execution's outcome was delivered")
+                     if self._execution_owner and not _is_owned(*self._session_owner)
+                     else self._finish(call, ex))
         try: self.ledger.record_result_once(ex.key, ex.result)
         except OSError: pass  # live delivery below still succeeds; only cross-session recovery is lost
         ex.done.set()
         if ex.dropped: ex.emit({"type": "dropped", "count": ex.dropped})
-        if ex.events is not None: ex.events.put({"type": "result", "result": ex.result})
+        ex.emit({"type": "result", "result": ex.result})
 
-    @staticmethod
-    def _signal_group(ex: _Execution, sig: int) -> None:
+    def _signal_group(self, ex: _Execution, sig: int) -> None:
+        if self._execution_owner:
+            self._signal_children(sig)
+            return
         if ex.pgid <= 1: return
         try: os.killpg(ex.pgid, sig)
         except ProcessLookupError: pass
@@ -530,7 +628,38 @@ class GuestWorker:
             try: self.ledger.write_identity(ex.key, ex.record)
             except OSError: pass
 
+    def _signal_children(self, sig: int) -> None:
+        # The kernel retains each orphan under this living subreaper. A vanished
+        # ancestry edge becomes a direct child, including setsid/double-fork jobs.
+        table = _proc_table()
+        owned = {os.getpid()}
+        while True:
+            new = {pid for pid, pp, _pg, _st, _s in table if pp in owned} - owned
+            if not new: break
+            owned.update(new)
+        for pid, _pp, _pg, st, start in table:
+            if pid == os.getpid() or pid not in owned or st.startswith("Z"): continue
+            try:
+                fd = os.pidfd_open(pid)
+                try:
+                    # Check *after* opening the pidfd: a recycled numeric PID is not our child.
+                    if _is_owned(pid, start): signal.pidfd_send_signal(fd, sig)
+                finally: os.close(fd)
+            except ProcessLookupError:
+                pass
+
     def _reap_group(self, ex: _Execution) -> None:
+        if self._execution_owner:
+            deadline = time.monotonic() + 0.3
+            while True:
+                # Popen has already reaped the shell. ECHILD, rather than an empty
+                # process-table snapshot, proves the durable boundary is empty.
+                try:
+                    while os.waitpid(-1, os.WNOHANG)[0]: pass
+                except ChildProcessError:
+                    return
+                self._signal_children(signal.SIGTERM if time.monotonic() < deadline else signal.SIGKILL)
+                time.sleep(0.02)
         for sig, wait in ((signal.SIGTERM, 0.3), (signal.SIGKILL, 5.0)):
             self._signal_group(ex, sig)
             for pid in self._tracked_alive(ex):
@@ -563,3 +692,22 @@ class GuestWorker:
             return self._result(call, status, code, out_b.decode() + suffix, err_b.decode(), "utf-8", error)
         except UnicodeDecodeError:
             return self._result(call, status, code, base64.b64encode(out_b + suffix.encode()).decode(), base64.b64encode(err_b).decode(), "base64", error)
+
+
+def _execution_main(spec_path: str) -> int:
+    """One independent guest execution owner; no transport or inherited worker pipes."""
+    with open(spec_path) as f: spec = json.load(f)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER, before any shell can run
+        raise OSError(ctypes.get_errno(), "could not establish execution subreaper")
+    worker = GuestWorker(spec["root"], worker_id=spec["worker_id"], output_dir=spec["output_dir"],
+                         state_dir=spec["state_dir"], protected_paths=spec["protected_paths"], kill_grace=spec["kill_grace"])
+    worker._execution_owner = True
+    worker._session_owner = spec["session_owner"]
+    ex = worker._launch(spec["call"], stream=False)
+    ex.done.wait()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_execution_main(sys.argv[1]))
