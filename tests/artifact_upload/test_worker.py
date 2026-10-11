@@ -556,15 +556,18 @@ class GuestSession:
 def docker_env(artifact_dir):
     assert shutil.which("docker"), "required prerequisite missing: docker CLI"
     info = _docker("info", "--format", "{{.ServerVersion}} {{.OSType}}/{{.Architecture}}").stdout.strip()
-    image = f"artifact-upload-{SUFFIX}:guest"; net = f"{SUFFIX}-net"; vol = f"{SUFFIX}-svcvol"
+    # ARTIFACT_WORKER_TEST_IMAGE runs the same cases in an existing guest image (e.g. the production candidate); it is never removed here.
+    external = os.environ.get("ARTIFACT_WORKER_TEST_IMAGE") or None
+    image = external or f"artifact-upload-{SUFFIX}:guest"; net = f"{SUFFIX}-net"; vol = f"{SUFFIX}-svcvol"
     guest_name = f"{SUFFIX}-guest"; svc_name = f"{SUFFIX}-svc"
     created = {"containers": [], "networks": [], "volumes": [], "images": []}
     env = {"info": info, "image": image, "net": net, "guest": guest_name, "svc": svc_name, "vol": vol, "log": [], "created": created}
     try:
-        p = subprocess.run(["docker", "build", "--file", "sandbox/artifact_upload/worker/Dockerfile", "--tag", image, "."], cwd=REPO, capture_output=True, text=True, timeout=1800)
-        save(artifact_dir, "docker-build.log", p.stdout + "\n" + p.stderr)
-        assert p.returncode == 0, f"guest image build failed: {p.stderr[-3000:]}"
-        created["images"].append(image)
+        if external is None:
+            p = subprocess.run(["docker", "build", "--file", "sandbox/artifact_upload/worker/Dockerfile", "--tag", image, "."], cwd=REPO, capture_output=True, text=True, timeout=1800)
+            save(artifact_dir, "docker-build.log", p.stdout + "\n" + p.stderr)
+            assert p.returncode == 0, f"guest image build failed: {p.stderr[-3000:]}"
+            created["images"].append(image)
         env["image_inspect"] = json.loads(_docker("image", "inspect", image).stdout)[0]
         _docker("network", "create", net); created["networks"].append(net)
         _docker("volume", "create", vol); created["volumes"].append(vol)
@@ -718,8 +721,26 @@ def _wait_for(predicate, timeout=20.0):
     return predicate()
 
 
+# /proc probes run with the guest's own python: the production image has no procps (ps, pkill).
+_PROC_PROBE = ("import os,sys\nme=os.getpid(); pat,sig=sys.argv[1],sys.argv[2]\nout=[]\n"
+               "for p in os.listdir('/proc'):\n"
+               " if not p.isdigit() or int(p)==me: continue\n"
+               " try: c=open('/proc/'+p+'/cmdline','rb').read().replace(b'\\0',b' ').decode().strip()\n"
+               " except OSError: continue\n"
+               " if pat in c:\n"
+               "  out.append(p+' '+c)\n"
+               "  if int(sig): os.kill(int(p), int(sig))\n"
+               "print('\\n'.join(out))")
+
+
 def _guest_procs(name, marker):
-    return _docker("exec", name, "sh", "-c", f"ps -eo pid,pgid,stat,args | grep '[s]leep {marker}' || true").stdout.strip()
+    """Live processes whose command line names this sleep marker (zombies have no command line and are not counted)."""
+    return _docker("exec", name, "python", "-c", _PROC_PROBE, f"sleep {marker}", "0").stdout.strip()
+
+
+def _signal_guest_session(name, sig):
+    """Signal only the worker session process; its shells are left alone (no cleanup runs on SIGKILL)."""
+    _docker("exec", name, "python", "-c", _PROC_PROBE, "sandbox.artifact_upload.worker.guest_session", str(sig))
 
 
 def _settled(session, request, timeout=30.0):
@@ -741,7 +762,7 @@ def test_worker_session_loss_leaves_no_uncontrolled_jobs_and_recovers_by_key(doc
     assert _wait_for(lambda: len(_guest_procs(name, marker).splitlines()) >= 3), _guest_procs(name, marker)
     if loss == "client_killed": first.proc.kill()
     elif loss == "stdin_eof": first.proc.stdin.close()
-    else: _docker("exec", name, "sh", "-c", f"pkill -{'KILL' if loss == 'guest_sigkilled' else 'TERM'} -f '[s]andbox.artifact_upload.worker.guest_session' || true")
+    else: _signal_guest_session(name, 9 if loss == "guest_sigkilled" else 15)
     first.proc.wait(timeout=30)
     second = GuestSession(name, docker_env["log"])
     try:
@@ -775,13 +796,23 @@ def test_cancel_and_timeout_reap_setsid_and_nohup_descendants(docker_env, mode):
         session.proc.stdin.close(); session.proc.wait(timeout=20)
 
 
+def _result_recorded(name, request):
+    """True once the guest has durably recorded this execution's terminal result (checked inside the guest)."""
+    fname = hashlib.sha256(json.dumps(list(key_of(request).values())).encode()).hexdigest() + ".result.json"
+    code = ("import os,sys\nfrom sandbox.artifact_upload.worker.guest_session import state_dir_for\n"
+            "print(os.path.exists(os.path.join(state_dir_for(sys.argv[1]), sys.argv[2])))")
+    return _docker("exec", name, "python", "-c", code, RUN_ID, fname).stdout.strip() == "True"
+
+
 def test_lost_start_reply_and_restart_dedup_serve_the_recorded_result(docker_env):
     name = docker_env["guest"]
     request = call("shell", "bash", {"command": "printf lost-ack"}, run_id=RUN_ID, call_id="lost-ack")
     first = GuestSession(name, docker_env["log"])
     first.proc.stdin.write(json.dumps({"op": "start", "call": request}) + "\n"); first.proc.stdin.flush()
     assert first.proc.stdout.readline(), "guest must acknowledge the start before the host loses the reply"
-    first.proc.kill(); first.proc.wait(timeout=20)  # the host never learns the handle
+    assert _wait_for(lambda: _result_recorded(name, request)), "the shell's terminal result was never recorded"
+    # The host never learns the handle; the worker session then dies without cleanup, so its result must come from the ledger.
+    _signal_guest_session(name, 9); first.proc.wait(timeout=20)
     second = GuestSession(name, docker_env["log"])
     try:
         assert _settled(second, request)["stdout"] == "lost-ack"  # recovered by key, no second start

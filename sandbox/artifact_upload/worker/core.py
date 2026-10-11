@@ -407,8 +407,10 @@ class GuestWorker:
         """Graceful session end (stdin EOF, SIGTERM or SIGHUP): terminate this session's live executions and their groups."""
         with self._lock: live = [ex for ex in self._execs.values() if not ex.done.is_set()]
         for ex in live:
-            ex.cancel_signal = ex.cancel_signal or signal.SIGTERM; ex.cancel_at = time.monotonic()
-            self._signal_group(ex, signal.SIGTERM)
+            # A shell that already exited keeps its real result; only a still-running one is reported as cancelled.
+            if ex.proc.poll() is None:
+                ex.cancel_signal = ex.cancel_signal or signal.SIGTERM; ex.cancel_at = time.monotonic()
+                self._signal_group(ex, signal.SIGTERM)
         for ex in live: ex.done.wait(self.kill_grace + 10)
 
     # ------------------------------------------------------------- shell
