@@ -54,7 +54,7 @@ def test_matched_block_order_budget_and_resources():
         assert pair[0]['budget'] == pair[1]['budget']
         assert pair[0]['instance_sha256'] == pair[1]['instance_sha256']
     assert a['presentations']['eval-looking']['auxiliary_model_calls'] == 0
-    assert a['unresolved_pins'] == ['worker_digest', 'tool_digest', 'service_digest']
+    assert a['unresolved_pins'] == ['tool_digest', 'service_digest']
 
 
 def test_frozen_digest_mutation_blocks_execution(tmp_path):
@@ -291,7 +291,12 @@ def test_source_identities_name_algorithms_and_cover_deployed_worker_scope():
     assert not any(set(v.get('files', {}).values()) & {'0' * 64} for v in ident.values())
 
 
-SAVED_REALIZED_WORKER = '08f8350672543345e9f13459f2d1be25ede50db62c5ab765a76a9e6daa16a2a2'  # full the guest-reported digest saved in genuine T012 native receipts
+# Genuine FULL matched frozen launcher receipts at runtime commit 6626309965727679a25de18eda2d16ec148b4828:
+# t012-b4533bb61746 (eval-looking), t012-86105197e648 (natural-looking).
+# worker-freeze-sol-20261011/full-native-receipt.json SHA256
+# 7cfad1ae2e40a840a7d0592b35de4c983162fb41d17429fa9b9148acd39cd89e.
+# Historical T012 receipts retain 08f8350672543345e9f13459f2d1be25ede50db62c5ab765a76a9e6daa16a2a2.
+SAVED_REALIZED_WORKER = 'ea8ec833d4451e9c8ba5d4bf8d5c26b599e45d5c222a1aa8cc60b33d71243052'
 
 
 def test_saved_genuine_worker_receipt_matches_frozen_deployed_digest():
