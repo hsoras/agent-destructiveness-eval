@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import http.server
+import io
 import json
 import os
 import re
@@ -770,7 +771,7 @@ class HostOpenCodeAdapter:
         self._turn = 0
         self._reported = 0
         self._staged = False
-        self._active: subprocess.Popen[str] | None = None
+        self._active: subprocess.Popen[bytes] | None = None
 
     # -- discovery of native, model-specific tools --------------------------
     def discover_native_tools(self) -> dict[str, dict[str, Any]]:
@@ -889,18 +890,92 @@ class HostOpenCodeAdapter:
         if session_id:
             command += ["--session", session_id]
         command += prompt_args
-        proc = subprocess.Popen(command, cwd=work, env=self._environment(root, config), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        # Collect bytes so a timeout in the middle of a character cannot destroy evidence.
+        proc = subprocess.Popen(command, cwd=work, env=self._environment(root, config), start_new_session=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         self._active = proc
+        expired = None
+        capture_errors = []
+        killed = False
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+        except subprocess.TimeoutExpired as exc:
+            expired = exc
+            stdout, stderr = exc.output or b"", exc.stderr or b""
+            try:
+                # Kill descendants too: an inherited pipe must not keep collection waiting indefinitely.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    killed = True
+                except ProcessLookupError:
+                    pass  # already exited; still collect its final buffered output
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired as drain_exc:
+                # communicate's snapshot includes previous output; never concatenate the two snapshots.
+                stdout, stderr = drain_exc.output or stdout, drain_exc.stderr or stderr
+                capture_errors.append("drain_timeout")
+                for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                    try:
+                        pipe.close()
+                    except Exception as close_exc:
+                        capture_errors.append(f"{name}_close:{type(close_exc).__name__}")
+                try:
+                    proc.wait(timeout=1)
+                except Exception as wait_exc:
+                    if isinstance(wait_exc, subprocess.TimeoutExpired):
+                        capture_errors.append("exit_uncollected")
+                    else:
+                        capture_errors.append(f"exit_collection:{type(wait_exc).__name__}")
+            except Exception as collect_exc:
+                capture_errors.append(f"collection:{type(collect_exc).__name__}")
+            exc.output, exc.stderr = stdout, stderr
             raise
         finally:
             self._active = None
-            # A runtime that dies (interrupt, kill, timeout) cannot cancel its own tool calls: the guest must not keep mutating.
-            self.bridge.cancel_inflight()
+            # A runtime that dies cannot cancel its own tool calls: retain the broker's honest receipts.
+            cancellations = None
+            try:
+                cancellations = self.bridge.cancel_inflight()
+            except Exception as cancel_exc:
+                if expired is None:
+                    raise
+                capture_errors.append(f"cancellation:{type(cancel_exc).__name__}")
+            if expired is not None:
+                receipt_path = Path(f"{log_prefix}.timeout.json")
+                expired.capture_receipt_path = receipt_path
+                expired.capture_errors = capture_errors
+                streams = {}
+                for name, data in (("stdout", stdout), ("stderr", stderr)):
+                    try:
+                        log_prefix.parent.mkdir(parents=True, exist_ok=True)
+                        path = Path(f"{log_prefix}.{name}.log")
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                        with os.fdopen(fd, "wb") as stream:
+                            os.fchmod(stream.fileno(), 0o600)
+                            stream.write(data)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        streams[name] = {"path": str(path), "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                    except Exception as persist_exc:
+                        capture_errors.append(f"{name}_persistence:{type(persist_exc).__name__}")
+                receipt = {"kind": "native_process_timeout", "timeout_seconds": timeout, "pid": proc.pid,
+                           "kill_signal": "SIGKILL" if killed else None, "exit_code": proc.returncode,
+                           "cancellations": cancellations, "streams": streams, "encoding": "bytes",
+                           "capture_complete": not capture_errors, "capture_errors": capture_errors}
+                try:
+                    fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "wb") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.write((json.dumps(receipt, sort_keys=True) + "\n").encode())
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                except Exception as receipt_exc:
+                    capture_errors.append(f"receipt_persistence:{type(receipt_exc).__name__}")
+                if capture_errors:
+                    expired.add_note("Native timeout capture incomplete: " + ", ".join(capture_errors))
+        # Preserve Popen(text=True)'s default decoding and universal-newline behavior on success.
+        stdout = io.TextIOWrapper(io.BytesIO(stdout)).read()
+        stderr = io.TextIOWrapper(io.BytesIO(stderr)).read()
         result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         log_prefix.parent.mkdir(parents=True, exist_ok=True)
         Path(f"{log_prefix}.stdout.log").write_text(result.stdout)

@@ -18,6 +18,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -25,6 +26,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
@@ -1058,3 +1060,193 @@ def test_router_typescript_typecheck_and_unit_tests(artifact_dir):
     save(artifact_dir, "router-ts.log", typecheck.stdout + typecheck.stderr + units.stdout + units.stderr)
     assert typecheck.returncode == 0, typecheck.stdout
     assert units.returncode == 0, units.stdout[-3000:]
+
+
+@pytest.fixture
+def process_capture_adapter(tmp_path):
+    """Exercise the collector with a real local subprocess, without a provider or guest."""
+    binary = tmp_path / "output-process"
+    adapter = HostOpenCodeAdapter.__new__(HostOpenCodeAdapter)
+    adapter.runtime = SimpleNamespace(binary=binary)
+    adapter.model = "unused-local-process-test"
+    adapter._environment = lambda *_: dict(os.environ)
+    cancellations = []
+    def cancel():
+        cancellations.append("called")
+        return [{"cancelled": True, "status": "cancelled"}]
+    adapter.bridge = SimpleNamespace(cancel_inflight=cancel)
+    def run(script, timeout=0.5):
+        binary.write_text(f"#!{sys.executable}\n" + script)
+        binary.chmod(0o700)
+        return adapter._run_process(tmp_path, tmp_path, tmp_path, [], tmp_path / "turn", timeout=timeout)
+    return adapter, run, cancellations
+
+
+def test_process_timeout_retains_exact_bytes_and_cancellation_without_redispatch(process_capture_adapter, tmp_path, monkeypatch):
+    adapter, run, cancellations = process_capture_adapter
+    launches, timeouts = [], []
+    original = subprocess.Popen
+    def launch(*args, **kwargs):
+        proc = original(*args, **kwargs)
+        launches.append(proc)
+        communicate = proc.communicate
+        def collect(*args, **kwargs):
+            try:
+                return communicate(*args, **kwargs)
+            except subprocess.TimeoutExpired as exc:
+                timeouts.append(exc)
+                raise
+        proc.communicate = collect
+        return proc
+    monkeypatch.setattr(host_adapter.subprocess, "Popen", launch)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        run("import os, subprocess, sys, time\n"
+            "os.write(1, b'stdout\\r\\n\\xff\\xe2\\x82')\n"
+            "os.write(2, b'stderr\\r\\n\\xfe')\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "time.sleep(30)\n")
+    assert time.monotonic() - started < 3
+    assert len(launches) == 1 and caught.value is timeouts[0]
+    assert caught.value.output == (tmp_path / "turn.stdout.log").read_bytes() == b"stdout\r\n\xff\xe2\x82"
+    assert caught.value.stderr == (tmp_path / "turn.stderr.log").read_bytes() == b"stderr\r\n\xfe"
+    receipt = json.loads(caught.value.capture_receipt_path.read_bytes())
+    assert receipt["exit_code"] == -signal.SIGKILL
+    assert receipt["kill_signal"] == "SIGKILL" and receipt["timeout_seconds"] == 0.5
+    assert receipt["cancellations"] == [{"cancelled": True, "status": "cancelled"}]
+    assert receipt["capture_complete"] is True and receipt["capture_errors"] == []
+    for name in ("stdout", "stderr"):
+        path = tmp_path / f"turn.{name}.log"
+        assert receipt["streams"][name]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert receipt["streams"][name]["size_bytes"] == len(path.read_bytes())
+        assert path.stat().st_mode & 0o777 == 0o600
+    assert caught.value.capture_receipt_path.stat().st_mode & 0o777 == 0o600
+    assert cancellations == ["called"] and adapter._active is None
+
+
+def test_process_capture_success_preserves_text_output(process_capture_adapter, tmp_path):
+    adapter, run, cancellations = process_capture_adapter
+    result = run("import os\nos.write(1, b'normal\\r\\n\\xc3\\xa9')\nos.write(2, b'error\\r\\n')\n", timeout=5)
+    assert result.returncode == 0 and result.stdout == "normal\né" and result.stderr == "error\n"
+    assert (tmp_path / "turn.stdout.log").read_text() == result.stdout
+    assert (tmp_path / "turn.stderr.log").read_text() == result.stderr
+    assert not (tmp_path / "turn.timeout.json").exists()
+    assert cancellations == ["called"] and adapter._active is None
+
+
+def test_process_timeout_preserves_exception_when_drain_cleanup_fails(process_capture_adapter, tmp_path, monkeypatch):
+    adapter, run, cancellations = process_capture_adapter
+    original_popen = subprocess.Popen
+    original_timeout = []
+    cleanup = []
+
+    class PipeProxy:
+        def __init__(self, pipe, name):
+            self.pipe = pipe
+            self.name = name
+        def __getattr__(self, name):
+            return getattr(self.pipe, name)
+        def close(self):
+            cleanup.append(f"{self.name}_close")
+            if self.name == "stdout":
+                raise OSError("injected close failure")
+            return self.pipe.close()
+
+    def launch(*args, **kwargs):
+        proc = original_popen(*args, **kwargs)
+        communicate = proc.communicate
+        wait = proc.wait
+        def collect(*args, **kwargs):
+            if not original_timeout:
+                try:
+                    return communicate(*args, **kwargs)
+                except subprocess.TimeoutExpired as exc:
+                    original_timeout.append(exc)
+                    proc.stdout = PipeProxy(proc.stdout, "stdout")
+                    proc.stderr = PipeProxy(proc.stderr, "stderr")
+                    raise
+            raise subprocess.TimeoutExpired(proc.args, kwargs["timeout"], output=b"partial", stderr=b"error")
+        def bounded_wait(*args, **kwargs):
+            cleanup.append("wait")
+            return wait(*args, **kwargs)
+        proc.communicate = collect
+        proc.wait = bounded_wait
+        return proc
+
+    monkeypatch.setattr(host_adapter.subprocess, "Popen", launch)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        run("import os, time\nos.write(1, b'partial')\nos.write(2, b'error')\ntime.sleep(30)\n")
+
+    assert original_timeout and caught.value is original_timeout[0]
+    assert caught.value.output == (tmp_path / "turn.stdout.log").read_bytes() == b"partial"
+    assert caught.value.stderr == (tmp_path / "turn.stderr.log").read_bytes() == b"error"
+    assert caught.value.capture_errors == ["drain_timeout", "stdout_close:OSError"]
+    assert cleanup == ["stdout_close", "stderr_close", "wait"]
+    receipt = json.loads(caught.value.capture_receipt_path.read_bytes())
+    assert receipt["capture_complete"] is False
+    assert receipt["capture_errors"] == caught.value.capture_errors
+    assert receipt["streams"]["stdout"]["size_bytes"] == len(b"partial")
+    assert cancellations == ["called"] and adapter._active is None
+
+
+@pytest.mark.parametrize("failure", ["stream", "receipt", "cancellation", "drain"])
+def test_process_timeout_capture_failure_is_explicit(process_capture_adapter, tmp_path, monkeypatch, failure):
+    adapter, run, cancellations = process_capture_adapter
+    original = os.open
+    def failing_open(path, *args, **kwargs):
+        suffix = ".stdout.log" if failure == "stream" else ".timeout.json"
+        if failure in {"stream", "receipt"} and str(path).endswith(suffix):
+            raise OSError("test persistence failure")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(host_adapter.os, "open", failing_open)
+    if failure == "drain":
+        original_popen = subprocess.Popen
+        def launch(*args, **kwargs):
+            proc = original_popen(*args, **kwargs)
+            communicate = proc.communicate
+            def collect(*args, **kwargs):
+                stdout, stderr = communicate(*args, **kwargs)
+                # Force the bounded collector's incomplete branch after a real subprocess timeout.
+                raise subprocess.TimeoutExpired(proc.args, kwargs["timeout"], output=stdout, stderr=stderr)
+            proc.communicate = collect
+            return proc
+        monkeypatch.setattr(host_adapter.subprocess, "Popen", launch)
+    if failure == "cancellation":
+        def cancel():
+            cancellations.append("called")
+            raise RuntimeError("test cancellation failure")
+        adapter.bridge.cancel_inflight = cancel
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        run("import os, time\nos.write(1, b'partial')\ntime.sleep(30)\n")
+    assert caught.value.output == b"partial" and caught.value.capture_errors
+    assert any("capture incomplete" in note for note in caught.value.__notes__)
+    if failure != "receipt":
+        receipt = json.loads(caught.value.capture_receipt_path.read_bytes())
+        assert receipt["capture_complete"] is False and receipt["capture_errors"]
+    assert cancellations == ["called"] and adapter._active is None
+
+
+
+def test_real_runtime_timeout_retains_native_streams_and_cancels_guest(harness, guest, artifact_dir):
+    marker = f"{WORKTREE}/timeout_capture_failed.txt"
+    guest_exec(guest, f"rm -f {marker}")
+    h = harness(script=[("tools", [("call_timeout_capture", "bash", {"command": "sleep 12; touch timeout_capture_failed.txt", "description": "timeout cancellation regression"})]), ("text", "never")])
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        h.adapter.run_turn("run the blocking guest command", timeout=6)
+    elapsed = time.monotonic() - started
+    receipt = json.loads(caught.value.capture_receipt_path.read_bytes())
+    assert receipt["capture_complete"] is True and receipt["exit_code"] == -signal.SIGKILL
+    assert receipt["cancellations"] and all(r["status"] == "cancelled" for r in receipt["cancellations"])
+    stdout = Path(receipt["streams"]["stdout"]["path"]).read_bytes()
+    stderr = Path(receipt["streams"]["stderr"]["path"]).read_bytes()
+    assert stdout == caught.value.output and stderr == caught.value.stderr and (stdout or stderr)
+    event = next(e for e in h.adapter.bridge.events if e["call_id"] == "call_timeout_capture")
+    entry = h.broker.journal.by_call(h.run_id, event["session_id"], "call_timeout_capture")
+    assert entry["state"] == "cancelled" and entry["result"]["status"] == "cancelled"
+    assert len(h.provider.main_requests()) == 1, "timeout must not redispatch"
+    assert elapsed < 15
+    time.sleep(12)
+    assert guest_exec(guest, f"test -e {marker}").returncode != 0, "timed-out command still mutated the guest"
+    save(artifact_dir, "timeout-real-runtime.json", {"elapsed_seconds": elapsed, "receipt": receipt, "journal": entry,
+                                                    "binary_sha256": host_adapter.RUNTIME_SHA256})
