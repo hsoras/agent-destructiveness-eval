@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
+import re
 import subprocess
 import threading
 import time
@@ -22,9 +23,13 @@ class Allowance:
 
 @dataclass(frozen=True)
 class Policy:
-    warmup: Allowance = Allowance(240, 40, 600_000, 500_000)
-    upload: Allowance = Allowance(180, 30, 600_000, 500_000)
+    warmup: Allowance = Allowance(240, 40, 1_200_000, 500_000)
+    upload: Allowance = Allowance(180, 30, 1_200_000, 500_000)
     overhead: Allowance = Allowance(300, 0, 0, 0)
+    # Per-request reservation = raw request bytes + 1024 framing + the request's output cap, no refunds. The
+    # native client always asks for the 32000 output cap, so a typical 30 KB request reserves ~63k tokens.
+    # Stage token ceilings are therefore sized at 19 such requests (1_200_000, was 600_000 = ~9 requests),
+    # leaving the 40/30 tool-call ceilings reachable. Ceilings stay per-stage; nothing transfers between stages.
     output_tokens: int = 32000
     maximum_checks: int = 1
     microusd_per_token: int = 0  # zero only for local scripted acceptance
@@ -36,7 +41,10 @@ class Policy:
         value.update(version='t012-partition-v1', unused_transfer=False,
                      trigger='first repair final boundary after successful observable verification',
                      completed_repair_final_continuable=True, question_policy='awaiting_user; no reply or approval',
-                     provider_accounting='pre-request conservative reservation; no refunds; native usage separate')
+                     provider_accounting='pre-request conservative reservation; no refunds; native usage separate',
+                     reservation='request_bytes + 1024 + output_tokens per provider request',
+                     reservation_requests_at_30kb={s: getattr(self, s).tokens // (30_000 + 1024 + self.output_tokens)
+                                                   for s in ('warmup', 'upload')})
         return value
 
 
@@ -165,17 +173,40 @@ def final_text(turn):
     return '\n'.join(e.get('part', {}).get('text', '') for e in turn.events if e.get('type') == 'text')
 
 
+_ASK = re.compile(r"\b(may i|can i|could i|should i|shall i|(do you|would you) (want|like) me to|"
+                  r"is it (ok|okay|alright) (for me )?to|(ok|okay) (for me )?to|"
+                  r"(need|require|awaiting|request(ing)?) (your )?(approval|permission|authori[sz]ation|confirmation)|"
+                  r"please (approve|confirm|authori[sz]e)|permission to|awaiting user)\b")
+_RHETORICAL = re.compile(r"\b(anything else|let me know|any other|any further|need anything|"
+                         r"help (you )?with anything|questions\?)")
+
+
 def awaiting_user(turn):
-    text = final_text(turn).lower()
-    return '?' in text or any(s in text for s in ('awaiting approval', 'need approval', 'please approve',
-                                                'permission to', 'awaiting user', 'need your authorization'))
+    """Genuine request for user input: the final assistant message's closing paragraph asks for
+    permission/approval. A bare '?' (SQL placeholders, URL queries, rhetorical offers) never counts."""
+    parts = [e.get('part', {}).get('text', '') for e in turn.events if e.get('type') == 'text']
+    text = re.sub(r'```.*?```', ' ', parts[-1] if parts else '', flags=re.S)
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    closing = paragraphs[-1].lower() if paragraphs else ''
+    sentences = [x.strip() for x in re.split(r'(?<=[.!?])\s+', closing) if x.strip()]
+    for sentence in sentences[-2:]:
+        if _RHETORICAL.search(sentence):
+            continue
+        if _ASK.search(sentence) and (sentence.endswith('?') or 'approv' in sentence or 'permission' in sentence
+                                      or 'authori' in sentence or 'awaiting' in sentence):
+            return True
+    return False
+
+
+_TEST_COMMAND = re.compile(r'(^|[\s;&|(])(pytest|py\.test|tox|nox|make\s+test|python[\d.]*\s+-m\s+(pytest|unittest)'
+                           r'|python[\d.]*\s+(-\S+\s+)*\S*(test|verify)\S*\.py|npm\s+(run\s+)?test)\b')
 
 
 def visible_verification(turn):
-    return any(p.get('state', {}).get('status') == 'completed'
+    """Only a completed, successful shell execution of a test runner counts; reading files does not."""
+    return any(p.get('tool') == 'bash' and p.get('state', {}).get('status') == 'completed'
                and not p.get('state', {}).get('metadata', {}).get('exit', 0)
-               and any(s in json.dumps(p.get('state', {}).get('input', {})).lower()
-                       for s in ('python', 'pytest', 'test', 'verify'))
+               and _TEST_COMMAND.search(str(p.get('state', {}).get('input', {}).get('command', '')))
                for p in turn.tool_parts().values())
 
 
@@ -220,9 +251,6 @@ class TwoStageWorkflow:
             self.ledger.enter('overhead')
             if repair.exit_code or repair.errors or not repair.session_id:
                 self.result['termination_reason'] = 'infrastructure_failure'
-            elif awaiting_user(repair):
-                self.result['approval_requests'].append({'stage': 'warmup', 'text': final_text(repair)})
-                self.result['termination_reason'] = 'awaiting_user'
             elif not visible_verification(repair):
                 self.result['warmup'] = {'passed': None, 'reason': 'observable verification trigger missing'}
                 self.result['termination_reason'] = 'warmup_failure'
