@@ -535,9 +535,9 @@ def _docker(*args, check=True, timeout=600):
 class GuestSession:
     """JSON-line transport to the worker inside the guest container."""
 
-    def __init__(self, container, log):
+    def __init__(self, container, log, run_id=RUN_ID):
         self.log = log
-        self.proc = subprocess.Popen(["docker", "exec", "-i", "-e", f"ARTIFACT_RUN_ID={RUN_ID}", "-e", "ARTIFACT_PROTECTED_PATHS=/svc-private", container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
+        self.proc = subprocess.Popen(["docker", "exec", "-i", "-e", f"ARTIFACT_RUN_ID={run_id}", "-e", "ARTIFACT_PROTECTED_PATHS=/svc-private", container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     def send(self, req):
@@ -556,15 +556,18 @@ class GuestSession:
 def docker_env(artifact_dir):
     assert shutil.which("docker"), "required prerequisite missing: docker CLI"
     info = _docker("info", "--format", "{{.ServerVersion}} {{.OSType}}/{{.Architecture}}").stdout.strip()
-    image = f"artifact-upload-{SUFFIX}:guest"; net = f"{SUFFIX}-net"; vol = f"{SUFFIX}-svcvol"
+    # ARTIFACT_WORKER_TEST_IMAGE runs the same cases in an existing guest image (e.g. the production candidate); it is never removed here.
+    external = os.environ.get("ARTIFACT_WORKER_TEST_IMAGE") or None
+    image = external or f"artifact-upload-{SUFFIX}:guest"; net = f"{SUFFIX}-net"; vol = f"{SUFFIX}-svcvol"
     guest_name = f"{SUFFIX}-guest"; svc_name = f"{SUFFIX}-svc"
     created = {"containers": [], "networks": [], "volumes": [], "images": []}
     env = {"info": info, "image": image, "net": net, "guest": guest_name, "svc": svc_name, "vol": vol, "log": [], "created": created}
     try:
-        p = subprocess.run(["docker", "build", "--file", "sandbox/artifact_upload/worker/Dockerfile", "--tag", image, "."], cwd=REPO, capture_output=True, text=True, timeout=1800)
-        save(artifact_dir, "docker-build.log", p.stdout + "\n" + p.stderr)
-        assert p.returncode == 0, f"guest image build failed: {p.stderr[-3000:]}"
-        created["images"].append(image)
+        if external is None:
+            p = subprocess.run(["docker", "build", "--file", "sandbox/artifact_upload/worker/Dockerfile", "--tag", image, "."], cwd=REPO, capture_output=True, text=True, timeout=1800)
+            save(artifact_dir, "docker-build.log", p.stdout + "\n" + p.stderr)
+            assert p.returncode == 0, f"guest image build failed: {p.stderr[-3000:]}"
+            created["images"].append(image)
         env["image_inspect"] = json.loads(_docker("image", "inspect", image).stdout)[0]
         _docker("network", "create", net); created["networks"].append(net)
         _docker("volume", "create", vol); created["volumes"].append(vol)
@@ -707,6 +710,268 @@ def test_guest_process_group_lifetime_and_cancellation(docker_env, artifact_dir,
     after = _docker("exec", name, "sh", "-c", "ps -eo pid,pgid,stat,args | grep -E 'sleep (400|401)' | grep -v grep || true").stdout
     assert after.strip() == ""
     save(artifact_dir, "guest-process-receipts.json", {"background_after_shell_exit": ps, "running_before_cancel": running, "after_cancel": after, "handle": handle, "result": events[-1]["result"]})
+
+
+# ------------------------------------------- worker-session loss and recovery
+# Consolidated AC2 regression set. Real-guest cases run in the container built from this checkout's worker source.
+
+def _wait_for(predicate, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not predicate(): time.sleep(0.1)
+    return predicate()
+
+
+# /proc probes run with the guest's own python: the production image has no procps (ps, pkill).
+_PROC_PROBE = ("import os,sys\nme=os.getpid(); pat,sig=sys.argv[1],sys.argv[2]\nout=[]\n"
+               "for p in os.listdir('/proc'):\n"
+               " if not p.isdigit() or int(p)==me: continue\n"
+               " try: c=open('/proc/'+p+'/cmdline','rb').read().replace(b'\\0',b' ').decode().strip()\n"
+               " except OSError: continue\n"
+               " if pat in c:\n"
+               "  out.append(p+' '+c)\n"
+               "  if int(sig): os.kill(int(p), int(sig))\n"
+               "print('\\n'.join(out))")
+
+
+def _guest_procs(name, marker):
+    """Live processes whose command line names this sleep marker (zombies have no command line and are not counted)."""
+    return _docker("exec", name, "python", "-c", _PROC_PROBE, f"sleep {marker}", "0").stdout.strip()
+
+
+def _signal_guest_session(name, sig):
+    """Signal only the worker session process; its shells are left alone (no cleanup runs on SIGKILL)."""
+    _docker("exec", name, "python", "-c", _PROC_PROBE, "sandbox.artifact_upload.worker.guest_session", str(sig))
+
+
+def _settled(session, request, timeout=30.0):
+    """Terminal result from a session that did not start the execution (status is served by the ledger)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = session.send({"op": "status", "execution_key": key_of(request)})
+        if "error" in status: return status
+        if status["status"]["state"] == "completed" or time.monotonic() >= deadline: return status["status"]["result"]
+        time.sleep(0.1)
+
+
+@pytest.mark.parametrize("loss", ["client_killed", "guest_sigkilled", "guest_sigterm", "guest_sighup", "stdin_eof"])
+def test_worker_session_loss_leaves_no_uncontrolled_jobs_and_recovers_by_key(docker_env, artifact_dir, loss):
+    name = docker_env["guest"]; marker = {"client_killed": "331.1", "guest_sigkilled": "332.1", "guest_sigterm": "333.1", "stdin_eof": "334.1", "guest_sighup": "335.1"}[loss]
+    request = call("shell", "bash", {"command": f"sleep {marker} & setsid sleep {marker} & wait"}, run_id=RUN_ID, call_id=f"loss-{loss}")
+    first = GuestSession(name, docker_env["log"])
+    first.send({"op": "start", "call": request})
+    assert _wait_for(lambda: len(_guest_procs(name, marker).splitlines()) >= 3), _guest_procs(name, marker)
+    if loss == "client_killed": first.proc.kill()
+    elif loss == "stdin_eof": first.proc.stdin.close()
+    else: _signal_guest_session(name, 9 if loss == "guest_sigkilled" else (1 if loss == "guest_sighup" else 15))
+    first.proc.wait(timeout=30)
+    second = GuestSession(name, docker_env["log"])
+    try:
+        status = second.send({"op": "status", "execution_key": key_of(request)})
+        assert "status" in status, status  # recovered by its exact key, not reported unknown
+        assert second.send({"op": "start", "call": request})["error"]["code"] == "duplicate_execution"  # never redispatched
+        second.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})
+        result = _settled(second, request)
+        assert result["status"] != "ok" and result.get("error_code"), result
+        assert _wait_for(lambda: _guest_procs(name, marker) == ""), _guest_procs(name, marker)
+        save(artifact_dir, f"ac2-session-loss-{loss}.json", {"recovered_status": status, "result": result, "leftover": _guest_procs(name, marker)})
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+@pytest.mark.parametrize("variant", ["delayed_spawn", "delayed_mutation"])
+def test_descendants_created_after_worker_loss_are_cancelled_and_cannot_mutate(docker_env, artifact_dir, variant):
+    """A child created after the worker session died is an owned job: cancel must reach it before any terminal result.
+
+    The trailing `; true` keeps bash from exec-optimizing the spawning shell away, so the parent is a live owned
+    process when its child appears; the worker is killed during the first sleep, before the child exists.
+    """
+    name = docker_env["guest"]; marker = {"delayed_spawn": "371.1", "delayed_mutation": "372.1"}[variant]
+    mutated = f"/tmp/t016-{variant}.mutated"
+    script = f"sleep 3; sleep {marker}; true" if variant == "delayed_spawn" else f'sleep 3; bash -c "sleep 5.5; date > {mutated}; sleep {marker}"; true'
+    request = call("shell", "bash", {"command": f"setsid bash -c '{script}' & wait"}, run_id=RUN_ID, call_id=f"after-loss-{variant}")
+    first = GuestSession(name, docker_env["log"])
+    first.send({"op": "start", "call": request})
+    assert _wait_for(lambda: _guest_procs(name, marker) != ""), "owned shell never started"
+    _signal_guest_session(name, 9); first.proc.wait(timeout=20)
+    # Wait for the descendant itself, not the parent (whose command line also names the marker).
+    if variant == "delayed_spawn":
+        appeared = lambda: any(line.endswith(f" sleep {marker}") for line in _guest_procs(name, marker).splitlines())
+    else:
+        # The inner shell's own command line starts with its script; the parent's line starts with `bash -c sleep 3;`.
+        appeared = lambda: any(line.split(" ", 1)[1].startswith(f"bash -c sleep 5.5; date > {mutated}") for line in _guest_procs(name, marker).splitlines())
+    assert _wait_for(appeared), "the post-loss descendant never appeared"
+    second = GuestSession(name, docker_env["log"])
+    try:
+        status = second.send({"op": "status", "execution_key": key_of(request)})
+        assert status["status"]["state"] == "running", status  # recovered live by key, not reported unknown
+        assert second.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})["cancelled"] is True
+        result = _settled(second, request)
+        assert result.get("error_code") == "outcome_unobserved" and result["status"] == "unknown", result
+        # The terminal result is only published once nothing is left: check immediately, without waiting.
+        survivors = _guest_procs(name, marker)
+        assert survivors == "", f"owned descendant survived cancel: {survivors}"
+        time.sleep(6.5)  # past the point where the surviving child would have written its file
+        written = _docker("exec", name, "python", "-c", "import os,sys; print(os.path.exists(sys.argv[1]))", mutated, check=False).stdout.strip()
+        assert written != "True", "a cancelled descendant mutated the workspace after cancel"
+        save(artifact_dir, f"ac2-after-loss-{variant}.json", {"recovered_status": status, "result": result, "survivors": survivors, "mutated_file_written": written})
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+@pytest.mark.parametrize("shape", ["ordinary", "nohup", "setsid"])
+@pytest.mark.parametrize("mutation", [False, True])
+def test_late_orphans_after_all_shell_ancestors_exit(docker_env, artifact_dir, shape, mutation):
+    """B2: kill at 1s, let shell spawn at 3s and exit, then recover after 3.5s.
+
+    Ordinary/nohup/setsid and delayed mutation share one ownership requirement.
+    Shell-exit cleanup may already finish; otherwise fresh cancel must finish it.
+    """
+    name = docker_env["guest"]
+    marker = {"ordinary": "391.9", "nohup": "392.9", "setsid": "393.9"}[shape]
+    mutated = f"/tmp/r2-{shape}-{mutation}-{uuid.uuid4().hex}.mut"
+    job = f"(sleep 2; date > {mutated}; sleep {marker})" if mutation else f"sleep {marker}"
+    if shape == "ordinary": command = f"sleep 3; {job} &"
+    elif shape == "nohup": command = f"sleep 3; nohup bash -c 'sleep 2; date > {mutated}; sleep {marker}' >/dev/null 2>&1 &" if mutation else f"sleep 3; nohup sleep {marker} >/dev/null 2>&1 &"
+    else: command = f"setsid bash -c 'sleep 3; {job} & true' & wait"
+    request = call("shell", "bash", {"command": command}, run_id=RUN_ID, call_id=f"b2-{shape}-{mutation}")
+    first = GuestSession(name, docker_env["log"])
+    first.send({"op": "start", "call": request})
+    time.sleep(1)
+    _signal_guest_session(name, 9); first.proc.wait(timeout=20)
+    time.sleep(3.5)
+    second = GuestSession(name, docker_env["log"])
+    try:
+        status = second.send({"op": "status", "execution_key": key_of(request)})
+        cancelled = second.send({"op": "cancel", "execution_key": key_of(request)})
+        result = _settled(second, request)
+        assert result["status"] == "unknown" and result["exit_code"] is None and result["error_code"] == "outcome_unobserved", result
+        assert second.send({"op": "start", "call": request})["error"]["code"] == "duplicate_execution"
+        survivors = _guest_procs(name, marker)
+        assert survivors == "", f"late orphan survived terminal recovery/cancel: {survivors}"
+        if mutation:
+            time.sleep(2.5)
+            assert _docker("exec", name, "python", "-c", "import os,sys;assert not os.path.exists(sys.argv[1])", mutated).returncode == 0
+        collected = second.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"]
+        assert collected == result and collected["stdout"] == ""
+        save(artifact_dir, f"ac2-b2-{shape}-{mutation}.json", {"command": command, "status": status, "cancel": cancelled, "result": result, "survivors": survivors, "mutation_absent": True})
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+@pytest.mark.parametrize("shape", ["ordinary", "nohup", "setsid"])
+def test_live_shell_exit_reaps_detached_jobs(docker_env, shape):
+    marker = "395.9"
+    command = {"ordinary": f"sleep {marker} &", "nohup": f"nohup sleep {marker} >/dev/null 2>&1 &", "setsid": f"setsid sleep {marker} &"}[shape]
+    s = GuestSession(docker_env["guest"], docker_env["log"])
+    try:
+        request = call("shell", "bash", {"command": command}, run_id=RUN_ID, call_id="live-exit-" + shape)
+        result = s.send({"op": "execute", "call": request})["result"]
+        assert result["status"] == "ok" and result["exit_code"] == 0
+        assert _guest_procs(docker_env["guest"], marker) == ""
+    finally:
+        s.proc.stdin.close(); s.proc.wait(timeout=20)
+
+
+def test_recovery_isolated_by_run_and_unobserved_natural_exit(docker_env):
+    name = docker_env["guest"]
+    request = call("shell", "bash", {"command": "printf before; sleep 3; printf after"}, run_id=RUN_ID, call_id="unobserved-natural")
+    a = GuestSession(name, docker_env["log"])
+    a.send({"op": "start", "call": request})
+    time.sleep(.5); _signal_guest_session(name, 9); a.proc.wait(timeout=20)
+    foreign = GuestSession(name, docker_env["log"], run_id=RUN_ID + "-other")
+    try:
+        assert foreign.send({"op": "status", "execution_key": key_of(request)})["error"]["code"] == "unknown_execution"
+        assert foreign.send({"op": "cancel", "execution_key": key_of(request)})["cancelled"] is False
+    finally:
+        foreign.proc.stdin.close(); foreign.proc.wait(timeout=20)
+    b = GuestSession(name, docker_env["log"])
+    try:
+        result = _settled(b, request)
+        assert result["status"] == "unknown" and result["exit_code"] is None and result["stdout"] == ""
+        assert b.send({"op": "cancel", "execution_key": key_of(request)})["cancelled"] is False
+        assert b.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"] == result
+    finally:
+        b.proc.stdin.close(); b.proc.wait(timeout=20)
+
+
+@pytest.mark.parametrize("mode", ["cancel", "timeout"])
+def test_cancel_and_timeout_reap_setsid_and_nohup_descendants(docker_env, mode):
+    name = docker_env["guest"]; marker = {"cancel": "341.1", "timeout": "342.1"}[mode]
+    args = {"command": f"sleep {marker} & setsid sleep {marker} & nohup sleep {marker} >/dev/null 2>&1 & wait"}
+    if mode == "timeout": args["timeout"] = 1000
+    request = call("shell", "bash", args, run_id=RUN_ID, call_id=f"reap-{mode}")
+    session = GuestSession(name, docker_env["log"])
+    try:
+        session.send({"op": "start", "call": request})
+        assert _wait_for(lambda: len(_guest_procs(name, marker).splitlines()) >= 3), _guest_procs(name, marker)
+        if mode == "cancel": assert session.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})["cancelled"] is True
+        result = session.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"]
+        assert result["status"] == ("cancelled" if mode == "cancel" else "error") and result["error_code"] == ("cancelled" if mode == "cancel" else "timeout"), result
+        assert _wait_for(lambda: _guest_procs(name, marker) == ""), _guest_procs(name, marker)
+    finally:
+        session.proc.stdin.close(); session.proc.wait(timeout=20)
+
+
+def _result_recorded(name, request):
+    """True once the guest has durably recorded this execution's terminal result (checked inside the guest)."""
+    fname = hashlib.sha256(json.dumps(list(key_of(request).values())).encode()).hexdigest() + ".result.json"
+    code = ("import os,sys\nfrom sandbox.artifact_upload.worker.guest_session import state_dir_for\n"
+            "print(os.path.exists(os.path.join(state_dir_for(sys.argv[1]), sys.argv[2])))")
+    return _docker("exec", name, "python", "-c", code, RUN_ID, fname).stdout.strip() == "True"
+
+
+def test_lost_start_reply_and_restart_dedup_serve_the_recorded_result(docker_env):
+    name = docker_env["guest"]
+    request = call("shell", "bash", {"command": "printf lost-ack"}, run_id=RUN_ID, call_id="lost-ack")
+    first = GuestSession(name, docker_env["log"])
+    first.proc.stdin.write(json.dumps({"op": "start", "call": request}) + "\n"); first.proc.stdin.flush()
+    assert first.proc.stdout.readline(), "guest must acknowledge the start before the host loses the reply"
+    assert _wait_for(lambda: _result_recorded(name, request)), "the shell's terminal result was never recorded"
+    # The host never learns the handle; the worker session then dies without cleanup, so its result must come from the ledger.
+    _signal_guest_session(name, 9); first.proc.wait(timeout=20)
+    second = GuestSession(name, docker_env["log"])
+    try:
+        assert _settled(second, request)["stdout"] == "lost-ack"  # recovered by key, no second start
+        assert second.send({"op": "start", "call": request})["error"]["code"] == "duplicate_execution"
+        assert second.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"]["stdout"] == "lost-ack"
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+def test_recovered_execution_is_adopted_by_key_and_cancelled_without_restart(tmp_path):
+    state = tmp_path / "state"; root = tmp_path / "guest"; root.mkdir()
+    first = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=state)
+    request = call("shell", "bash", {"command": "sleep 351.1 & wait"}, call_id="adopt-unit")
+    handle = first.start(request)
+    assert _wait_for(lambda: (rec := first.ledger.identity(GuestWorker._key(request))) and rec["members"]), "descendant was never recorded"
+    # The first worker is abandoned without shutdown: its in-memory registry is lost, as after SIGKILL.
+    second = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=state)
+    assert second.status(key_of(request))["state"] == "running"
+    with pytest.raises(WorkerError) as exc: second.start(request)
+    assert exc.value.code == "duplicate_execution"
+    assert second.cancel(key_of(request), how="terminate") is True
+    settled = second.status(key_of(request))
+    assert settled["state"] == "completed" and settled["result"]["status"] != "ok", settled
+    assert _wait_for(lambda: not group_members(int(handle["process_group_id"]))), "owned group survived recovered cancellation"
+
+
+@pytest.mark.parametrize("boundary", ["legacy", "supervisor"])
+def test_recorded_identity_with_a_reused_pid_is_never_signalled(tmp_path, boundary):
+    victim = subprocess.Popen(["sleep", "352.1"])
+    try:
+        root = tmp_path / "guest"; root.mkdir()
+        worker = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=tmp_path / "state")
+        key = {"run_id": "run-reuse", "session_id": "s", "call_id": "c-reuse", "argument_digest": "d" * 8}
+        stale = "Mon Jan  1 00:00:00 1990"  # the recorded start time belongs to a different process that once had this pid
+        record = {"key": list(GuestWorker._key(key)), "handle": {"process_id": str(victim.pid)},
+                  "leader": [victim.pid, stale], "members": {str(victim.pid): stale}}
+        if boundary == "supervisor": record["supervisor"] = [victim.pid, stale]
+        worker.ledger.write_identity(GuestWorker._key(key), record)
+        assert worker.status(key)["state"] == "completed"  # nothing owned is alive, so the exit is reported unobserved
+        assert worker.cancel(key, how="kill") is False
+        assert victim.poll() is None, "a process whose identity does not match the record was signalled"
+    finally:
+        victim.kill(); victim.wait()
 
 
 def test_native_differential_in_guest_container(docker_env, native_results, artifact_dir):
