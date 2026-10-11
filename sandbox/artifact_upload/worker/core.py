@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import queue
 import shutil
@@ -63,6 +64,72 @@ def _proc_table() -> list[tuple[int, int, int, str, str]]:
 
 def group_members(pgid: int) -> list[int]:
     return [pid for pid, _pp, pg, st, _s in _proc_table() if pg == pgid and not st.startswith("Z")]
+
+
+def _proc_start(pid: int) -> str | None:
+    """Start time of a live, non-zombie process; (pid, start time) names one process even after pid reuse."""
+    if not os.path.isdir("/proc/self"):  # non-Linux host (direct in-process use): ps reports the same identity
+        try: out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.split()
+        except (OSError, subprocess.SubprocessError): return None
+        return None if not out or out[0].startswith("Z") else " ".join(out[1:])
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f: raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    rest = raw[raw.rindex(")") + 2:].split()
+    return None if rest[0] == "Z" else rest[19]
+
+
+def _is_owned(pid: int, start: str | None) -> bool:
+    return start is not None and _proc_start(pid) == start
+
+
+class _Ledger:
+    """Run-private guest record of shell executions, so a fresh worker session can see what a dead session started.
+
+    Per execution: an identity file (exact key, process handle, leader and member process identities; replaced
+    atomically as members appear) and, once the outcome is known, one exclusively linked result file.
+    Files are named by a digest of the full key and hold the key, so a digest collision cannot alias two executions.
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+        os.makedirs(root, mode=0o700, exist_ok=True)
+
+    def _path(self, key: tuple[str, str, str, str], suffix: str) -> str:
+        return os.path.join(self.root, hashlib.sha256(json.dumps(list(key)).encode()).hexdigest() + suffix)
+
+    def _read(self, key: tuple[str, str, str, str], suffix: str) -> dict[str, Any] | None:
+        try:
+            with open(self._path(key, suffix), "rb") as f: return json.loads(f.read())
+        except FileNotFoundError:
+            return None
+
+    def identity(self, key: tuple[str, str, str, str]) -> dict[str, Any] | None:
+        rec = self._read(key, ".json")
+        return rec if rec is not None and rec.get("key") == list(key) else None
+
+    def result(self, key: tuple[str, str, str, str]) -> dict[str, Any] | None:
+        return self._read(key, ".result.json")
+
+    def write_identity(self, key: tuple[str, str, str, str], record: dict[str, Any]) -> None:
+        path = self._path(key, ".json")
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(record, f)
+        os.replace(tmp, path)
+
+    def record_result_once(self, key: tuple[str, str, str, str], result: dict[str, Any]) -> dict[str, Any]:
+        """Keep the first terminal result for this key; a link is an exclusive create that never exposes partial content."""
+        path = self._path(key, ".result.json")
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(result, f)
+        try:
+            os.link(tmp, path)
+            return result
+        except FileExistsError:
+            return self.result(key)  # type: ignore[return-value]
+        finally:
+            os.unlink(tmp)
 
 
 def select_shell() -> str:
@@ -134,6 +201,8 @@ class _Execution:
         self.cancel_signal: int | None = None; self.cancel_at = 0.0
         self.expired = False; self.done = threading.Event(); self.result: dict[str, Any] | None = None
         self.tracked: dict[int, str] = {}
+        # Durable identity: the leader is the process group; members are its tracked descendants (any group).
+        self.record: dict[str, Any] = {"key": list(key), "handle": self.handle, "leader": [proc.pid, _proc_start(proc.pid)], "members": {}}
 
     def emit(self, event: dict[str, Any]) -> None:
         if self.events is None: return
@@ -151,7 +220,7 @@ class GuestWorker:
     """Handlers sharing one guest filesystem and one fixed worker identity."""
 
     def __init__(self, root: str | os.PathLike[str], *, worker_id: str = "guest-worker", protected_paths: tuple[str, ...] | list[str] = (),
-                 output_dir: str | os.PathLike[str] | None = None, kill_grace: float = 3.0):
+                 output_dir: str | os.PathLike[str] | None = None, kill_grace: float = 3.0, state_dir: str | os.PathLike[str] | None = None):
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir(): raise ValueError("guest root must be a directory")
         self.worker_id = worker_id
@@ -162,6 +231,8 @@ class GuestWorker:
         self._lock = threading.RLock()
         self._execs: dict[tuple[str, str, str, str], _Execution] = {}
         self._finished: set[tuple[str, str, str, str]] = set()
+        # Without an explicit run-private state dir the ledger is ephemeral (direct in-process use only).
+        self.ledger = _Ledger(str(state_dir) if state_dir else tempfile.mkdtemp(prefix="artifact-worker-state-"))
 
     # ------------------------------------------------------------ identity
     @property
@@ -252,7 +323,12 @@ class GuestWorker:
         """Yield stdout/stderr chunk events in arrival order, then one result event."""
         key = self._exec_key(execution_key)
         with self._lock: ex = self._execs.get(key)
-        if ex is None or ex.events is None: raise WorkerError("unknown_execution", "execution is not active")
+        if ex is None:
+            result = self._recovered(key)[1]
+            if result is None: raise WorkerError("unknown_execution", "execution is not complete")
+            yield {"type": "result", "result": result}
+            return
+        if ex.events is None: raise WorkerError("unknown_execution", "execution is not active")
         while True:
             item = ex.events.get()
             yield item
@@ -264,7 +340,9 @@ class GuestWorker:
     def status(self, execution_key: dict[str, str]) -> dict[str, Any]:
         key = self._exec_key(execution_key)
         with self._lock: ex = self._execs.get(key)
-        if ex is None: raise WorkerError("unknown_execution", "execution is not active")
+        if ex is None:
+            rec, result = self._recovered(key)
+            return {"state": "running" if result is None else "completed", "result": result, "process": dict(rec["handle"])}
         return {"state": "completed" if ex.done.is_set() else "running", "result": ex.result, "process": dict(ex.handle)}
 
     def cancel(self, execution_key: dict[str, str] | str, *, how: str = "terminate") -> bool:
@@ -273,10 +351,65 @@ class GuestWorker:
         sig = {"interrupt": signal.SIGINT, "terminate": signal.SIGTERM, "kill": signal.SIGKILL}.get(how)
         if sig is None: raise ValueError("signal must be interrupt, terminate, or kill")
         with self._lock: ex = self._execs.get(key)
-        if ex is None or ex.done.is_set(): return False
+        if ex is None: return self._cancel_recovered(key, sig)
+        if ex.done.is_set(): return False
         ex.cancel_signal = sig; ex.cancel_at = time.monotonic()
         self._signal_group(ex, sig)
         return True
+
+    # ------------------------------------------------- recovered executions
+    # An execution started by an earlier worker session is found through its ledger identity. Its process
+    # identities (leader, tracked descendants) are compared by start time, so a reused pid is never signalled.
+    def _owned_alive(self, rec: dict[str, Any]) -> bool:
+        pid, start = rec["leader"]
+        return _is_owned(pid, start) or any(_is_owned(int(p), s) for p, s in rec["members"].items())
+
+    def _recovered(self, key: tuple[str, str, str, str]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Identity and terminal result of an execution this session did not start; result is None while running."""
+        with self._lock:
+            if key in self._finished: raise WorkerError("unknown_execution", "execution is not active")  # consumed here: forgotten
+        rec = self.ledger.identity(key)
+        if rec is None: raise WorkerError("unknown_execution", "execution is not active")
+        result = self.ledger.result(key)
+        if result is None and not self._owned_alive(rec):
+            # Processes are gone but nothing recorded their exit: report that honestly, not a fabricated status.
+            result = self.ledger.record_result_once(key, self._unobserved(key, "worker session ended before this execution's exit was observed"))
+        return rec, result
+
+    def _cancel_recovered(self, key: tuple[str, str, str, str], sig: int) -> bool:
+        rec = self.ledger.identity(key)
+        if rec is None or self.ledger.result(key) is not None or not self._owned_alive(rec): return False
+        self._terminate_owned(rec, sig)
+        if not self._owned_alive(rec):
+            self.ledger.record_result_once(key, self._unobserved(key, "terminated after worker session loss; exit not observed"))
+        return True
+
+    def _terminate_owned(self, rec: dict[str, Any], sig: int) -> None:
+        """Signal the recorded group (only while its leader is still the recorded process) and members; escalate after grace."""
+        for step, wait in ((sig, self.kill_grace), (signal.SIGKILL, 5.0)):
+            pid, start = rec["leader"]
+            if _is_owned(pid, start) and pid > 1:
+                try: os.killpg(pid, step)
+                except OSError: pass
+            for member, mstart in rec["members"].items():
+                if _is_owned(int(member), mstart):
+                    try: os.kill(int(member), step)
+                    except OSError: pass
+            deadline = time.monotonic() + wait
+            while self._owned_alive(rec) and time.monotonic() < deadline: time.sleep(0.02)
+            if not self._owned_alive(rec): return
+
+    def _unobserved(self, key: tuple[str, str, str, str], message: str) -> dict[str, Any]:
+        """Unknown outcome for an execution whose completion was not observed: no exit status is fabricated."""
+        return self._result(dict(zip(KEY_FIELDS, key)), "unknown", None, "", message, "utf-8", "outcome_unobserved")
+
+    def shutdown(self) -> None:
+        """Graceful session end (stdin EOF, SIGTERM or SIGHUP): terminate this session's live executions and their groups."""
+        with self._lock: live = [ex for ex in self._execs.values() if not ex.done.is_set()]
+        for ex in live:
+            ex.cancel_signal = ex.cancel_signal or signal.SIGTERM; ex.cancel_at = time.monotonic()
+            self._signal_group(ex, signal.SIGTERM)
+        for ex in live: ex.done.wait(self.kill_grace + 10)
 
     # ------------------------------------------------------------- shell
     def _launch(self, call: dict[str, Any], *, stream: bool) -> _Execution:
@@ -287,10 +420,16 @@ class GuestWorker:
         if not os.path.isdir(cwd): return self._failed(call, key, f"not a directory: {a.get('workdir', '.')}", "not_a_directory", stream)
         env = os.environ.copy(); env.update(a.get("env", {}))
         with self._lock:
-            if key in self._execs or key in self._finished: raise WorkerError("duplicate_execution", "execution key was already used")
+            if key in self._execs or key in self._finished or self.ledger.identity(key) is not None:
+                raise WorkerError("duplicate_execution", "execution key was already used")
             proc = subprocess.Popen([select_shell(), "-c", a["command"]], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             ex = _Execution(key, proc, self.worker_id, stream, self.output_dir)
             self._execs[key] = ex
+            # Durable before the handle is returned: a session that dies after this point leaves a recoverable record.
+            try: self.ledger.write_identity(key, ex.record)
+            except OSError as exc:
+                self._signal_group(ex, signal.SIGKILL); self._execs.pop(key, None)
+                raise WorkerError("ledger_unavailable", f"execution identity could not be recorded: {exc}") from exc
         threading.Thread(target=self._supervise, args=(call, ex, a.get("timeout", DEFAULT_SHELL_TIMEOUT_MS)), name="artifact-worker-shell", daemon=True).start()
         return ex
 
@@ -341,6 +480,8 @@ class GuestWorker:
         finally:
             ex.out.close(); ex.err.close()
         ex.result = self._finish(call, ex)
+        try: self.ledger.record_result_once(ex.key, ex.result)
+        except OSError: pass  # live delivery below still succeeds; only cross-session recovery is lost
         ex.done.set()
         if ex.dropped: ex.emit({"type": "dropped", "count": ex.dropped})
         if ex.events is not None: ex.events.put({"type": "result", "result": ex.result})
@@ -354,10 +495,16 @@ class GuestWorker:
     def _track(self, ex: _Execution) -> None:
         table = _proc_table(); children: dict[int, list[tuple[int, str]]] = {}
         for pid, ppid, _pg, _st, start in table: children.setdefault(ppid, []).append((pid, start))
-        todo = [ex.pgid]
+        todo = [ex.pgid]; before = len(ex.tracked)
         while todo:
             for pid, start in children.get(todo.pop(), []):
                 if pid not in ex.tracked: ex.tracked[pid] = start; todo.append(pid)
+        if len(ex.tracked) != before:
+            # Descendants that leave the group (setsid, nohup) are only recoverable if their identity is recorded now.
+            # Best effort: a lost write must not stop supervision, which still delivers the live result.
+            ex.record["members"] = {str(pid): start for pid, start in ex.tracked.items()}
+            try: self.ledger.write_identity(ex.key, ex.record)
+            except OSError: pass
 
     def _reap_group(self, ex: _Execution) -> None:
         for sig, wait in ((signal.SIGTERM, 0.3), (signal.SIGKILL, 5.0)):

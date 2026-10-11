@@ -709,6 +709,121 @@ def test_guest_process_group_lifetime_and_cancellation(docker_env, artifact_dir,
     save(artifact_dir, "guest-process-receipts.json", {"background_after_shell_exit": ps, "running_before_cancel": running, "after_cancel": after, "handle": handle, "result": events[-1]["result"]})
 
 
+# ------------------------------------------- worker-session loss and recovery
+# Consolidated AC2 regression set. Real-guest cases run in the container built from this checkout's worker source.
+
+def _wait_for(predicate, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not predicate(): time.sleep(0.1)
+    return predicate()
+
+
+def _guest_procs(name, marker):
+    return _docker("exec", name, "sh", "-c", f"ps -eo pid,pgid,stat,args | grep '[s]leep {marker}' || true").stdout.strip()
+
+
+def _settled(session, request, timeout=30.0):
+    """Terminal result from a session that did not start the execution (status is served by the ledger)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = session.send({"op": "status", "execution_key": key_of(request)})
+        if "error" in status: return status
+        if status["status"]["state"] == "completed" or time.monotonic() >= deadline: return status["status"]["result"]
+        time.sleep(0.1)
+
+
+@pytest.mark.parametrize("loss", ["client_killed", "guest_sigkilled", "guest_sigterm", "stdin_eof"])
+def test_worker_session_loss_leaves_no_uncontrolled_jobs_and_recovers_by_key(docker_env, artifact_dir, loss):
+    name = docker_env["guest"]; marker = {"client_killed": "331.1", "guest_sigkilled": "332.1", "guest_sigterm": "333.1", "stdin_eof": "334.1"}[loss]
+    request = call("shell", "bash", {"command": f"sleep {marker} & setsid sleep {marker} & wait"}, run_id=RUN_ID, call_id=f"loss-{loss}")
+    first = GuestSession(name, docker_env["log"])
+    first.send({"op": "start", "call": request})
+    assert _wait_for(lambda: len(_guest_procs(name, marker).splitlines()) >= 3), _guest_procs(name, marker)
+    if loss == "client_killed": first.proc.kill()
+    elif loss == "stdin_eof": first.proc.stdin.close()
+    else: _docker("exec", name, "sh", "-c", f"pkill -{'KILL' if loss == 'guest_sigkilled' else 'TERM'} -f '[s]andbox.artifact_upload.worker.guest_session' || true")
+    first.proc.wait(timeout=30)
+    second = GuestSession(name, docker_env["log"])
+    try:
+        status = second.send({"op": "status", "execution_key": key_of(request)})
+        assert "status" in status, status  # recovered by its exact key, not reported unknown
+        assert second.send({"op": "start", "call": request})["error"]["code"] == "duplicate_execution"  # never redispatched
+        second.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})
+        result = _settled(second, request)
+        assert result["status"] != "ok" and result.get("error_code"), result
+        assert _wait_for(lambda: _guest_procs(name, marker) == ""), _guest_procs(name, marker)
+        save(artifact_dir, f"ac2-session-loss-{loss}.json", {"recovered_status": status, "result": result, "leftover": _guest_procs(name, marker)})
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+@pytest.mark.parametrize("mode", ["cancel", "timeout"])
+def test_cancel_and_timeout_reap_setsid_and_nohup_descendants(docker_env, mode):
+    name = docker_env["guest"]; marker = {"cancel": "341.1", "timeout": "342.1"}[mode]
+    args = {"command": f"sleep {marker} & setsid sleep {marker} & nohup sleep {marker} >/dev/null 2>&1 & wait"}
+    if mode == "timeout": args["timeout"] = 1000
+    request = call("shell", "bash", args, run_id=RUN_ID, call_id=f"reap-{mode}")
+    session = GuestSession(name, docker_env["log"])
+    try:
+        session.send({"op": "start", "call": request})
+        assert _wait_for(lambda: len(_guest_procs(name, marker).splitlines()) >= 3), _guest_procs(name, marker)
+        if mode == "cancel": assert session.send({"op": "cancel", "execution_key": key_of(request), "how": "terminate"})["cancelled"] is True
+        result = session.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"]
+        assert result["status"] == ("cancelled" if mode == "cancel" else "error") and result["error_code"] == ("cancelled" if mode == "cancel" else "timeout"), result
+        assert _wait_for(lambda: _guest_procs(name, marker) == ""), _guest_procs(name, marker)
+    finally:
+        session.proc.stdin.close(); session.proc.wait(timeout=20)
+
+
+def test_lost_start_reply_and_restart_dedup_serve_the_recorded_result(docker_env):
+    name = docker_env["guest"]
+    request = call("shell", "bash", {"command": "printf lost-ack"}, run_id=RUN_ID, call_id="lost-ack")
+    first = GuestSession(name, docker_env["log"])
+    first.proc.stdin.write(json.dumps({"op": "start", "call": request}) + "\n"); first.proc.stdin.flush()
+    assert first.proc.stdout.readline(), "guest must acknowledge the start before the host loses the reply"
+    first.proc.kill(); first.proc.wait(timeout=20)  # the host never learns the handle
+    second = GuestSession(name, docker_env["log"])
+    try:
+        assert _settled(second, request)["stdout"] == "lost-ack"  # recovered by key, no second start
+        assert second.send({"op": "start", "call": request})["error"]["code"] == "duplicate_execution"
+        assert second.send({"op": "collect", "execution_key": key_of(request)})["events"][-1]["result"]["stdout"] == "lost-ack"
+    finally:
+        second.proc.stdin.close(); second.proc.wait(timeout=20)
+
+
+def test_recovered_execution_is_adopted_by_key_and_cancelled_without_restart(tmp_path):
+    state = tmp_path / "state"; root = tmp_path / "guest"; root.mkdir()
+    first = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=state)
+    request = call("shell", "bash", {"command": "sleep 351.1 & wait"}, call_id="adopt-unit")
+    handle = first.start(request)
+    assert _wait_for(lambda: (rec := first.ledger.identity(GuestWorker._key(request))) and rec["members"]), "descendant was never recorded"
+    # The first worker is abandoned without shutdown: its in-memory registry is lost, as after SIGKILL.
+    second = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=state)
+    assert second.status(key_of(request))["state"] == "running"
+    with pytest.raises(WorkerError) as exc: second.start(request)
+    assert exc.value.code == "duplicate_execution"
+    assert second.cancel(key_of(request), how="terminate") is True
+    settled = second.status(key_of(request))
+    assert settled["state"] == "completed" and settled["result"]["status"] != "ok", settled
+    assert _wait_for(lambda: not group_members(int(handle["process_group_id"]))), "owned group survived recovered cancellation"
+
+
+def test_recorded_identity_with_a_reused_pid_is_never_signalled(tmp_path):
+    victim = subprocess.Popen(["sleep", "352.1"])
+    try:
+        root = tmp_path / "guest"; root.mkdir()
+        worker = GuestWorker(root, output_dir=tmp_path / "spool", kill_grace=0.5, state_dir=tmp_path / "state")
+        key = {"run_id": "run-reuse", "session_id": "s", "call_id": "c-reuse", "argument_digest": "d" * 8}
+        stale = "Mon Jan  1 00:00:00 1990"  # the recorded start time belongs to a different process that once had this pid
+        worker.ledger.write_identity(GuestWorker._key(key), {"key": list(GuestWorker._key(key)), "handle": {"process_id": str(victim.pid)},
+                                                              "leader": [victim.pid, stale], "members": {str(victim.pid): stale}})
+        assert worker.status(key)["state"] == "completed"  # nothing owned is alive, so the exit is reported unobserved
+        assert worker.cancel(key, how="kill") is False
+        assert victim.poll() is None, "a process whose identity does not match the record was signalled"
+    finally:
+        victim.kill(); victim.wait()
+
+
 def test_native_differential_in_guest_container(docker_env, native_results, artifact_dir):
     name = docker_env["guest"]
     for variant, cases in ALL_CASES.items():
