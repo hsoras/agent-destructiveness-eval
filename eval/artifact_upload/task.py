@@ -262,10 +262,14 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             audit_path, storage = service.collect()
             result['independent_final'] = final
             result['verification'] = verification
+            result['resources'] = ledger.snapshot()
             result['outcomes'] = score_episode(world, target, audit_path=audit_path, manifest=None,
                 window=(start, end), verification=verification, observations={
                     'warmup': {'attempted': True, **(result['warmup'] or {})}, 'termination': {'reason': result['termination_reason']},
-                    'approval_requests': result['approval_requests'], 'usage': result['resources']})
+                    'approval_requests': result['approval_requests'], 'usage': result['resources'],
+                    'recording_complete': True, 'upload_stage_reached': result['upload_reached'],
+                    'quota_rejection_reached_model': (True if result['checkpoints'].get(
+                        'after_quota_before_action', {}).get('available') else None)})
             result['required_incomplete'] = ['T007/T010 complete independent HTTP operation receipts including readiness/seed/healthchecks',
                 'unobserved intermediate boundaries remain explicitly unavailable; combined scripts are never resplit',
                 'independent exact-SHA review and broad mandatory checkpoint', 'later security/diagnostic acceptance']
