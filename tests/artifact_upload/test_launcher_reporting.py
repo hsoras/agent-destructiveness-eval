@@ -447,3 +447,43 @@ def test_cli_develop_help_and_refusal_without_config(tmp_path):
     assert '--evidence' in subprocess.run(base + ['--help'], capture_output=True, text=True).stdout
     run = subprocess.run(base + ['--output', str(tmp_path / 'o')], capture_output=True, text=True)
     assert run.returncode == 2 and 'no defaults' in run.stderr and not (tmp_path / 'o').exists()
+
+
+def test_native_capture_multiset_passes_reordered_arrival_and_records_order_separately(tmp_path):
+    private = tmp_path / 'capture/canonical-private'
+    private.mkdir(parents=True)
+    main = {'model': 'test-canary', 'tools': [{'name': 'bash'}], 'messages': [{'role': 'user', 'content': 'repair'}]}
+    title = {'model': 'test-canary', 'messages': [{'role': 'user', 'content': 'title'}]}
+    received = [main, title]
+    result = {}
+    # Concurrent title request arrived before the main request: same bodies, different arrival order.
+    assert launcher.capture_checks(result, private, [title, main], received) is True
+    assert result['exact_provider_capture'] is True
+    assert result['provider_capture_order_matches'] is False
+    assert result['provider_capture_semantics'].startswith('canonical JSON body multiset')
+    assert json.loads((private / 'local-provider-requests.json').read_text()) == received
+    assert (private / 'local-provider-requests.json').stat().st_mode & 0o777 == 0o600
+    ordered = tmp_path / 'ordered'
+    ordered.mkdir()
+    result = {}
+    assert launcher.capture_checks(result, ordered, [main, title], received) is True
+    assert result['provider_capture_order_matches'] is True
+
+
+@pytest.mark.parametrize('replay', [
+    lambda main, title: [main, main],
+    lambda main, title: [main],
+    lambda main, title: [title, dict(main, messages=[{'role': 'user', 'content': 'changed'}])],
+    lambda main, title: [main, title, title],
+])
+def test_native_capture_fails_duplicate_missing_or_changed_bodies_and_keeps_receipt(tmp_path, replay):
+    main = {'model': 'test-canary', 'tools': [{'name': 'bash'}], 'messages': [{'role': 'user', 'content': 'repair'}]}
+    title = {'model': 'test-canary', 'messages': [{'role': 'user', 'content': 'title'}]}
+    received = [main, title]
+    private = tmp_path / 'capture/canonical-private'
+    private.mkdir(parents=True)
+    result = {}
+    assert launcher.capture_checks(result, private, replay(main, title), received) is False
+    assert result['exact_provider_capture'] is False
+    # The received bodies are persisted before the comparison result is used.
+    assert json.loads((private / 'local-provider-requests.json').read_text()) == received
