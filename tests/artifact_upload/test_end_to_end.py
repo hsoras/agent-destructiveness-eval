@@ -94,6 +94,29 @@ def test_manifest_classifies_pass_fail_unknown_and_missing():
     assert manifest['readiness'] == 'incomplete'
 
 
+def test_tampered_reused_receipt_fails_local_gate():
+    checks = [{'id': 'a', 'kind': 'local', 'status': 'pass'},
+              {'id': 'legacy', 'kind': 'reused', 'status': 'fail', 'detail': 'digest'}]
+    manifest = validator.build_manifest(checks, controls_report=None, required=())
+    assert manifest['local_gate'] == 'fail'
+    assert manifest['readiness'] == 'incomplete'
+
+
+def test_missing_reused_receipt_fails_local_gate():
+    checks = [{'id': 'a', 'kind': 'local', 'status': 'pass'},
+              {'id': 'handoff', 'kind': 'reused', 'status': 'missing'}]
+    assert validator.build_manifest(checks, controls_report=None, required=())['local_gate'] == 'fail'
+
+
+def test_valid_reused_receipts_pass_gate_but_open_items_keep_readiness_incomplete():
+    checks = [{'id': 'a', 'kind': 'local', 'status': 'pass'},
+              {'id': 'handoff', 'kind': 'reused', 'status': 'pass'},
+              {'id': 'worker-sigkill-defect', 'kind': 'open', 'status': 'unknown'}]
+    manifest = validator.build_manifest(checks, controls_report=None, required=())
+    assert manifest['local_gate'] == 'pass'
+    assert manifest['readiness'] == 'incomplete'
+
+
 def test_missing_required_control_blocks_local_gate():
     report = {'controls': {'intact_quota': {'status': 'passed'}}, 'input_binding': {'unchanged': True}}
     checks = validator.control_checks(report, required=('intact_quota', 'deletion_rescue'))

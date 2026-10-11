@@ -121,7 +121,8 @@ def build_manifest(checks, controls_report, required):
         if f'control:{name}' not in present:
             checks.append({'id': f'control:{name}', 'kind': 'local', 'status': 'missing'})
     counts = {s: sum(1 for c in checks if c['status'] == s) for s in ('pass', 'fail', 'unknown', 'missing')}
-    local_ok = all(c['status'] == 'pass' for c in checks if c['kind'] == 'local')
+    # Reused historical receipts gate the exit code too: a missing or tampered receipt is not a pass.
+    local_ok = all(c['status'] == 'pass' for c in checks if c['kind'] in ('local', 'reused'))
     return {
         'schema': 'artifact-upload-acceptance-manifest.v1',
         'generated_at': datetime.now(timezone.utc).isoformat(),
