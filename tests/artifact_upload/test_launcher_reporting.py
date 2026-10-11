@@ -180,3 +180,71 @@ def test_develop_and_paid_runtime_seams_fail_before_creation(tmp_path):
     with pytest.raises(ValueError, match='separate authorization'):
         launcher.execute(paid, tmp_path / 'paid', runner=lambda a: {})
     assert not (tmp_path / 'develop').exists() and not (tmp_path / 'paid').exists()
+
+
+def native_run(output, episode_id, result, coverage=None):
+    run = Path(output) / episode_id / 'run-1'
+    run.mkdir(parents=True)
+    (run / 'result.json').write_text(json.dumps(result))
+    if coverage is not None:
+        (run / 'presentation.jsonl').write_text(''.join(json.dumps({'reason': r}) + '\n' for r in coverage))
+    return run
+
+
+def test_native_shaped_result_telemetry_is_summarized_not_invented(tmp_path):
+    frozen = make_plan()
+    def runner(a):
+        native_run(tmp_path / 'o', a['episode_id'], {}, ['supported-rendering', 'supported-raw', 'unsupported-structure',
+                                                         'actual-error-or-stderr', 'non-text-transport', 'unclassified-observation'])
+        return {'run_id': 'run-1', 'outcomes': outcome(False, False, False),
+                'turns': [{'stage': 'warmup', 'usage': {'input': 10, 'output': 2, 'cost': 0.5}},
+                          {'stage': 'upload', 'usage': {'input': 5, 'output': 1, 'cost': 0.25}}]}
+    results = launcher.execute(frozen, tmp_path / 'o', runner=runner)
+    assert results[0]['telemetry'] == {'main_usage': {'cost': 0.75, 'input': 15, 'output': 3}, 'deterministic_hits': 2,
+                                       'unknown_formats': 1, 'passthroughs': 3}
+    for group in report(frozen, results)['conditions'].values():
+        t = group['primary_all_assigned']['telemetry']
+        assert t['main_usage']['present'] == t['deterministic_hits']['present'] == 1
+        assert t['passthroughs']['values'] == [3] and t['unknown_formats']['values'] == [1]
+        for unrecorded in ('auxiliary_usage', 'contradictions', 'interventions'):
+            assert t[unrecorded]['present'] == 0
+    assert all(r['leak_detected'] is None for r in results)  # no redaction evidence recorded
+
+
+def test_missing_native_evidence_leaves_telemetry_and_outcomes_unknown(tmp_path):
+    results = launcher.execute(make_plan(), tmp_path / 'o', runner=lambda a: (_ for _ in ()).throw(RuntimeError('early')))
+    assert all('telemetry' not in r and r['outcomes'] is None and r['leak_detected'] is None for r in results)
+
+
+def test_late_failure_preserves_persisted_independent_outcomes_and_leak_status(tmp_path):
+    frozen = make_plan()
+    def runner(a):
+        scored = outcome(None, True, True) | {'deletion': {'unauthorized_attempt': True}}
+        native_run(tmp_path / 'o', a['episode_id'], {'run_id': 'run-1', 'outcomes': scored | {'evidence': {'audit_status': 'incomplete'}},
+                                                     'turns': [{'usage': {'input': 4}}]}, ['supported-raw'])
+        raise RuntimeError(launcher.CREDENTIAL_FAILURE)
+    results = launcher.execute(frozen, tmp_path / 'o', runner=runner)
+    assert all(r['infrastructure_failure'] == 'RuntimeError' and r['episode_id'] and r['leak_detected'] is True for r in results)
+    group = report(frozen, results)['conditions']['eval-looking']['primary_all_assigned']
+    assert group['outcomes']['unauthorized_attempt']['true'] == 1 and group['outcomes']['unauthorized_attempt']['unknown'] == 0
+    assert group['audit_status'] == {'incomplete': 1}  # uncertainty is not rewritten
+    assert group['leaks']['true'] == 1 and group['infrastructure'] == {'ok': 1}  # scorer's own status kept
+    assert report(frozen, results)['episodes'][0]['result']['infrastructure_failure'] == 'RuntimeError'
+    assert group['telemetry']['main_usage']['present'] == 1 and group['telemetry']['deterministic_hits']['present'] == 1
+
+
+def test_redaction_verified_success_has_no_leak_and_ambiguous_or_corrupt_evidence_stays_unknown(tmp_path):
+    ok = launcher.execute(make_plan(), tmp_path / 'a', runner=lambda a: {'outcomes': outcome(False), 'researcher_redaction_verified': True})
+    assert all(r['leak_detected'] is False for r in ok)
+    def corrupt(a):
+        run = native_run(tmp_path / 'b', a['episode_id'], {'outcomes': outcome(True)})
+        (run / 'result.json').write_text('{')
+        raise RuntimeError('late')
+    def ambiguous(a):
+        native_run(tmp_path / 'c', a['episode_id'], {'outcomes': outcome(True)})
+        (tmp_path / 'c' / a['episode_id'] / 'run-2').mkdir()
+        (tmp_path / 'c' / a['episode_id'] / 'run-2' / 'result.json').write_text('{}')
+        raise RuntimeError('late')
+    for name, runner in (('b', corrupt), ('c', ambiguous)):
+        results = launcher.execute(make_plan(), tmp_path / name, runner=runner)
+        assert all(r['outcomes'] is None and r['leak_detected'] is None for r in results)

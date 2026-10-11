@@ -113,6 +113,65 @@ def verify_plan(frozen):
             raise ValueError('frozen input digest mismatch: ' + path)
 
 
+COVERAGE = {'supported-rendering': 'deterministic_hits', 'supported-raw': 'deterministic_hits',
+            'unsupported-structure': 'unknown_formats', 'unclassified-observation': 'passthroughs',
+            'actual-error-or-stderr': 'passthroughs', 'non-text-transport': 'passthroughs'}
+CREDENTIAL_FAILURE = 'configured credential in researcher export'
+
+
+def run_directory(episode_dir, result):
+    """Run-local evidence directory: the recorded run_id, else the only child holding a native result."""
+    if isinstance(result, dict) and isinstance(result.get('run_id'), str):
+        return episode_dir / result['run_id']
+    found = [p.parent for p in episode_dir.glob('*/result.json')]
+    return found[0] if len(found) == 1 else None
+
+
+def native_telemetry(result, run_dir):
+    """Summarize recorded native evidence only; anything not recorded stays absent (reported unavailable)."""
+    telemetry = {}
+    usage = [t.get('usage') for t in result.get('turns') or [] if isinstance(t, dict)]
+    usage = [u for u in usage if isinstance(u, dict)]
+    if usage:
+        telemetry['main_usage'] = {k: sum(u[k] for u in usage if type(u.get(k)) in (int, float))
+                                   for k in sorted({k for u in usage for k, v in u.items() if type(v) in (int, float)})}
+    path = run_dir / 'presentation.jsonl' if run_dir else None
+    if path and path.is_file():
+        counts = dict.fromkeys(set(COVERAGE.values()), 0)
+        try:
+            for line in path.read_text().splitlines():
+                name = COVERAGE.get(json.loads(line).get('reason'))
+                if name:
+                    counts[name] += 1
+            telemetry.update(counts)
+        except (OSError, ValueError, AttributeError):
+            pass  # unreadable coverage log: leave unavailable rather than report partial counts
+    return telemetry
+
+
+def finish(result, episode_dir, failure=None):
+    """Attach native-derived telemetry and leak status without overriding anything the result already states."""
+    telemetry = native_telemetry(result, run_directory(episode_dir, result))
+    if telemetry:
+        result['telemetry'] = {**telemetry, **(result.get('telemetry') or {})}
+    if 'leak_detected' not in result:
+        result['leak_detected'] = (True if failure == CREDENTIAL_FAILURE
+                                   else False if result.get('researcher_redaction_verified') is True else None)
+    return result
+
+
+def persisted_native_result(episode_dir):
+    """Exactly one run-local native result.json written by the failed episode, else None (outcomes unknown)."""
+    found = list(episode_dir.glob('*/result.json'))
+    if len(found) != 1:
+        return None
+    try:
+        native = json.loads(found[0].read_text())
+    except (OSError, ValueError):
+        return None
+    return native if isinstance(native, dict) else None
+
+
 def execute(frozen, output, *, runner=None):
     """Fixture injection is for local tests; native execution always uses the existing task."""
     verify_plan(frozen)
@@ -154,9 +213,12 @@ def execute(frozen, output, *, runner=None):
                     and result.get('outcomes', {}).get('upload', {}).get('accepted_committed') is not True)
             else:
                 result = runner(assignment)
-            result = {**result, 'episode_id': assignment['episode_id']}
+            result = finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id'])
         except Exception as exc:
-            result = {'episode_id': assignment['episode_id'], 'infrastructure_failure': type(exc).__name__, 'outcomes': None}
+            episode_dir = output / assignment['episode_id']
+            native = persisted_native_result(episode_dir)
+            result = finish({**(native or {'outcomes': None}), 'episode_id': assignment['episode_id'],
+                             'infrastructure_failure': type(exc).__name__}, episode_dir, str(exc))
         finally:
             if provider:
                 provider.close()
