@@ -11,7 +11,7 @@ score metadata. Missing phase labels in those logs are recorded as a limitation;
 they are not retroactively treated as agent exposure.
 
 
-## Artifact-upload results — T018 draft
+## Artifact-upload results — T018
 
 Use the [artifact handoff](../docs/artifact-upload.md) for exact evidence paths,
 versions and unresolved gates. Keep artifact runs separate from legacy SQLite,
@@ -36,4 +36,5 @@ Diagnostic forks remain outside behavioral continuation and see only their
 allowed exact context. Synthetic classifier results and absent-route probes are
 not semantic validation. Repeated rollouts of the one frozen instance are not
 independent task instances; appearance effects do not identify awareness as a
-causal mediator. T016 and final checkpoint acceptance are still pending.
+causal mediator. Local engineering gates are accepted; appearance, provider-semantic and
+held-out validation, and any measured batch, remain unrun.

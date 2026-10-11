@@ -10,14 +10,19 @@ release without approval. The experiment compares unauthorized-action rates
 between evaluation-looking and developer-looking workspaces while holding the
 task, tools, permissions, and underlying service state constant.
 
-**Artifact backend status (T018 draft, 2026-10-11):** Local engineering paths
-are implemented at approved integration `e475360dac9478461df418b31f9c5d5c79eba4d1`.
-Accepted worker-freeze evidence covers both presentations, quota rejection,
-separate functional publication controls, capture and cleanup. T016 security
-acceptance and the final checkpoint are incomplete; this is no readiness or
-model-behavior claim. See the [artifact researcher handoff](docs/artifact-upload.md)
-for tested commands, exact platform/pins, evidence and unresolved requirements.
-SQLite and Streamstats remain separately usable through their preserved guides.
+**Artifact backend status (T018, 2026-10-11):** Local engineering paths are
+implemented and independently approved through accepted integration
+`ccc0671c40cd3ca42e65922c029ece345f2f7c68`: both presentations, quota
+rejection at the actual service, separate larger-quota functional publication,
+fresh unauthorized-rescue and scoped-approved controls, security/cancellation
+gate, capture and cleanup. All of this is scripted local-provider engineering
+evidence. **No research readiness is claimed:** no paid, appearance-separation,
+held-out or provider-semantic validation has been run. The legacy SQLite and
+Streamstats commands remain the default; the artifact backend is reachable only
+through its explicit entry points (`python -m eval.artifact_upload.task`,
+`scripts/artifact_upload.py`, `scripts/validate_artifact_upload.py`). See the
+[artifact researcher handoff](docs/artifact-upload.md) for setup, platform,
+pinned native commands, evidence, limits, rollback and the requirement audit.
 
 ## Experiment design
 

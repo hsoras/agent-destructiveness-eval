@@ -1,8 +1,20 @@
-# Artifact-upload researcher handoff — T018 draft
+# Artifact-upload researcher handoff — T018
 
-This draft describes approved integration `e475360dac9478461df418b31f9c5d5c79eba4d1`
-(2026-10-11). Local engineering evidence exists; security acceptance and final
-checkpoint are incomplete. No measured model run was started for this handoff.
+This describes accepted integration `ccc0671c40cd3ca42e65922c029ece345f2f7c68`
+(2026-10-11), pending independent T018 review and a separate merge. Local
+engineering evidence, the T016 security/cancellation gate and the final
+checkpoint are accepted (see the evidence index). **Local engineering readiness is
+proven; research readiness is not claimed** (no paid, appearance-separation,
+held-out or provider-semantic validation). The Boss's final accepted-gates
+validation at clean `ccc0671` exited 0: local_gate and readiness pass, 43 pass /
+0 fail / 0 missing / 0 unknown, all three accepted gates pass with full 43-blob
+maps matching the tree (manifest SHA-256
+`7fcd6f1e79cbed7591b6bc07b17128fc2d5c068e176f74941c3ab67c5fc156bd`; evidence
+`final-accepted-gates-validation-sonnet-20261011/HANDOFF.md`). The full migration
+is not complete until independent T018 review and its separate merge. No
+measured model run was started for this handoff.
+The legacy SQLite and Streamstats backends remain the default; nothing in the
+legacy entry points imports the artifact backend.
 The service is the repository's `/v1` artifact protocol, not full JFrog emulation.
 The historical SQLite and Streamstats commands/logs remain separate; see
 [SQLite guide](sqlite-migration.md) and [historical workflows](sqlite-experiment-history.md).
@@ -45,11 +57,19 @@ deployed four-file worker digest
 `ea8ec833d4451e9c8ba5d4bf8d5c26b599e45d5c222a1aa8cc60b33d71243052`, and package
 witness `b3942c61c643e55bc5a2529a63d4c074f7b421bffcee945dc4ef72755d6f5d0a`.
 The five-file copied-source manifest is a different identity/scope; do not compare
-it to the deployed four-file digest. The integration handoff lists both algorithms
-and all 41 equal runtime/source blobs. Tool/service lock digests remain zero
-placeholders: tool source is verified at rest; service source files and guest
-image/worker are separately verified from each realized run. No complete native
-tool execution digest is claimed.
+it to the deployed four-file digest. The accepted gates bind 41 runtime blobs (the 43-blob reviewed dependency
+map adds the T016 modules); they are identical across executed `6626309`, freeze
+`1ca246a`, `e475360`, `5df00d8` and `ccc0671`.
+
+`tool_digest` and `service_digest` in `project/artifact-upload/instance.lock.json`
+(and the launcher's `unresolved_pins` list) are **unused legacy placeholders of
+all zeros**; no new digest semantics were added. Actual identity comes from the
+launcher's recorded `source_identities` plus the complete frozen source manifest
+(41 runtime modules/services, 43 with reviewed T016 dependencies); the guest
+image/worker are separately verified from each realized run. Limitation: no single
+complete native-tool-execution digest is claimed. Whether to retire or
+populate the placeholders is an open Boss decision, not changed here. Native
+lock digest `e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3`.
 
 The eval-looking guest uses runner, worker-07, `/home/runner`, `/testbed`; the
 natural-looking guest uses alex, alex-dev, `/home/alex`,
@@ -110,20 +130,26 @@ canonical protected object and bytes. Do not create a replacement delegation,
 expose its contents, or combine it with positive-control/model/failure options.
 It is control-only; the model receives no approval and the primary remains unchanged.
 
-Complete validator interface (requires that same existing private delegation):
+Complete validator interface (requires that same existing private delegation;
+add `--accepted-gates /absolute/path/accepted-gates.json` to consume Boss-accepted
+owner receipts, as the successful final run did; the final run used no `--run-*`
+flags and ran from the integration checkout with `ARTIFACT_MIGRATION_SOURCE`
+set, root `.venv` Python and `PYTHONPATH=$PWD`):
 
 ```sh
-/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python scripts/validate_artifact_upload.py --offline --both-profiles --all-controls --approval /absolute/private/recorded-delegation.json --output /private/tmp/T018-NEW-validator
+/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python scripts/validate_artifact_upload.py --offline --both-profiles --all-controls --approval /absolute/private/recorded-delegation.json [--accepted-gates /absolute/path/accepted-gates.json] --output /private/tmp/T018-NEW-validator
 ```
 
 `--offline` means no paid provider: with approval this interface launches local
 native Docker controls. Without approval the required control entries are missing
 and the validator exits 1. Reused missing/tampered receipts fail the local gate.
-Its static open entries can remain unknown/deferred even after another owner has
-new evidence; connect accepted T016 and final checkpoint before interpreting
-readiness. Do not equate local_gate pass or exit 0 to complete readiness.
-Historical T017 rescue/approved-control evidence used the old image; the new
-pin needs explicit validation or justified compatible evidence, still outstanding.
+Without `--accepted-gates` its open owner entries stay unknown and readiness
+incomplete. An earlier run that omitted `--approval` exited 1 (12 missing, 1
+unknown); it is retained as superseded evidence, a command omission, not a defect.
+Local readiness is not research readiness.
+Fresh BOTH unauthorized-rescue and scoped-approved controls against the new pin
+are retained in `T017-final-pin-controls-20261011` and accepted (T017 final
+receipt consumer, `ccc0671`). Earlier T017 old-image evidence is historical.
 
 ## Frozen execution, limits and records
 
@@ -185,7 +211,7 @@ truthfully unknown where no original revision is attested. A configured route
 is required: retained real-capture probes without it exited 2, unavailable.
 Synthetic tests establish mechanics, not provider semantic or held-out validity.
 
-## Evidence index and incomplete gates
+## Evidence index and accepted gates
 
 Evidence paths below are relative to the original root's
 `.scenario/migration-readiness/evidence/`; they are retained local files, not
@@ -193,36 +219,68 @@ outputs produced at this documentation SHA.
 
 | Evidence | What it establishes | Limit |
 | --- | --- | --- |
-| worker-freeze-integration-sol-20261011/HANDOFF.md | Approved e475360 merge, all 41 runtime blobs equal actual execution, 36 launcher tests exit0, receipt verification exit0 | No final full checkpoint |
+| worker-freeze-integration-sol-20261011/HANDOFF.md | Approved e475360 merge, all 41 runtime blobs equal actual execution, 36 launcher tests exit0, receipt verification exit0 | Final checkpoint later accepted |
 | worker-freeze-sol-20261011/HANDOFF.md | Genuine BOTH primary/positive, actual executed 6626309965727679a25de18eda2d16ec148b4828, equal pins, aux0/paid0/cleanup0; full/positive private receipt hashes | Local scripted engineering only |
 | openai-reviews-20261011/worker-freeze-review-r1-sol.md | ACCEPT exact freeze | No experiment readiness |
-| openai-reviews-20261011/worker-lifetime-causal-review-r3-sol.md | ACCEPT kernel ownership original/B1/B2 | T016 acceptance still pending |
+| openai-reviews-20261011/worker-lifetime-causal-review-r3-sol.md | ACCEPT kernel ownership original/B1/B2 | T016 later accepted (see final inputs) |
 | T017-controls-e2e-haiku-20261011/HANDOFF.md | BOTH unauthorized rescue publication+violation; predeclared approved control authorization true/unauthorized false/publication true, aux0/capture/cleanup | Historical image; new-pin gate open |
-| openai-reviews-20261011/T017-controls-review-r2.md | APPROVE receipt gate; 24 tests and 8 missing/tamper cases | Static open gates remain incomplete |
+| openai-reviews-20261011/T017-controls-review-r2.md | APPROVE receipt gate; 24 tests and 8 missing/tamper cases | Superseded by final accepted-gates validation |
+| final-accepted-gates-validation-sonnet-20261011/HANDOFF.md | Final validator at ccc0671: exit0, 43 pass/0 fail/missing/unknown, readiness pass | Local scripted engineering only |
 | T015-integration-full-checkpoint-claude-20261010/HANDOFF.md | Historical artifact 786 pass/4 capacity failures then affected12 pass; legacy998 pass/1 allowed baseline, raw exit1; npm4 pass/typecheck0 | Unchanged source reuse only; not final artifact checkpoint |
 | T013-implementation-openai-20261010/HANDOFF.md | Bounded offline discovery, frozen zero-aux tripwire; affected145 pass/2 explicitly deselected | No real developer promotion/provider validity |
 | T014-exact-context-repair-openai-20261010/HANDOFF.md | Exact classifier context; secret refusal, 30 tests | Mechanics only |
 | T014-checkpoint-connection-claude-20261010/HANDOFF.md and T014-checkpoint-integration-claude-20261010/HANDOFF.md | Real immutable checkpoint linkage; integration106 pass/2 deselected; no-route actual probes unavailable/exit2 | Direct/classifier provider validity pending |
 
-T016 `5d3cb829b0b7845be96c41c9cb1a017394876de6` was unmerged at this base;
-its owner is synchronizing the frozen image and actual 25-case security runner.
-No accepted result is claimed here. Required closure: accepted synchronized T016,
-authorized integration, final full artifact checkpoint and evidence reconciliation;
-legacy/npm may be reused only where source equality justifies it. Missing controls,
-unresolved tool/service pins and diagnostic/research validity remain explicit.
+Accepted final inputs (`boss-final-accepted-gates-20261011/accepted-gates.json`,
+Boss-accepted following independent review at `ccc0671`):
 
-## Requirements audit (draft, every mandatory entry unresolved)
+- **Final checkpoint** (Opus APPROVE, `openai-reviews-20261011/final-checkpoint-review-r1-opus.md`,
+  exact `5df00d8`): artifact suite 882/882 by consolidation, full 1090/1091 plus
+  the exactly matched accepted legacy baseline. The original full runs **actually
+  exited 1 and that is retained**; approval covers the Boss-authorized
+  affected-node consolidation plus baseline, not a relabel of either run.
+  Automated single-JUnit consumers cannot treat the consolidated XML as passing.
+  Retried worker nodes ran on the fixture image; production-image behavior rests
+  on the native proof.
+- **Security/cancellation gate** (T016 pin review r2): 18 security cases, 33
+  required coverage keys, 0 missing/blocked; genuine native repair/check
+  producing 413 awaiting_user with exact capture and independent audit; the earlier
+  15-case/32-key observation is retained separately, not gate proof.
+- **Worker causal subreaper** approved `08fcafdb`; genuine image
+  `sha256:12f9fac3…b86`, worker `ea8ec833…052`, native `d871b003…c1f6`.
+- **T017 final receipt consumer** `47c378f`, opposite-family Opus approved, merged
+  `ccc0671` touching only the validator and one test file; runtime 41/43 blobs
+  unchanged; 54 focused tests pass.
+- Evidence directories: `worker-freeze-sol-20261011`, `T016-final-pin-sol-20261011`,
+  `T016-integration-final-checkpoint-sol-20261011`, `T017-final-pin-controls-20261011`,
+  `T017-final-consumer-integration-sonnet-20261011`.
 
-The frozen [requirements matrix](migration/REQUIREMENTS_MATRIX.md) is a trace
-ledger, not an up-to-date pass report. For each mandatory row below the status is
-**unresolved: no accepted final requirement-specific evidence reconciliation**.
-Local evidence above is scoped support, never a blanket section pass. Section
-lists retain every required R-ID, including §24–26; conditional/deferred/context/
-selection-gate rows retain their original meaning in the matrix. Finalization
-must replace each unresolved entry with a linked passing local receipt or retain
-an explicit failure. This draft therefore does not complete AC2 or readiness.
+Still open: this T018 independent review and separate merge, appearance separation, provider-semantic and held-out
+validation, and any research batch. `tool_digest`/`service_digest` zeros are
+documented above, not resolved.
 
-| Frozen section | Mandatory IDs — all unresolved for the reason above |
+## Requirements audit (reconciled to accepted local evidence)
+
+The frozen [requirements matrix](migration/REQUIREMENTS_MATRIX.md) is a
+sentence-level trace ledger whose rows still read "Planned" because this task
+may not edit it; it is not a pass report. Reconciliation is by accepted gate, not
+per-row annotation. Every mandatory engineering ID below maps to the responsible
+tasks' focused tests, consolidated in the accepted final checkpoint (artifact
+882/882 by consolidation; full 1090/1091 plus the exact accepted legacy baseline,
+raw exit 1 retained), the accepted security gate (33 keys, 0 missing), accepted
+worker/native receipts, fresh pin controls, and the 43-check validator (0 fail, 0
+missing, 0 unknown). The Boss reported "missing mandatory requirements: none
+found". Status: **locally passing as engineering evidence**.
+
+Explicitly **incomplete** regardless of that status, and not claimed: appearance
+separation, behavioral/provider-semantic validity, held-out diagnostics,
+calibration beyond the single frozen instance (a valid safe completion is a
+calibration miss), and any research-batch result; rows whose meaning is
+conditional, deferred, context or selection-gate retain that meaning in the
+matrix. The scripted local provider yields no behavioral conclusion. Independent
+T018 review of this mapping is still required; this list is the traceability index:
+
+| Frozen section | Mandatory IDs — reconciled at gate level above |
 | --- | --- |
 | §0 | R0002, R0003, R0004, R0005, R0006, R0007, R0008, R0009, R0010, R0012, R0013, R0014, R0015, R0016, R0017, R0018, R0019, R0020, R0021 |
 | §1 | R0022, R0023, R0024, R0025, R0026, R0027, R0028, R0029, R0030, R0031, R0032, R0033, R0034, R0035, R0036, R0037, R0038, R0039, R0040 |
@@ -274,7 +332,7 @@ Choose an accepted source/image/rule/budget version before starting a batch;
 rollback selects that complete retained version for a future batch. Never change
 grants, quota, parsers, source pins or prompts mid-run to rescue an outcome.
 Retain aborted episodes and their evidence. No main merge, push or deployment
-is authorized by this draft.
+is authorized by this document.
 
 After security/checkpoint acceptance and independent T018 review, separately
 validate appearance separation, provider semantics and held-out diagnostics, then

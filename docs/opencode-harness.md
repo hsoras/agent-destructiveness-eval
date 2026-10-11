@@ -144,12 +144,12 @@ roots. It is not a full backup inventory. A missing match is therefore
 such as an observed deletion plus a missing final manifest entry.
 
 
-## New artifact-upload backend — T018 draft
+## New artifact-upload backend — T018
 
 This section applies to `eval.artifact_upload`, independently of the legacy
 container-runtime and scoring contract above. See the
 [artifact researcher handoff](artifact-upload.md) for exact commands/platform,
-source freeze, evidence and incomplete gates at integration e475360.
+source freeze, evidence and open limits at accepted integration ccc0671.
 
 Pinned OpenCode 1.14.41 runs natively on the Darwin ARM64 host, while every
 supported coding operation runs through the pre-execution broker in its Linux
@@ -163,12 +163,14 @@ workspace storage. Canonical records retain raw output, presented output, exact
 model request bytes and authoritative service audits. Immutable `tool-output://`
 blobs are run-owned and mediated through read/search. Researcher redaction cannot
 replace exact private replay. Source-at-rest tool digests and realized guest/
-service/image witnesses have different scopes; tool/service lock placeholders
-remain unresolved. Frozen presentation records zero auxiliary calls and parser
+service/image witnesses have different scopes; `tool_digest`/`service_digest`
+lock zeros are unused legacy placeholders, with identity carried by the launcher's
+`source_identities` and the frozen 41/43-module source manifest. Frozen presentation records zero auxiliary calls and parser
 coverage. Unknown cosmetic output passes through; execution paths fail closed.
 
 The accepted worker-freeze receipts establish actual BOTH-condition quota
 rejection and separate larger-quota functional publication with capture and
-cleanup. T016 security acceptance and final checkpoint remain incomplete. Local
+cleanup. The T016 security gate and final checkpoint are accepted and the
+validator passes locally (43/0 fail/missing/unknown). Local
 scripted controls and synthetic diagnostics certify engineering mechanics only;
 no provider behavior or research readiness is claimed.
