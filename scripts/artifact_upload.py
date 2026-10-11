@@ -29,10 +29,21 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def tree_digest(folder, suffixes):
-    """Worker-style tree algorithm (GuestWorker.digest): sha256 over sorted '<name>\\0<sha256 digest bytes>' of direct files."""
+# Exactly the files Dockerfile.worker COPYs into /opt/worker/sandbox/artifact_upload/worker/ (the guest-installed set that
+# the in-guest GuestWorker.digest hashes); a test asserts this against the Dockerfile COPY line.
+DEPLOYED_WORKER_FILES = ('__init__.py', 'core.py', 'guest_session.py', 'tools.py')
+
+
+def tree_digest(folder, suffixes, names=None):
+    """Worker-style tree algorithm (GuestWorker.digest): sha256 over sorted '<name>\\0<sha256 digest bytes>' of direct files.
+    `names` restricts to an explicit file set (missing one raises: fail closed)."""
     h = hashlib.sha256()
-    files = sorted(p for p in Path(folder).glob('*') if p.is_file() and p.suffix in suffixes)
+    if names is not None:
+        files = sorted(Path(folder) / n for n in names)
+        if not all(p.is_file() for p in files):
+            raise ValueError('required frozen source evidence unavailable: ' + str(folder))
+    else:
+        files = sorted(p for p in Path(folder).glob('*') if p.is_file() and p.suffix in suffixes)
     if not files:
         raise ValueError('required frozen source evidence unavailable: ' + str(folder))
     for p in files:
@@ -46,8 +57,9 @@ def source_identities(root=None):
     root = Path(root or ROOT)
     service = {n: sha(root / 'sandbox/artifact_upload' / n) for n in ('service.py', 'storage.py')}
     return {
-        'worker_source': {'algorithm': 'worker-tree-sha256.v1: sha256 over sorted "<name>\\0<sha256 digest>" of worker/*.py (GuestWorker.digest)',
-                          'scope': 'sandbox/artifact_upload/worker/*.py', 'digest': tree_digest(root / 'sandbox/artifact_upload/worker', {'.py'}),
+        'worker_source': {'algorithm': 'worker-tree-sha256.v1: sha256 over sorted "<name>\\0<sha256 digest>" of the guest-installed worker files (GuestWorker.digest in the image)',
+                          'scope': 'deployed worker files per Dockerfile.worker COPY: ' + ' '.join(DEPLOYED_WORKER_FILES),
+                          'digest': tree_digest(root / 'sandbox/artifact_upload/worker', {'.py'}, DEPLOYED_WORKER_FILES),
                           'realized': 'guest-reported worker_digest in recorded raw_outputs results'},
         'tool_source': {'algorithm': 'worker-tree-sha256.v1 (same algorithm, different scope)',
                         'scope': 'runtime/artifact_upload_host/router/*.ts', 'digest': tree_digest(root / 'runtime/artifact_upload_host/router', {'.ts'}),

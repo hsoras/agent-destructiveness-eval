@@ -273,13 +273,41 @@ def test_late_faults_count_as_infrastructure_failure_while_normal_and_early_stay
     assert sum(g['primary_all_assigned']['outcomes']['unauthorized_attempt']['true'] for g in r['conditions'].values()) == 2
 
 
-def test_source_identities_name_algorithms_and_match_native_worker_digest():
-    from sandbox.artifact_upload.worker.core import GuestWorker
+def test_source_identities_name_algorithms_and_cover_deployed_worker_scope():
+    import hashlib, re
     ident = make_plan()['source_identities']
-    assert ident['worker_source']['digest'] == GuestWorker.digest.fget(None)
+    # the explicit deployed set equals the Dockerfile.worker COPY install set (not the 7 host files)
+    df = (launcher.ROOT / 'sandbox/artifact_upload/Dockerfile.worker').read_text()
+    copied = re.search(r'COPY ((?:sandbox/artifact_upload/worker/\S+ )+)/opt/worker/sandbox/artifact_upload/worker/', df).group(1).split()
+    assert sorted(Path(c).name for c in copied) == sorted(launcher.DEPLOYED_WORKER_FILES)
+    h = hashlib.sha256()
+    for n in sorted(launcher.DEPLOYED_WORKER_FILES):
+        h.update(n.encode() + b'\0' + hashlib.sha256((launcher.ROOT / 'sandbox/artifact_upload/worker' / n).read_bytes()).digest())
+    assert ident['worker_source']['digest'] == h.hexdigest()
+    host_only = {'fixture_runner.py', 'native_cases.py', 'native_fixture.py'}
+    assert host_only.isdisjoint(launcher.DEPLOYED_WORKER_FILES) and all(n in ident['worker_source']['scope'] for n in launcher.DEPLOYED_WORKER_FILES)
     assert all(v['algorithm'] and v['scope'] for v in ident.values())
     assert ident['common_image']['id'].startswith('sha256:') and ident['tool_source']['digest'] != ident['worker_source']['digest']
     assert not any(set(v.get('files', {}).values()) & {'0' * 64} for v in ident.values())
+
+
+SAVED_REALIZED_WORKER = '08f8350672543345e9f13459f2d1be25ede50db62c5ab765a76a9e6daa16a2a2'  # full the guest-reported digest saved in genuine T012 native receipts
+
+
+def test_saved_genuine_worker_receipt_matches_frozen_deployed_digest():
+    ident = make_plan()['source_identities']
+    assert ident['worker_source']['digest'] == SAVED_REALIZED_WORKER
+
+
+def test_classify_source_provenance_no_mismatch_for_genuine_current_source(tmp_path):
+    frozen = make_plan()
+    ident = frozen['source_identities']
+    for n in range(2):  # positive controls: genuine current-source guest digest, service files and image
+        a = {'episode_id': 'e%d' % n}
+        result = realized_run(tmp_path, a, ident)
+        out = launcher.classify_source_provenance(frozen, result, tmp_path / a['episode_id'])
+        assert out['source_provenance']['mismatches'] == [] and not out.get('infrastructure_failure')
+        assert out['outcomes'] == result['outcomes']
 
 
 def test_tampered_source_fails_before_dispatch_and_unavailable_source_fails_closed(tmp_path, monkeypatch):
