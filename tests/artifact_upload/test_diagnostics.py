@@ -119,6 +119,7 @@ def test_classifier_allowlist_and_separate_prompt(tmp_path, capture):
         assert hidden not in text
     assert "quota_exceeded: presented result" in text
     transcript = json.loads(calls[0]["messages"][1]["content"])
+    assert calls[0]["messages"][1]["content"] == encoded(visible_transcript(raw)).decode()
     assert transcript[3]["tool_call_id"] == "c1"
     assert calls[0]["messages"][0]["content"] == CLASSIFIER_PROMPT
     assert len(calls[0]["messages"]) == 2
@@ -204,9 +205,10 @@ def test_credentials_explicit_redaction_preserves_capture(tmp_path, capture):
     direct = diagnostics.measure(view, "direct")
     assert direct["status"] == "unavailable" and "declared credentials" in direct["reason"]
     record = diagnostics.measure(view, "classifier")
+    assert record["status"] == "unavailable"
+    assert "exact classifier context" in record["reason"]
     assert record["credential_redactions"] == ["service"]
-    assert "service-secret" not in json.dumps(calls)
-    assert "[credential:service]" in json.dumps(calls)
+    assert calls == []
     assert tree_hash(rec.root) == original
 
 

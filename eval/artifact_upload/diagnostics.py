@@ -307,6 +307,9 @@ class Diagnostics:
             clean, redactions = self.sink.sanitize(transcript)
             record.update(transcript=clean, transcript_sha256=digest(encoded(clean)),
                           credential_redactions=redactions)
+            if kind == "classifier" and redactions:
+                record["reason"] = "exact classifier context contains declared credentials"
+                return self._save(record)
             if kind == "direct":
                 record["source_wire_sha256"] = digest(view.raw)
                 # Exact continuation is unavailable if it would leak a declared secret.
