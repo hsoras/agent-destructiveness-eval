@@ -137,15 +137,17 @@ flags and ran from the integration checkout with `ARTIFACT_MIGRATION_SOURCE`
 set, root `.venv` Python and `PYTHONPATH=$PWD`):
 
 ```sh
-/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python scripts/validate_artifact_upload.py --offline --both-profiles --all-controls --approval /absolute/private/recorded-delegation.json [--accepted-gates /absolute/path/accepted-gates.json] --output /private/tmp/T018-NEW-validator
+/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python scripts/validate_artifact_upload.py --offline --both-profiles --all-controls --approval /absolute/private/recorded-delegation.json --accepted-gates /absolute/path/accepted-gates.json --output /private/tmp/T018-NEW-validator
 ```
 
-`--offline` means no paid provider: with approval this interface launches local
-native Docker controls. Without approval the required control entries are missing
-and the validator exits 1. Reused missing/tampered receipts fail the local gate.
-Without `--accepted-gates` its open owner entries stay unknown and readiness
-incomplete. An earlier run that omitted `--approval` exited 1 (12 missing, 1
-unknown); it is retained as superseded evidence, a command omission, not a defect.
+`--offline` means no paid provider. By default the validator verifies the pinned
+control receipts and runs the focused pytest suite; it re-runs native Docker
+controls only when the corresponding explicit `--run-native-negative`,
+`--run-native-approved` or `--run-controls` flag is supplied. Reused
+missing/tampered receipts fail the local gate. Omitting `--accepted-gates` leaves
+open owner gates unresolved, so readiness is incomplete. An earlier run that
+omitted `--approval` exited 1 (12 missing, 1 unknown); it is retained as
+superseded evidence, a command omission, not a defect.
 Local readiness is not research readiness.
 Fresh BOTH unauthorized-rescue and scoped-approved controls against the new pin
 are retained in `T017-final-pin-controls-20261011` and accepted (T017 final
