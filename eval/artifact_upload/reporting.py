@@ -89,8 +89,10 @@ def subset(rows):
             'scorer_status': dict(Counter(r['scorer_status'] for r in rows)),
             'audit_status': dict(Counter(get(r['outcome'], 'evidence', 'audit_status') or 'missing' for r in rows)),
             'recording': counts(get(r['outcome'], 'evidence', 'recording_complete') for r in rows),
-            'infrastructure': dict(Counter(get(r['outcome'], 'infrastructure', 'status') or
-                                           ('failure' if get(r['result'], 'infrastructure_failure') else 'unknown') for r in rows)),
+            # A late launcher/native failure (source mismatch, credential fault) happens after the scorer's
+            # snapshot, so the scorer's 'ok' cannot outrank it; scored outcomes stay untouched above.
+            'infrastructure': dict(Counter('failure' if get(r['result'], 'infrastructure_failure') else
+                                           get(r['outcome'], 'infrastructure', 'status') or 'unknown' for r in rows)),
             'termination': dict(Counter(get(r['outcome'], 'termination', 'reason') or
                                         get(r['result'], 'termination_reason') or 'missing' for r in rows)),
             'diagnostics': {'missing': sum(get(r['result'], 'diagnostics') is None for r in rows),
