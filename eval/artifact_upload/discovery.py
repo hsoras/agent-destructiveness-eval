@@ -8,7 +8,7 @@ existing ProviderGuard with tools disabled; development receipts use RunRecorder
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import http.client
 import json
@@ -128,6 +128,17 @@ class Reply:
     input_tokens: int
     output_tokens: int
     cost_usd: float
+    usage: dict | None = field(default=None, compare=False)  # raw provider usage object (JSON-able), for the audit trail
+    request_bytes: int = field(default=0, compare=False)  # size of the full request body sent
+
+
+class AuxiliaryError(ValueError):
+    """A provider answered 200 but the reply is unusable (e.g. null content from a reasoning model that
+    spent max_tokens thinking). When the usage was parseable the charge is known (``cost_usd``) and the
+    failure is not a transport failure, so it must not halt the budget."""
+    def __init__(self, message, *, usage=None, cost_usd=None, request_bytes=0):
+        super().__init__(message)
+        self.usage, self.cost_usd, self.request_bytes = usage, cost_usd, request_bytes
 
 
 class AuxiliaryClient:
@@ -197,10 +208,28 @@ class AuxiliaryClient:
                     raise ValueError("auxiliary response too large")
                 chunks.append(chunk)
             data = _object(b"".join(chunks).decode())
-            usage = data["usage"]
-            inp, out = usage["prompt_tokens"], usage["completion_tokens"]
-            return Reply(data["choices"][0]["message"]["content"], inp, out,
-                         inp * self.input_price + out * self.output_price)
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if not isinstance(usage, dict):
+                raise ValueError("auxiliary response lacks usage")
+            inp, out = usage.get("prompt_tokens"), usage.get("completion_tokens")
+            if type(inp) is int and type(out) is int and inp >= 0 and out >= 0:
+                # Tokens x the route's fixed prices; OpenRouter's usage.cost is informational only.
+                cost = inp * self.input_price + out * self.output_price
+            elif type(usage.get("cost")) in (int, float) and math.isfinite(usage["cost"]) and usage["cost"] >= 0:
+                inp, out, cost = 0, 0, float(usage["cost"])
+            else:
+                raise ValueError("auxiliary response lacks usage")
+            safe_usage = {k: v for k, v in usage.items() if type(v) in (int, float, str, bool, type(None))}
+            try:
+                choice = data["choices"][0]
+                content, finish = choice["message"].get("content"), choice.get("finish_reason")
+            except (KeyError, IndexError, TypeError, AttributeError):
+                raise AuxiliaryError("auxiliary reply has no choices[0].message", usage=safe_usage, cost_usd=cost,
+                                     request_bytes=len(raw)) from None
+            if not isinstance(content, str) or not content.strip():
+                raise AuxiliaryError("auxiliary reply content empty (finish_reason=%s, completion_tokens=%s)" % (finish, out),
+                                     usage=safe_usage, cost_usd=cost, request_bytes=len(raw))
+            return Reply(content, inp, out, cost, safe_usage, len(raw))
         finally:
             if timer is not None:
                 timer.cancel()
@@ -300,7 +329,7 @@ class DevelopmentDiscovery:
             raise ValueError("development budget exhausted")
         self._calls += 1
         self._reserved += cap  # failed/unknown calls retain the full reservation
-        started, reply, status = time.monotonic(), None, "failed"
+        started, reply, status, failure = time.monotonic(), None, "failed", None
         try:
             client = self.proposer if role == "proposer" else self.reviewer
             reply = client.complete(deepcopy(payload), seconds=self.budget.seconds,
@@ -319,11 +348,18 @@ class DevelopmentDiscovery:
                 raise ValueError("auxiliary response exceeds bounds or lacks usage")
             status = "completed"
             return _object(reply.output)
-        except Exception:
-            # An unknown charge or transport failure cannot trigger retries.
-            if reply is None:
+        except Exception as exc:
+            # An unknown charge or transport failure cannot trigger retries; an unusable reply with
+            # known usage is a bad answer, not a transport failure: account its cost and carry on.
+            known = getattr(exc, "cost_usd", None) if isinstance(exc, AuxiliaryError) else None
+            if known is not None and reply is None:
+                self._actual += known
+                failure = {"error": type(exc).__name__ + ": " + str(exc)[:200], "usage": exc.usage,
+                           "cost_usd": known, "request_bytes": exc.request_bytes}
+            elif reply is None:
                 self._halted = True
                 self._unaccounted += 1
+                failure = {"error": type(exc).__name__ + ": " + str(exc)[:200]}
             raise
         finally:
             receipt = None
@@ -332,7 +368,8 @@ class DevelopmentDiscovery:
                            for key, value in reply.__dict__.items()}
             self.recorder.append("diagnostics", {"kind": "development_auxiliary_call", "transaction_id": transaction,
                 "role": role, "status": status, "seconds": time.monotonic() - started,
-                "request_digest": argument_digest(payload), "reply": receipt,
+                "request_digest": argument_digest(payload), "reply": receipt, "failure": failure,
+                "payload_bytes": len(json.dumps(payload, default=str).encode()),
                 **self.usage()})
 
     def _proposal(self, value, packet):

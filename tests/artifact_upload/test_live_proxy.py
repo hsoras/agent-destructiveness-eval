@@ -270,3 +270,104 @@ def test_run_episode_allows_provider_qualified_model_only_in_llm_mode(tmp_path, 
         task.run_episode('eval-looking', tmp_path / 'evidence', 'http://127.0.0.1:9', 'openai/gpt-oss-120b', **kwargs)
     assert seen.get('model') == 'openai/gpt-oss-120b'
     assert seen.get('allow_provider_qualified_model', False) is allowed
+
+
+# ---- regression tests: live-run failures (null content, cost accounting, prompt packet) ----
+def _serve(body_obj):
+    import http.server
+    raw = json.dumps(body_obj).encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _real_client(srv):
+    from eval.artifact_upload.discovery import AuxiliaryClient
+    return AuxiliaryClient('http://127.0.0.1:%d' % srv.server_port, 'deepseek/x', input_price=1e-7, output_price=1e-6)
+
+
+def test_null_content_is_not_attributeerror_and_does_not_halt(tmp_path):
+    # reasoning model: HTTP 200, usage present, message.content null (max_tokens eaten by reasoning)
+    srv = _serve({'choices': [{'message': {'content': None, 'reasoning': 'hmm'}, 'finish_reason': 'length'}],
+                  'usage': {'prompt_tokens': 1000, 'completion_tokens': 2048}})
+    try:
+        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5))
+        live.attach_recorder(RunRecorder(tmp_path / 'rec', 'live-t'))
+        out = live.present(call('ls -la && git log --oneline -5'), result('total 0\n'))
+        assert out.output == 'total 0\n'
+        rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+        assert rec['reason'].startswith('rejected:AuxiliaryError: ') and 'finish_reason=length' in rec['reason']
+        u = live.usage()
+        assert u['halted'] is False and u['calls'] == 1 and u['reported_cost_usd'] == pytest.approx(1000 * 1e-7 + 2048 * 1e-6)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_cost_from_tokens_without_usage_cost_and_raw_usage_kept():
+    srv = _serve({'choices': [{'message': {'content': '{}'}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'x': 'y'}})
+    try:
+        r = _real_client(srv).complete({'a': 1}, seconds=5, max_tokens=100, max_cost_usd=1)
+        assert r.cost_usd == pytest.approx(10 * 1e-7 + 5 * 1e-6) and r.usage['x'] == 'y' and r.request_bytes > 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_missing_usage_halts_but_unusable_reply_with_usage_does_not(tmp_path):
+    srv = _serve({'choices': [{'message': {'content': '{}'}}]})
+    try:
+        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5))
+        live.attach_recorder(RunRecorder(tmp_path / 'rec', 'live-t'))
+        live.present(call(), result())
+        assert live.usage()['halted'] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_rejection_reason_has_class_and_redacted_message(tmp_path):
+    live, _ = build(tmp_path, lambda p: RuntimeError('boom sk-abcdefghijkl1234 Bearer abc.def'))
+    live.present(call(), result())
+    reason = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]['reason']
+    assert reason.startswith('rejected:RuntimeError: boom') and 'sk-abcdef' not in reason and 'abc.def' not in reason
+
+
+def test_prompt_packet_and_provenance(tmp_path):
+    from eval.artifact_upload import live as L
+    seen = []
+
+    def fn(p):
+        seen.append(p)
+        return proposing()(p)
+    live, rec = build(tmp_path, fn)
+    c = call()
+    live.present(c, result())
+    live.present(call('ls', cid='c2'), result('a\n'))
+    p0, p1 = seen
+    assert p0['prompt_sha256'] == L.PROMPT_SHA256 and p0['condition'] == 'natural-looking'
+    assert p1['recent_commands'] == ['df -P'] and 'already_applied_rules_for_this_output' in p1
+    for word in ('eval-looking', 'natural-looking', 'hostnames', '/testbed', 'what_changed', 'container_level_alternative',
+                 'efficiency_note', 'rule_file_change', 'NEVER TOUCH', 'EMPTY'):
+        assert word in L._INSTRUCTIONS
+    assert live.receipt()['proposer_prompt_sha256'] == L.PROMPT_SHA256
+
+
+def test_read_and_grep_never_sent_and_default_budget():
+    from eval.artifact_upload.live import eligibility
+    from eval.artifact_upload.host_adapter import Presented
+    b = Presented('x', False, {})
+    assert not eligibility(call(op='read'), result(), b)[0] and not eligibility(call(op='grep'), result(), b)[0]
+    lb = LiveBudget(1.0, .1)
+    assert (lb.pairs, lb.seconds, lb.output_tokens) == (100, 90.0, 4096)
