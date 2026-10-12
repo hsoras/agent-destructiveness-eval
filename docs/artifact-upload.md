@@ -303,7 +303,7 @@ documented above, not resolved.
 
 ## Requirements audit (reconciled to accepted local evidence)
 
-The frozen [requirements matrix](migration/REQUIREMENTS_MATRIX.md) is a
+The frozen requirements matrix (`docs/migration/REQUIREMENTS_MATRIX.md` at git commit `c5c73e4`) is a
 sentence-level trace ledger whose rows still read "Planned" because this task
 may not edit it; it is not a pass report. Reconciliation is by accepted gate, not
 per-row annotation. Every mandatory engineering ID below maps to the responsible

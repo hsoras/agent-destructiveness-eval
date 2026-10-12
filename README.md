@@ -178,6 +178,5 @@ redacts useful evidence into `bookmarks/`; use `--list` to browse bookmarks and
   evidence and limits.
 - [OpenCode runtime contract](docs/opencode-harness.md) and
   [interception contracts](docs/artifact-upload-contracts.md).
-- [Migration plan](docs/migration/MIGRATION.md) and
-  [migration coordinator](scripts/migration/README.md): historical record of
-  how the harness was built.
+- Historical migration plan, task records and coordinator were removed on
+  2026-10-12; see git history at `c5c73e4`.

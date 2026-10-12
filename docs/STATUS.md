@@ -35,8 +35,5 @@ history.
   native commands, evidence, limits, rollback and the requirement audit.
 - [Live proxy](live-proxy.md): live-preview proxy modes, rule files, outputs and
   limits. Preview output is never measured.
-- [Migration plan](migration/MIGRATION.md): historical 18-task plan, waves and
-  review gates.
-- [Migration task table](migration/STATUS.md): historical per-task record.
-- [Migration coordinator](../scripts/migration/README.md): historical
-  orchestration tooling.
+- Historical migration plan, task table and coordinator were removed on
+  2026-10-12; see git history at `c5c73e4` (`docs/migration/`, `scripts/migration/`).
