@@ -35,7 +35,8 @@ def main() -> int:
             if key:
                 credentials[kind + "-provider"] = key
             routes[kind] = Route(model=route["model"], version=route["version"], base_url=route["base_url"],
-                                 options_json=json.dumps(route.get("options", {})), api_key=key)
+                                 options_json=json.dumps(route.get("options", {})),
+                                 provider_options=route.get("provider_options"), api_key=key)
         else:
             routes[kind] = None
     # Declare capture credentials by environment variable name, never put secrets in the manifest.

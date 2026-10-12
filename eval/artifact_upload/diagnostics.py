@@ -133,6 +133,8 @@ class Route:
     version: str
     base_url: str
     options_json: str = "{}"
+    # Extra request-body fields (e.g. {"provider": {"zdr": true}}) merged into diagnostic requests only.
+    provider_options: dict | None = None
     api_key: str = field(default="", repr=False, compare=False)
 
     def validate(self) -> dict[str, Any]:
@@ -144,6 +146,9 @@ class Route:
         options = json.loads(self.options_json)
         if not isinstance(options, dict) or set(options) & CONTINUATION_FIELDS:
             raise ValueError("invalid route options")
+        if self.provider_options is not None and (
+                not isinstance(self.provider_options, dict) or set(self.provider_options) & CONTINUATION_FIELDS):
+            raise ValueError("invalid route provider options")
         return options
 
 
@@ -368,8 +373,8 @@ class Diagnostics:
             else:
                 messages = [{"role": "system", "content": prompt},
                             {"role": "user", "content": encoded(clean).decode()}]
-            request = {**options, "model": route.model, "messages": messages, "tools": [],
-                       "tool_choice": "none", "stream": False, "max_tokens": budget.output_tokens}
+            request = {**options, **(route.provider_options or {}), "model": route.model, "messages": messages,
+                       "tools": [], "tool_choice": "none", "stream": False, "max_tokens": budget.output_tokens}
             request_raw = encoded(request)
             record.update(request=request, request_sha256=digest(request_raw))
             if len(request_raw) > budget.request_bytes or self.used[kind] >= budget.calls:

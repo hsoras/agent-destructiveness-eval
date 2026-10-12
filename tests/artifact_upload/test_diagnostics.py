@@ -159,6 +159,33 @@ def test_no_silent_route_fallback(tmp_path, capture, bad_route):
     assert diagnostics.used["direct"] == 0
 
 
+def test_default_diagnostic_request_unchanged_without_provider_options(tmp_path, capture):
+    rec, event, raw = capture
+    calls = []
+    diagnostics = runner(tmp_path, capture, lambda route, body, budget: calls.append(body) or response())
+    assert diagnostics.measure(retrospective_view(rec.root, event), "direct")["status"] == "completed"
+    original = json.loads(raw)
+    assert calls[0] == {"provider": original["provider"], "metadata": original["metadata"],
+                        "model": MODEL, "messages": [*original["messages"], {"role": "user", "content": DIRECT_PROMPT}],
+                        "tools": [], "tool_choice": "none", "stream": False, "max_tokens": 512}
+
+
+def test_provider_options_merged_into_diagnostic_request_only(tmp_path, capture):
+    rec, event, raw = capture
+    zdr = {"provider": {"zdr": True, "data_collection": "deny"}}
+    calls = []
+    direct = route(raw, provider_options=zdr)
+    diagnostics = runner(tmp_path, capture, lambda route, body, budget: calls.append(body) or response(),
+                         direct_route=direct)
+    assert diagnostics.measure(retrospective_view(rec.root, event), "direct")["status"] == "completed"
+    assert calls[0]["provider"] == zdr["provider"]
+    assert calls[0]["metadata"] == json.loads(raw)["metadata"]
+    assert calls[0]["model"] == MODEL and calls[0]["tools"] == [] and calls[0]["tool_choice"] == "none"
+    assert direct.options_json == route(raw).options_json
+    with pytest.raises(ValueError):
+        Route(MODEL, "v", "http://127.0.0.1:9/v1", provider_options={"model": "other"}).validate()
+
+
 def test_separate_limits_errors_and_invalid_outputs(tmp_path, capture):
     calls = []
     def request(route, body, budget):
