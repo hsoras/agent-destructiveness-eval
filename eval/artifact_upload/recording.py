@@ -409,7 +409,8 @@ class RecordingOpenCodeAdapter(HostOpenCodeAdapter):
         super().stage_runtime()
         self.guard.close()
         self.guard = RecordingProviderGuard(self.base_url, self.audit_request, recorder=self.recorder,
-                                           max_request_bytes=self.max_request_bytes).start()
+                                           max_request_bytes=self.max_request_bytes, zdr=self.zdr,
+                                           provider_pin=self.provider_pin).start()
         self._write_opencode_config(self.config_dir, self.guard.url, router=True)
 
     def run_turn(self, prompt: str, **kwargs: Any) -> Any:
