@@ -147,12 +147,13 @@ class AuxiliaryClient:
     No tools, streaming, automatic retries, or target context are sent.
     Local acceptance substitutes mocked replies instead of calling providers.
     """
-    def __init__(self, upstream, model, *, input_price, output_price, api_key=None, provider_options=None):
+    def __init__(self, upstream, model, *, input_price, output_price, api_key=None, provider_options=None, provider_pin=None):
         if not model or any(not math.isfinite(x) or x < 0 for x in (input_price, output_price)):
             raise ValueError("model and nonnegative per-token prices required")
         self.upstream, self.model, self.api_key = upstream, model, api_key
         self.input_price, self.output_price = input_price, output_price
         self.provider_options = provider_options
+        self.provider_pin = provider_pin
 
     def complete(self, payload, *, seconds, max_tokens, max_cost_usd):
         prompt = json.dumps(payload, sort_keys=True, ensure_ascii=True)
@@ -166,7 +167,8 @@ class AuxiliaryClient:
         raw = json.dumps(body).encode()
         def audit(actual):
             return [] if actual == body else [{"reason": "unexpected auxiliary request"}]
-        guard = ProviderGuard(self.upstream, audit, max_request_bytes=len(raw), upstream_timeout=seconds).start()
+        guard = ProviderGuard(self.upstream, audit, max_request_bytes=len(raw), upstream_timeout=seconds,
+                              provider_pin=self.provider_pin).start()
         connection = http.client.HTTPConnection("127.0.0.1", guard._server.server_port, timeout=seconds)
         started = time.monotonic()
         timer = None

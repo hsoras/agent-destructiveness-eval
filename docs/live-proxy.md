@@ -97,12 +97,21 @@ Real runs used this shape (paths are placeholders):
 python3 scripts/artifact_upload.py run --mode develop --proxy-mode llm \
   --label live-preview --instance project/artifact-upload/instance.lock.json \
   --model deepseek/deepseek-v4.1-flash --provider https://openrouter.ai/api \
+  --openrouter-provider inference-net/fp4 \
   --budget <policy.json> --proxy-routes <routes.json> --proxy-budget <proxy-budget.json> \
   --guest-image-id sha256:<64 hex> --zdr --reviewer off --condition both \
   --output <run-dir>
 ```
 
 - `<policy.json>`: `output_tokens` 32000, `microusd_per_token` 2, warmup
+
+OpenRouter requests use ZDR by default and require an explicit provider pin on
+every run (`--openrouter-provider TAG`, repeatable). Auxiliary route JSON may
+include `provider_pin` as a tag or ordered list; OpenRouter auxiliary routes
+must provide it. Diagnostics manifests use `route.provider_pin`. Recommended
+low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
+and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
+explicitly opts out of both ZDR and the pin requirement.
   `tokens` 25000000, plus the other stage allowances.
 - `<proxy-budget.json>`: `{"cost_usd": 0.9, "max_call_cost_usd": 0.04,
   "pairs": 40, "seconds": 90, "output_tokens": 8192}`.

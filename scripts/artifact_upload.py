@@ -370,7 +370,10 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
     return results
 
 
-ROUTE_FIELDS = {'upstream', 'model', 'input_price', 'output_price', 'api_key_env'}
+ROUTE_FIELDS = {'upstream', 'model', 'input_price', 'output_price', 'api_key_env', 'provider_pin'}
+
+def valid_route_fields(route):
+    return isinstance(route, dict) and (set(route) == ROUTE_FIELDS or set(route) == ROUTE_FIELDS - {'provider_pin'})
 
 
 def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False):
@@ -392,14 +395,16 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
         if role == 'reviewer' and not reviewer:
             continue
         route = routes[role]
-        if set(route) != ROUTE_FIELDS:
+        if not valid_route_fields(route):
             raise ValueError('invalid %s proxy route' % role)
+        if is_openrouter(route['upstream']) and route.get('provider_pin') is None:
+            raise ValueError('OpenRouter proxy route requires provider_pin')
         key = os.environ.get(route['api_key_env'])
         if not key:
             raise ValueError('proxy route credential environment variable is not set')
         clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
                                         output_price=route['output_price'], api_key=key,
-                                        provider_options=None)
+                                        provider_options=None, provider_pin=route.get('provider_pin'))
     live_budget = LiveBudget(**live_budget)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -411,7 +416,8 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
         result = run_episode(assignment['condition'], output / assignment['episode_id'], frozen['provider'], frozen['model'],
             provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
             live={**clients, 'budget': live_budget}, rules_out=rules_out,
-            guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True))
+            guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True),
+            provider_pin=args.openrouter_provider)
         results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
         (output / 'results.json').write_text(json.dumps(results, indent=2))
     return results
@@ -425,13 +431,16 @@ def develop_clients(routes, environ=None):
         raise ValueError('develop requires explicit separate proposer and reviewer routes')
     clients = {}
     for role, route in routes.items():
-        if not isinstance(route, dict) or set(route) != ROUTE_FIELDS or not route['upstream'] or not route['model']:
+        if not valid_route_fields(route) or not route['upstream'] or not route['model']:
             raise ValueError('develop route %s must set exactly: %s' % (role, ', '.join(sorted(ROUTE_FIELDS))))
+        if is_openrouter(route['upstream']) and route.get('provider_pin') is None:
+            raise ValueError('OpenRouter proxy route requires provider_pin')
         key = environ.get(route['api_key_env'])
         if not key:
             raise ValueError('develop route %s: credential environment variable is not set' % role)
         clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
-                                        output_price=route['output_price'], api_key=key)
+                                        output_price=route['output_price'], api_key=key,
+                                        provider_pin=route.get('provider_pin'))
     return clients
 
 
@@ -526,6 +535,8 @@ def main():
     parser.add_argument('--budget', type=Path, help='JSON containing the native Policy fields')
     parser.add_argument('--model')
     parser.add_argument('--provider', help='Explicit provider base URL; never discovered')
+    parser.add_argument('--openrouter-provider', action='append', dest='openrouter_provider',
+                        help='Pinned OpenRouter provider tag; repeat to allow an ordered set')
     parser.add_argument('--label', choices=('local-acceptance', 'paid-pilot', 'held-out', 'live-preview'))
     parser.add_argument('--output', type=Path)
     parser.add_argument('--evidence', type=Path, help='develop: directory of captured recorder runs (canonical-private/raw_outputs.jsonl)')
@@ -559,8 +570,12 @@ def main():
             # Validate credentials and route shape before any target or auxiliary request.
             for role in (('proposer', 'reviewer') if args.reviewer == 'on' else ('proposer',)):
                 route = routes.get(role) if isinstance(routes, dict) else None
-                if not isinstance(route, dict) or set(route) != ROUTE_FIELDS or not os.environ.get(route.get('api_key_env', '')):
+                if not valid_route_fields(route) or not os.environ.get(route.get('api_key_env', '')):
                     raise ValueError('llm mode requires valid %s proxy route and configured key' % role)
+                if is_openrouter(route['upstream']) and route.get('provider_pin') is None:
+                    raise ValueError('OpenRouter proxy route requires provider_pin')
+            if is_openrouter(args.provider or '') and args.zdr is not False and not args.openrouter_provider:
+                raise ValueError('OpenRouter ZDR requires --openrouter-provider')
         frozen['component_commands'] = {
             'prepare': [sys.executable, str(ROOT / 'scripts/prepare_artifact_upload.py'), 'prepare', '<fresh-destination>'],
             'control': [sys.executable, str(ROOT / 'scripts/artifact_upload_controls.py'), '--instance', str(args.instance), '--output', '<fresh-output>', '--approval', '<explicit-private-control-authorization>'],

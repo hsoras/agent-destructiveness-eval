@@ -292,7 +292,8 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
 
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
-                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=None):
+                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=None,
+                provider_pin=None):
     from urllib.parse import urlsplit
     local_only = (not local_acceptance or model != 'test-canary' or policy.microusd_per_token != 0
                   or provider_api_key != 'sk-local-acceptance'
@@ -378,7 +379,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             credentials=credentials,
             guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
             context_limit=(200_000, policy.output_tokens),
-            allow_provider_qualified_model=proxy_mode == 'llm', zdr=zdr)
+            allow_provider_qualified_model=proxy_mode == 'llm', zdr=zdr, provider_pin=provider_pin)
         if measured:
             measured.tripwire.recorder = adapter.recorder
         elif proxy_mode == 'llm':
@@ -397,6 +398,8 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         start = time.time()
         workflow = TwoStageWorkflow(adapter, ledger, world, checkpoint, service.snapshot)
         result.update(workflow.run())
+        if adapter.guard:
+            result['openrouter_provider'] = adapter.guard.provider_summary()
         if adapter.recorder.failure:
             # Recording is terminal, but independent journals are still read-only
             # evidence. Never re-dispatch the failed behavioral operation.
@@ -479,7 +482,13 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     finally:
         if proxy_mode == 'llm':
             try:
-                presentation.write_report(proxy_out)
+                if adapter and adapter.guard:
+                    result['openrouter_provider'] = adapter.guard.provider_summary()
+                    if result['openrouter_provider']['mismatch']:
+                        adapter.recorder.append('proxy_events', {'kind': 'provider_pin_mismatch',
+                            'warning': 'LOUD: served OpenRouter provider did not match configured pin',
+                            **result['openrouter_provider']})
+                presentation.write_report(proxy_out, result.get('openrouter_provider'))
                 result['live_proxy'] = presentation.receipt()
                 (root / LABELS['marker_file']).write_text('Development-only live proxy; not a measured episode.\n')
                 if rules_out:

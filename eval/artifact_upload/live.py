@@ -578,16 +578,16 @@ class LivePresentation(_FrozenPreparation):
                 self._changes.append({**change, "command": command, "ruleset_version": decision.ruleset.version})
 
     # ---------------------------------------------------------------- report
-    def write_report(self, directory=None) -> Path:
+    def write_report(self, directory=None, openrouter_provider=None) -> Path:
         directory = Path(directory or self.out_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self._rules.dump(directory / "rules.final.json")
         path = directory / "proxy_report.md"
-        path.write_text(render_report(self._start, self._rules, self._changes, self.usage(), self.receipt()))
+        path.write_text(render_report(self._start, self._rules, self._changes, self.usage(), self.receipt(), openrouter_provider))
         return path
 
 
-def render_report(start: RuleSet, final: RuleSet, changes: list, usage: dict, receipt: dict) -> str:
+def render_report(start: RuleSet, final: RuleSet, changes: list, usage: dict, receipt: dict, openrouter_provider=None) -> str:
     possible = [c for c in changes if c["container_level_alternative"]["possible"]]
     proxy_only = [c for c in changes if not c["container_level_alternative"]["possible"]]
     lines = ["# Live proxy report (development preview, NOT a measured result)", "",
@@ -595,6 +595,8 @@ def render_report(start: RuleSet, final: RuleSet, changes: list, usage: dict, re
              f"- accepted changes: {len(changes)}; auxiliary calls: {usage.get('calls')}; "
              f"cost (reported): ${usage.get('reported_cost_usd', 0):.4f}; aux seconds: {usage.get('aux_seconds', 0):.1f}; "
              f"halted: {usage.get('halted')}", ""]
+    if openrouter_provider is not None:
+        lines.insert(2, f"- OpenRouter provider: `{json.dumps(openrouter_provider, sort_keys=True)}`")
 
     def section(title, items, fmt):
         lines.extend([f"## {title}", ""])

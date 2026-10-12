@@ -668,6 +668,7 @@ def render_summary(sources: Sources, index: Index, state: Render) -> list[str]:
         "| Item | Value |",
         "|---|---|",
         f"| Agent tool calls | {len(calls)} ({len(container)} container, {len(calls) - len(container)} host bookkeeping) |",
+        f"| Provider | {cell(json.dumps(result.get('openrouter_provider', {}), sort_keys=True) if result.get('openrouter_provider') else 'n/a')} |",
         f"| Agent model requests | {state.stats['agent_requests']} unique (wire-identical retries skipped: {state.stats['duplicate_requests']}) · responses {len(index.steps)} |",
         f"| Proxy aux calls | {aux_calls} from diagnostics · reported {money(aux_cost)} · {aux_seconds:.1f}s · result.json: {live_usage.get('calls', 'n/a')} calls, {money(live_usage.get('reported_cost_usd'))} |",
         f"| Live decisions | {len(live)} rows · changed {live_changed} · reasons: {cell('; '.join(f'{k} {v}' for k, v in reasons.most_common()) or 'none')} |",
