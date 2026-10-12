@@ -1,5 +1,7 @@
 # Migration supervisor notes
 
+> Current T3 workflow and model/usage policy: read the root `BOSS_PROMPT.md`. This file retains historical Python-coordinator guidance; its routing and execution instructions do not override the current prompt. Use targeted historical evidence only.
+
 2026-10-09 resumed takeover. Read prior notes and replaced them as requested. Infrastructure 0d421fd is present on migration/new-spec. State/Git agree: T001 and T003 integrated; T002 rejected candidate 56b8bfa7, attempt/review 5, clean retained worktree. Integration HEAD 69f54c7. Consolidated final brief and all referenced scratch inputs are accessible. Lock available and escalated process inspection found no active coordinator or workers.
 
 Optimization observations:
