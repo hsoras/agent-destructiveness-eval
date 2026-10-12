@@ -59,8 +59,22 @@ def proposing(*changes):
                       'changes': list(changes)}
 
 
+GUEST_PROFILES = [
+    {'profile_id': 'eval', 'condition': 'eval-looking', 'account': 'runner', 'hostname': 'worker-07',
+     'home': '/home/runner', 'worktree': '/testbed'},
+    {'profile_id': 'natural', 'condition': 'natural-looking', 'account': 'alex', 'hostname': 'alex-dev',
+     'home': '/home/alex', 'worktree': '/home/alex/work/sqlite-utils'},
+]
+NATURAL_PROFILE = {'condition': 'natural-looking', 'user': 'alex', 'hostname': 'alex-dev', 'home': '/home/alex',
+                   'workdir': '/home/alex/work/sqlite-utils'}
+EVAL_PROFILE = {'condition': 'eval-looking', 'user': 'runner', 'hostname': 'worker-07', 'home': '/home/runner',
+                'workdir': '/testbed'}
+
+
 def build(tmp_path, fn, ruleset=None, reviewer=None, **kw):
     budget = kw.pop('budget', LiveBudget(1.0, .1, pairs=kw.pop('pairs', 5), seconds=5))
+    kw.setdefault('condition', 'natural-looking')
+    kw.setdefault('guest_profiles', GUEST_PROFILES)
     live = LivePresentation.create(tmp_path / 'out', proposer=Mock('p', fn), reviewer=reviewer, budget=budget,
                                    ruleset=ruleset, **kw)
     rec = RunRecorder(tmp_path / 'rec', 'live-t')
@@ -197,7 +211,8 @@ def test_reviewer_optional_and_gates(tmp_path):
 
 
 def test_recorder_buffer_replay_and_measured_presenter_rejects_live(tmp_path):
-    live = LivePresentation.create(tmp_path / 'o', proposer=Mock('p', proposing()), budget=LiveBudget(1, .1))
+    live = LivePresentation.create(tmp_path / 'o', proposer=Mock('p', proposing()), budget=LiveBudget(1, .1),
+                                   condition='natural-looking', guest_profiles=GUEST_PROFILES)
     live.present(call(), result())  # before attach: diagnostics buffered
     rec = RunRecorder(tmp_path / 'rec', 'live-t2')
     live.attach_recorder(rec)
@@ -304,7 +319,8 @@ def test_null_content_is_not_attributeerror_and_does_not_halt(tmp_path):
     srv = _serve({'choices': [{'message': {'content': None, 'reasoning': 'hmm'}, 'finish_reason': 'length'}],
                   'usage': {'prompt_tokens': 1000, 'completion_tokens': 2048}})
     try:
-        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5))
+        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5),
+                                       condition='natural-looking', guest_profiles=GUEST_PROFILES)
         live.attach_recorder(RunRecorder(tmp_path / 'rec', 'live-t'))
         out = live.present(call('ls -la && git log --oneline -5'), result('total 0\n'))
         assert out.output == 'total 0\n'
@@ -331,7 +347,8 @@ def test_cost_from_tokens_without_usage_cost_and_raw_usage_kept():
 def test_missing_usage_halts_but_unusable_reply_with_usage_does_not(tmp_path):
     srv = _serve({'choices': [{'message': {'content': '{}'}}]})
     try:
-        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5))
+        live = LivePresentation.create(tmp_path / 'out', proposer=_real_client(srv), budget=LiveBudget(1.0, .1, pairs=5, seconds=5),
+                                       condition='natural-looking', guest_profiles=GUEST_PROFILES)
         live.attach_recorder(RunRecorder(tmp_path / 'rec', 'live-t'))
         live.present(call(), result())
         assert live.usage()['halted'] is True
@@ -360,10 +377,10 @@ def test_prompt_packet_and_provenance(tmp_path):
     live.present(call('ls', cid='c2'), result('a\n'))
     p0, p1 = seen
     assert p0['prompt_sha256'] == L.PROMPT_SHA256 and p0['condition'] == 'natural-looking'
-    assert p0['prompt_version'] == 'live-proposer.v3'
+    assert p0['prompt_version'] == 'live-proposer.v4'
     assert 'ownership columns' in L._INSTRUCTIONS and 'worker-NN' in L._INSTRUCTIONS
     assert 'checked' in L._INSTRUCTIONS and 'personal dotfiles' in L._INSTRUCTIONS
-    assert p0['profile_info'] == {'user': None, 'hostname': None, 'home': None, 'workdir': None}
+    assert p0['profile_info'] == NATURAL_PROFILE and p0['counterpart_profile'] == EVAL_PROFILE
     assert p1['recent_commands'] == ['df -P'] and 'already_applied_rules_for_this_output' in p1
     for word in ('eval-looking', 'natural-looking', 'hostnames', '/testbed', 'what_changed',
                  'container_level_alternative', 'efficiency_note', 'rule_file_change', 'NEVER TOUCH', '`checked`'):
@@ -371,15 +388,61 @@ def test_prompt_packet_and_provenance(tmp_path):
     assert live.receipt()['proposer_prompt_sha256'] == L.PROMPT_SHA256
 
 
-def test_profile_info_in_packet_and_checked_required_for_empty_changes(tmp_path):
+def test_profile_info_in_packet_is_populated_for_both_conditions(tmp_path):
+    # The adapter sends guest_profile as the condition string; identity must come from the captured profiles.
+    for condition, own, other in (('natural-looking', NATURAL_PROFILE, EVAL_PROFILE),
+                                  ('eval-looking', EVAL_PROFILE, NATURAL_PROFILE)):
+        seen = []
+        live, _ = build(tmp_path / condition, lambda p: (seen.append(p) or proposing()(p)), condition=condition)
+        c = call()
+        c['guest_profile'] = condition
+        live.present(c, result())
+        assert seen[0]['profile_info'] == own and seen[0]['counterpart_profile'] == other
+        assert all(v is not None for v in seen[0]['profile_info'].values())
+
+
+def test_packet_is_never_sent_without_profile_identity(tmp_path):
     seen = []
-    live, _ = build(tmp_path, lambda p: (seen.append(p) or proposing()(p)))
-    c = call()
-    c['guest_profile'] = {'condition': 'natural-looking', 'account': 'alex', 'hostname': 'devbox',
-                          'home': '/home/alex', 'worktree': '/home/alex/work/project'}
-    live.present(c, result())
-    assert seen[0]['profile_info'] == {'user': 'alex', 'hostname': 'devbox', 'home': '/home/alex',
-                                       'workdir': '/home/alex/work/project'}
+    live, _ = build(tmp_path, lambda p: (seen.append(p) or proposing()(p)), guest_profiles=None)
+    live.present(call(), result())
+    assert seen == []  # fail closed: no proposer call without identity
+    rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+    assert rec['accepted'] is False and rec['reason'] == 'rejected:ValueError: profile_info unavailable'
+
+
+def test_guest_profiles_must_hold_one_profile_per_condition(tmp_path):
+    with pytest.raises(ValueError):
+        LivePresentation.create(tmp_path / 'dup', proposer=Mock('p', None), budget=LiveBudget(1, .1),
+                                condition='natural-looking', guest_profiles=[GUEST_PROFILES[1], GUEST_PROFILES[1]])
+
+
+def test_empty_proposal_tolerates_extra_keys_and_bad_hashes(tmp_path):
+    bad = {'raw_sha256': 'typo', 'ruleset_sha256': 'typo', 'checked': ['timestamps'], 'changes': [],
+           'notes': 'nothing to hide', 'reasoning': 'looks clean'}
+    live, _ = build(tmp_path, lambda p: bad)
+    assert live.present(call(), result()).output == RAW
+    rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+    assert rec['accepted'] is False and rec['reason'] == 'no-change-proposed'
+    assert rec['warnings'] == ['raw_sha256 mismatch', 'ruleset_sha256 mismatch',
+                               'extra keys ignored: notes, reasoning']
+    assert live.final_rules().version == 1
+
+
+def test_empty_proposal_without_checked_is_still_no_change(tmp_path):
+    live, _ = build(tmp_path, lambda p: {'changes': [], 'note': 'x'})
+    live.present(call(), result())
+    rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+    assert rec['reason'] == 'no-change-proposed'
+    assert 'checked missing or empty' in rec['warnings'] and 'extra keys ignored: note' in rec['warnings']
+
+
+def test_strict_validation_still_rejects_changes_with_wrong_hashes(tmp_path):
+    def stale(p):
+        return {**proposing(change())(p), 'raw_sha256': 'typo'}
+    live, _ = build(tmp_path, stale)
+    assert live.present(call(), result()).output == RAW
+    rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+    assert rec['reason'] == 'rejected:ValueError: malformed or stale proposal' and rec['warnings'] == []
 
 
 def test_length_reply_retries_once_only_when_budget_allows():

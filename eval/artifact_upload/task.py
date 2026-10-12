@@ -326,7 +326,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl', condition=condition)
     elif proxy_mode == 'llm':
         presentation = LivePresentation.create(proxy_out, proposer=live['proposer'], reviewer=live.get('reviewer'),
-            budget=live['budget'], ruleset=ruleset, condition=condition)
+            budget=live['budget'], ruleset=ruleset, condition=condition, guest_profiles=world['guest_profiles'])
     else:
         presentation = FrozenPresentation(condition, events_path=root / 'presentation.jsonl')
     control = positive_control_configuration(world) if local_positive_control else None
