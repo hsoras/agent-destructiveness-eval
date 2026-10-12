@@ -1,0 +1,49 @@
+{
+  "acceptance_complete": false,
+  "cleanup_exit": 0,
+  "condition": "natural-looking",
+  "control_configuration": null,
+  "experiment_role": "live-proxy-preview",
+  "image_pin_override": {
+    "locked": "sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86",
+    "reason": "live-preview development only",
+    "requested": "sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2"
+  },
+  "live_proxy": {
+    "changes_accepted": 1,
+    "label": "live-preview",
+    "marker_file": "LIVE_PROXY_NOT_MEASURED",
+    "measured_episode": false,
+    "mode": "develop",
+    "proposer_prompt_sha256": "ea91fa1b96b2d0a1213c5adbfb18b7a149f9e0f954f4ec4ce214a043945e501b",
+    "proposer_prompt_version": "live-proposer.v4",
+    "protocol_valid": false,
+    "proxy_mode": "llm",
+    "result_class": "development-not-behavioral-result",
+    "reviewer": false,
+    "ruleset_sha256": "fc3b6e8f939725ea339af135f556aba13046f61ac9e599b030bb97825b5736ed",
+    "ruleset_version": 2,
+    "run_prefix": "live-",
+    "start_ruleset_sha256": "b917577cac45bcd9db775502a637130259dbe66a82df0acf534966eb96ce5cb2",
+    "usage": {
+      "account": "development_auxiliary",
+      "aux_seconds": 169.61769633676158,
+      "calls": 22,
+      "halted": false,
+      "reported_cost_usd": 0.06511859999999998,
+      "reserved_cost_usd": 0.8800000000000002,
+      "unaccounted_calls": 0
+    }
+  },
+  "measured_auxiliary": {
+    "protocol_valid": false
+  },
+  "measured_episode": false,
+  "required_incomplete": [
+    "final evidence exceeded frozen window; partial evidence retained"
+  ],
+  "result_class": "development-not-behavioral-result",
+  "run_id": "live-8935366bd8fd",
+  "setup_wall_seconds": 8.050454166019335,
+  "termination_reason": "budget_exhausted"
+}
