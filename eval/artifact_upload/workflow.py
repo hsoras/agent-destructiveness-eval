@@ -215,11 +215,14 @@ def visible_verification(turn):
 
 
 class TwoStageWorkflow:
-    def __init__(self, adapter, ledger, world, checkpoint, snapshot):
+    def __init__(self, adapter, ledger, world, checkpoint, snapshot, scenario='bug-and-dilemma'):
+        if scenario not in ('bug-and-dilemma', 'dilemma-only'):
+            raise ValueError('unsupported scenario')
+        self.scenario = scenario
         self.adapter, self.ledger, self.world = adapter, ledger, world
         self.checkpoint, self.snapshot = checkpoint, snapshot
         self.ledger.after_capture = self.after_capture
-        self.result = {'upload_reached': False, 'warmup': None, 'termination_reason': None,
+        self.result = {'scenario': scenario, 'upload_reached': False, 'warmup': None, 'termination_reason': None,
                        'approval_requests': [], 'turns': [], 'checkpoints': {}}
 
     def after_capture(self, captured):
@@ -251,48 +254,60 @@ class TwoStageWorkflow:
         self.result['checkpoints'][name] = value
         self.adapter.recorder.append('workflow_events', {'kind': 'checkpoint', 'name': name, **value})
 
+    def run_bug_and_dilemma(self):
+        rec = self.adapter.recorder
+        self.ledger.enter('warmup')
+        repair = self.adapter.run_turn(self.world['task_prompts']['repair'],
+                                      timeout=self.ledger.snapshot()['remaining']['warmup']['wall_seconds'])
+        self.result['turns'].append({'stage': 'warmup', 'session_id': repair.session_id, 'usage': repair.usage})
+        self.ledger.check()
+        self.ledger.enter('overhead')
+        if repair.exit_code or repair.errors or not repair.session_id:
+            self.result['termination_reason'] = 'infrastructure_failure'
+        elif awaiting_user(repair):
+            self.result['approval_requests'].append({'stage': 'warmup', 'text': final_text(repair)})
+            self.result['termination_reason'] = 'awaiting_user'
+        elif not visible_verification(repair):
+            self.result['warmup'] = {'passed': None, 'reason': 'observable verification trigger missing'}
+            self.result['termination_reason'] = 'warmup_failure'
+        else:
+            self.result['warmup'] = self.checkpoint()
+            rec.append('workflow_events', {'kind': 'protected_repair_check', **self.result['warmup']})
+            self.ledger.check()
+            if self.result['warmup'].get('passed') is not True:
+                self.result['termination_reason'] = ('infrastructure_failure'
+                    if self.result['warmup'].get('passed') is None else 'warmup_failure')
+            else:
+                self.mark('warmup_before_upload')
+                self.run_upload(repair.session_id)
+
+    def run_upload(self, session_id):
+        if session_id is None:
+            self.result['warmup'] = {'skipped': True}
+        self.ledger.enter('upload')
+        self.result['upload_reached'] = True
+        upload = self.adapter.run_turn(self.world['task_prompts']['upload'], session_id=session_id,
+                                      timeout=self.ledger.snapshot()['remaining']['upload']['wall_seconds'])
+        self.result['turns'].append({'stage': 'upload', 'session_id': upload.session_id, 'usage': upload.usage})
+        if (session_id is not None and upload.session_id != session_id) or upload.exit_code or upload.errors or not upload.session_id:
+            self.result['termination_reason'] = 'infrastructure_failure'
+        elif awaiting_user(upload):
+            self.result['approval_requests'].append({'stage': 'upload', 'text': final_text(upload)})
+            self.result['termination_reason'] = 'awaiting_user'
+        else:
+            self.result['termination_reason'] = 'normal_completion'
+        self.ledger.check()
+        self.ledger.enter('overhead')
+
     def run(self):
         rec = self.adapter.recorder
         try:
             rec.append('run_state', {'world': self.world, 'policy': self.ledger.policy.manifest()})
             self.adapter.stage_runtime()
-            self.ledger.enter('warmup')
-            repair = self.adapter.run_turn(self.world['task_prompts']['repair'],
-                                          timeout=self.ledger.snapshot()['remaining']['warmup']['wall_seconds'])
-            self.result['turns'].append({'stage': 'warmup', 'session_id': repair.session_id, 'usage': repair.usage})
-            self.ledger.check()
-            self.ledger.enter('overhead')
-            if repair.exit_code or repair.errors or not repair.session_id:
-                self.result['termination_reason'] = 'infrastructure_failure'
-            elif awaiting_user(repair):
-                self.result['approval_requests'].append({'stage': 'warmup', 'text': final_text(repair)})
-                self.result['termination_reason'] = 'awaiting_user'
-            elif not visible_verification(repair):
-                self.result['warmup'] = {'passed': None, 'reason': 'observable verification trigger missing'}
-                self.result['termination_reason'] = 'warmup_failure'
+            if self.scenario == 'dilemma-only':
+                self.run_upload(None)
             else:
-                self.result['warmup'] = self.checkpoint()
-                rec.append('workflow_events', {'kind': 'protected_repair_check', **self.result['warmup']})
-                self.ledger.check()
-                if self.result['warmup'].get('passed') is not True:
-                    self.result['termination_reason'] = ('infrastructure_failure'
-                        if self.result['warmup'].get('passed') is None else 'warmup_failure')
-                else:
-                    self.mark('warmup_before_upload')
-                    self.ledger.enter('upload')
-                    self.result['upload_reached'] = True
-                    upload = self.adapter.run_turn(self.world['task_prompts']['upload'], session_id=repair.session_id,
-                                                  timeout=self.ledger.snapshot()['remaining']['upload']['wall_seconds'])
-                    self.result['turns'].append({'stage': 'upload', 'session_id': upload.session_id, 'usage': upload.usage})
-                    if upload.session_id != repair.session_id or upload.exit_code or upload.errors:
-                        self.result['termination_reason'] = 'infrastructure_failure'
-                    elif awaiting_user(upload):
-                        self.result['approval_requests'].append({'stage': 'upload', 'text': final_text(upload)})
-                        self.result['termination_reason'] = 'awaiting_user'
-                    else:
-                        self.result['termination_reason'] = 'normal_completion'
-                    self.ledger.check()
-                    self.ledger.enter('overhead')
+                self.run_bug_and_dilemma()
         except CaptureFailure:
             self.result['termination_reason'] = 'recording_failure'
         except (BudgetExhausted, subprocess.TimeoutExpired, TimeoutError):

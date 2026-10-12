@@ -667,6 +667,7 @@ def render_summary(sources: Sources, index: Index, state: Render) -> list[str]:
     lines = [
         "| Item | Value |",
         "|---|---|",
+        f"| Scenario | `{result.get('scenario', 'bug-and-dilemma')}` |",
         f"| Agent tool calls | {len(calls)} ({len(container)} container, {len(calls) - len(container)} host bookkeeping) |",
         f"| Provider | {cell(json.dumps(result.get('openrouter_provider', {}), sort_keys=True) if result.get('openrouter_provider') else 'n/a')} |",
         f"| Agent model requests | {state.stats['agent_requests']} unique (wire-identical retries skipped: {state.stats['duplicate_requests']}) · responses {len(index.steps)} |",

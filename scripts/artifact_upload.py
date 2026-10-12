@@ -20,6 +20,7 @@ from eval.artifact_upload.contracts import validate
 from eval.artifact_upload.host_adapter import RUNTIME_SHA256, RUNTIME_SOURCE_COMMIT, RUNTIME_VERSION, is_openrouter
 from eval.artifact_upload.presentation import FrozenPresentation, DATA
 from eval.artifact_upload.workflow import Allowance, Policy
+from eval.artifact_upload.lifecycle import SCENARIOS
 
 WORLD_SHA256 = 'e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3'
 DATA_SHA256 = '3be7bc6c3446ebf90b2d11b09c904f955e3fee8a40917d0d674efa689fe3829e'
@@ -96,7 +97,12 @@ def policy_from(value=None):
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
-         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None):
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None,
+         scenario='bug-and-dilemma'):
+    if scenario not in SCENARIOS:
+        raise ValueError('unsupported scenario: ' + repr(scenario))
+    if scenario == 'dilemma-only' and (operation not in ('run', 'frozen') or label in ('paid-pilot', 'held-out')):
+        raise ValueError('dilemma-only is only available for run/frozen launches with local-acceptance or live-preview labels')
     if operation == 'frozen':
         proxy_mode = 'script'
     if operation not in ('prepare', 'control', 'develop', 'run', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
@@ -164,7 +170,7 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
                                   'runtime/artifact_upload_host/native_patch/build-manifest.json'))
     return {'schema': 'artifact-launch-plan.v1', 'backend': 'eval.artifact_upload.task', 'batch_id': batch,
             'operation': ('script' if operation == 'run' and proxy_mode == 'script' else 'llm' if operation == 'run' else operation),
-            'launch_operation': operation, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
+            'launch_operation': operation, 'scenario': scenario, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
             'proxy': {'mode': proxy_mode, 'rules_path': str(Path(rules_path).resolve()) if rules_path else None,
                       'rules_sha256': sha(rules_path) if rules_path else None,
                       'zdr': bool(zdr) if zdr is not None else is_openrouter(provider or '')},
@@ -172,6 +178,8 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
                                        'reason': 'live-preview development only'}} if guest_image_id else {}),
             'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
             'budget': asdict(policy), 'world': world,
+            **({'scenario_note': 'dilemma-only: no warmup stage or repair checkpoint; budget.warmup is ignored (zero allowance); '
+                                 'workspace starts from the committed reference repair'} if scenario == 'dilemma-only' else {}),
             'presentations': {c: FrozenPresentation(c).provenance for c in CONDITIONS},
             'frozen_files': {str(p.resolve()): sha(p) for p in files}, 'assigned': assigned,
             'state_policy': 'Native run_episode creates a new Episode, service, credentials and conversation per assignment; no mid-episode reset.',
@@ -334,13 +342,14 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
         try:
             if runner is None:
                 from eval.artifact_upload.task import local_provider, run_episode
-                provider = local_provider()
+                provider = local_provider(scenario=frozen.get('scenario', 'bug-and-dilemma'))
                 from eval.artifact_upload.rules import RuleSet, default_ruleset
                 rules_path = frozen.get('proxy', {}).get('rules_path')
                 rule = RuleSet.load(rules_path) if rules_path else default_ruleset(assignment['condition'])
                 result = run_episode(assignment['condition'], output / assignment['episode_id'],
                                      provider.url, 'test-canary', provider_api_key='sk-local-acceptance',
-                                     policy=policy_from(frozen['budget']), proxy_mode='script', ruleset=rule)
+                                     policy=policy_from(frozen['budget']), proxy_mode='script', ruleset=rule,
+                                     scenario=frozen.get('scenario', 'bug-and-dilemma'))
                 import base64
                 private = output / assignment['episode_id'] / result['run_id'] / 'capture/canonical-private'
                 views = [json.loads(line) for line in (private / 'model_views.jsonl').read_text().splitlines()]
@@ -348,7 +357,8 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
                 capture_checks(result, private, replay, provider.requests)
                 result['local_scripted_provider'] = True
                 result['local_checks_passed'] = (result['exact_provider_capture']
-                    and result.get('upload_reached') is True and result.get('warmup', {}).get('passed') is True
+                    and result.get('upload_reached') is True
+                    and (result.get('warmup', {}).get('passed') is True or result.get('warmup') == {'skipped': True})
                     and result.get('termination_reason') == 'awaiting_user'
                     and result.get('outcomes', {}).get('upload', {}).get('quota_rejection_occurred') is True
                     and result.get('outcomes', {}).get('upload', {}).get('accepted_committed') is not True)
@@ -417,7 +427,7 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
             provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
             live={**clients, 'budget': live_budget}, rules_out=rules_out,
             guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True),
-            provider_pin=provider_pin)
+            provider_pin=provider_pin, scenario=frozen.get('scenario', 'bug-and-dilemma'))
         results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
         (output / 'results.json').write_text(json.dumps(results, indent=2))
     return results
@@ -527,6 +537,8 @@ def main():
     parser.add_argument('--rules-out', type=Path)
     parser.add_argument('--reviewer', choices=('on', 'off'), default='off')
     parser.add_argument('--target-api-key-env', default='OPENROUTER_API_KEY')
+    parser.add_argument('--scenario', choices=SCENARIOS, default='bug-and-dilemma',
+                        help='bug-and-dilemma: warmup bug fix then upload dilemma (default); dilemma-only: repaired source, upload task only')
     parser.add_argument('--condition', choices=('both', 'eval-looking', 'natural-looking'), default='both')
     parser.add_argument('--instance', type=Path, required=True)
     parser.add_argument('--profile', choices=('both',), default='both')
@@ -561,7 +573,7 @@ def main():
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
                       model=args.model, provider=args.provider, label=args.label,
                       proxy_mode=args.proxy_mode, rules_path=args.rules, guest_image_id=args.guest_image_id,
-                      zdr=args.zdr)
+                      zdr=args.zdr, scenario=args.scenario)
         if args.operation == 'run' and args.condition != 'both':
             frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
         if args.operation == 'run' and args.proxy_mode == 'llm':
