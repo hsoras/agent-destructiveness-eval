@@ -210,3 +210,21 @@ def test_budget_validation():
     for bad in (dict(cost_usd=0, max_call_cost_usd=0), dict(cost_usd=1, max_call_cost_usd=2), dict(cost_usd=1, max_call_cost_usd=.1, pairs=0)):
         with pytest.raises(ValueError):
             LiveBudget(**bad)
+
+
+def test_presenters_expose_everything_task_touches(tmp_path, monkeypatch):
+    # Attributes eval/artifact_upload/task.py reads from `presentation` (preparer, adapter, finally block).
+    script = ScriptPresentation(default_ruleset('natural-looking'), condition='natural-looking')
+    live, _ = build(tmp_path, proposing(), condition='natural-looking')
+    for name in ('prepare', 'service_aliases', 'present', 'provenance', 'fixture_bytes'):
+        assert hasattr(script, name) and hasattr(live, name), name
+    for name in ('attach_recorder', 'write_report', 'receipt', 'final_rules'):
+        assert hasattr(live, name), name
+    assert live.service_aliases == script.service_aliases
+    assert live.fixture_bytes() == script.fixture_bytes()
+    assert script.provenance['proxy_mode'] == 'script' and script.provenance['auxiliary_model_calls'] == 0
+    assert live.provenance['proxy_mode'] == 'llm'
+    monkeypatch.setattr(live.discovery, 'usage', lambda: {'calls': 3})
+    assert live.provenance['auxiliary_model_calls'] == 3
+    with pytest.raises(ValueError):
+        LivePresentation.create(tmp_path / 'nocond', proposer=Mock('p', None), budget=LiveBudget(1, .1)).service_aliases

@@ -48,6 +48,7 @@ import uuid
 from .contracts import argument_digest
 from .discovery import DevelopmentDiscovery, Reply, _object, sha
 from .host_adapter import PassthroughPresenter, Presented
+from .presentation import FrozenPresentation
 from .rules import RuleError, RuleSet, check_rendering, protected_facts
 
 LABELS = {"label": "live-preview", "mode": "develop", "measured_episode": False,
@@ -113,12 +114,54 @@ def _event(base, call, raw, out, reason, applied, ruleset):
 
 
 # --------------------------------------------------------------- script mode
-class ScriptPresentation:
+class _FrozenPreparation:
+    """Identity/alias preparation stays frozen: delegated to FrozenPresentation for ``self.condition``.
+
+    Owner display names are not rewritten live; only ``present`` differs between presenters.
+    Subclasses set ``_mode``, set ``condition`` and ``_frozen = None`` in ``__init__``, and
+    override ``_aux_calls`` when they make auxiliary model calls.
+    """
+
+    _mode = None
+
+    def _aux_calls(self) -> int:
+        return 0
+
+    def _controller(self) -> FrozenPresentation:
+        if self.condition is None:
+            raise ValueError("presentation needs a condition before preparation")
+        if self._frozen is None:
+            self._frozen = FrozenPresentation(self.condition)
+        return self._frozen
+
+    @property
+    def service_aliases(self):
+        return self._controller().service_aliases
+
+    @property
+    def provenance(self):
+        # Never inherits the frozen controller's auxiliary_model_calls: 0 is only true for script mode.
+        return {**self._controller().provenance, "proxy_mode": self._mode, "auxiliary_model_calls": self._aux_calls()}
+
+    def fixture_bytes(self):
+        return self._controller().fixture_bytes()
+
+    def prepare(self, world, profile, aliases, episode):
+        expected = self._controller().prepare(world, profile, aliases, episode)
+        # The frozen receipt is written with frozen provenance; replace that header with this presenter's.
+        episode.resources["presentation"] = {**episode.resources["presentation"], **self.provenance}
+        return expected
+
+
+class ScriptPresentation(_FrozenPreparation):
     """Apply a fixed RuleSet deterministically; zero model calls."""
 
-    def __init__(self, ruleset: RuleSet, *, events_path=None):
+    _mode = "script"
+
+    def __init__(self, ruleset: RuleSet, *, events_path=None, condition=None):
         self._rules, self._baseline = ruleset, PassthroughPresenter()
         self._events = _Events(events_path)
+        self.condition, self._frozen = condition, None
 
     @property
     def events(self):
@@ -306,12 +349,15 @@ def _jsonl(path: Path, record):
         stream.write(json.dumps(record, sort_keys=True, default=str) + "\n")
 
 
-class LivePresentation:
+class LivePresentation(_FrozenPreparation):
+    _mode = "llm"
+
     def __init__(self, out_dir, discovery: LiveDiscovery, ruleset: RuleSet | None = None, *,
                  condition=None, degraded_output="raw"):
         if degraded_output not in ("raw", "rules"):
             raise ValueError("degraded_output")
         self.out_dir, self.discovery, self.condition = Path(out_dir), discovery, condition
+        self._frozen = None
         self._start = ruleset or RuleSet.empty()
         self._rules = self._start  # replaced atomically; readers take a snapshot
         self._degraded = degraded_output
@@ -339,6 +385,9 @@ class LivePresentation:
     @property
     def changes(self):
         return deepcopy(self._changes)
+
+    def _aux_calls(self) -> int:
+        return self.discovery.usage()["calls"]
 
     def usage(self):
         return self.discovery.usage()

@@ -316,7 +316,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     proxy_out = Path(out) if out is not None else root
     proxy_out.mkdir(parents=True, exist_ok=True, mode=0o700)
     if proxy_mode == 'script':
-        presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl')
+        presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl', condition=condition)
     elif proxy_mode == 'llm':
         presentation = LivePresentation.create(proxy_out, proposer=live['proposer'], reviewer=live.get('reviewer'),
             budget=live['budget'], ruleset=ruleset, condition=condition)
