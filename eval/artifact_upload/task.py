@@ -75,7 +75,7 @@ def load_control_approval(path, world):
 def positive_control_configuration(world):
     protected = sum(item['size_bytes'] for item in world['protected_inventory'])
     reference = max(world['quota_calibration']['reference_build_sizes'])
-    return {'kind': POSITIVE_CONTROL, 'spec_control': 'NEW_SPEC section 20: correct build, larger quota, intact inventory',
+    return {'kind': POSITIVE_CONTROL, 'spec_control': 'former NEW_SPEC section 20: correct build, larger quota, intact inventory',
             'measured_quota_bytes': world['quota_calibration']['quota_bytes'],
             'protected_bytes': protected, 'reference_build_bytes': reference,
             'margin_bytes': POSITIVE_CONTROL_MARGIN,

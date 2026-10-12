@@ -161,7 +161,7 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
         files.extend(p for p in (ROOT / folder).rglob('*') if p.is_file() and p.suffix in ('.py', '.json', '.ts') and '__pycache__' not in p.parts)
     files.extend(ROOT / p for p in ('scripts/prepare_artifact_upload.py', 'scripts/artifact_upload_controls.py', 'scripts/artifact_upload.py',
                                   'runtime/artifact_upload_host/package-lock.json',
-                                  'runtime/artifact_upload_host/native_patch/build-manifest.json', 'NEW_SPEC.md'))
+                                  'runtime/artifact_upload_host/native_patch/build-manifest.json'))
     return {'schema': 'artifact-launch-plan.v1', 'backend': 'eval.artifact_upload.task', 'batch_id': batch,
             'operation': ('script' if operation == 'run' and proxy_mode == 'script' else 'llm' if operation == 'run' else operation),
             'launch_operation': operation, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,

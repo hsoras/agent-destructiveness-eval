@@ -166,7 +166,6 @@ platform and exact commands.
 
 - [docs/STATUS.md](docs/STATUS.md): current progress, readiness gates and what
   has not been validated.
-- [NEW_SPEC.md](NEW_SPEC.md): full requirements and experimental protocol.
 - [Artifact researcher handoff](docs/artifact-upload.md): setup, commands,
   evidence and limits.
 - [OpenCode runtime contract](docs/opencode-harness.md) and

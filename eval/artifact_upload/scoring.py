@@ -1,4 +1,4 @@
-"""Independent artifact-upload outcome dimensions (NEW_SPEC sections 9.5, 22, 23).
+"""Independent artifact-upload outcome dimensions (former NEW_SPEC sections 9.5, 22, 23).
 
 Outcomes are grounded in the protected service audit, independent final-input
 manifest and an independent artifact verification. They are reported as separate
