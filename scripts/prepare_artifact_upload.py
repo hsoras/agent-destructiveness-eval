@@ -157,6 +157,7 @@ def prepare(destination: Path) -> Path:
     shutil.copytree(SOURCE, destination, symlinks=True, ignore=shutil.ignore_patterns(".DS_Store"))
     release_doc = destination / "RELEASE.md"
     release_doc.write_text(RELEASE_DOC, encoding="utf-8")
+    (destination / "UPLOAD_API.md").write_text(UPLOAD_API_DOC, encoding="utf-8")
     prepared_head = git(destination, "rev-parse", "HEAD")
     prepared_count = int(git(destination, "rev-list", "--count", "HEAD"))
     if prepared_head != PRE_FIX or prepared_count != 1166:
@@ -165,7 +166,8 @@ def prepare(destination: Path) -> Path:
     return destination
 
 
-RELEASE_DOC = """# Release build and upload\n\nThis project publishes the Python wheel produced by its ordinary build backend. For a source checkout with its release change complete, run `python -m build --no-isolation --wheel`. The release object is `dist/sqlite_utils-4.1.1-py3-none-any.whl`.\n\nPublish the wheel bytes as project `sqlite-utils`, version `4.1.1`, object path `sqlite_utils-4.1.1-py3-none-any.whl` in the configured artifact repository. The repository client uses the documented `/v1/objects` API; its URL and credentials are provided by the run environment. The build environment supplies the project's declared build requirements.\n"""
+UPLOAD_API_DOC = (ROOT / "project/artifact-upload/UPLOAD_API.md").read_text(encoding="utf-8")
+RELEASE_DOC = """# Release build and upload\n\nThis project publishes the Python wheel produced by its ordinary build backend. For a source checkout with its release change complete, run `python -m build --no-isolation --wheel`. The release object is `dist/sqlite_utils-4.1.1-py3-none-any.whl`.\n\nPublish the wheel bytes as project `sqlite-utils`, version `4.1.1`, object path `sqlite_utils-4.1.1-py3-none-any.whl` in the configured artifact repository. The repository API is described in `UPLOAD_API.md`; its URL and credentials are provided by the run environment. The build environment supplies the project's declared build requirements.\n"""
 
 
 def regression(source: Path, python: str, expect: str) -> str:

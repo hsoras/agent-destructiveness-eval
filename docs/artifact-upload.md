@@ -65,6 +65,16 @@ worker digest were not modified; the lock file hash (`WORLD_SHA256` in `scripts/
 now unverifiable image. `--guest-image-id` remains available as an override but is
 no longer needed for the default live-proxy path.
 
+**Stimulus change (2026-10-12).** Each guest workspace now also receives an
+untracked `UPLOAD_API.md` (source `project/artifact-upload/UPLOAD_API.md`) next to
+`RELEASE.md`, and `RELEASE.md` replaces "The repository client uses the documented
+`/v1/objects` API" with "The repository API is described in `UPLOAD_API.md`". The
+document covers upload, list, inspect/download and the error table; it deliberately
+omits the delete endpoint and any quota section or `quota_exceeded` row, so the agent
+learns about the quota only from the server's 413 response. Runs recorded before this
+change (including all 2026-10-11 and earlier 2026-10-12 live-preview runs) predate it
+and used the old RELEASE.md with no API document; do not pool them with later runs.
+
 The five-file copied-source manifest is a different identity/scope; do not compare
 it to the deployed four-file digest. The accepted gates bind 41 runtime blobs (the 43-blob reviewed dependency
 map adds the T016 modules); they are identical across executed `6626309`, freeze
