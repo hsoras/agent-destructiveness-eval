@@ -95,10 +95,25 @@ def policy_from(value=None):
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
-         blocks=1, budget=None, model=None, provider=None, label='local-acceptance'):
-    if operation not in ('prepare', 'control', 'develop', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None):
+    if operation == 'frozen':
+        proxy_mode = 'script'
+    if operation not in ('prepare', 'control', 'develop', 'run', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
         raise ValueError('unsupported operation/mode')
-    if operation == 'frozen' and mode != 'frozen' or operation == 'develop' and mode != 'develop':
+    if operation == 'run':
+        requested_mode = mode
+        mode = 'develop' if proxy_mode == 'llm' else 'frozen'
+        if proxy_mode not in ('llm', 'script'):
+            raise ValueError('unsupported proxy mode')
+        if proxy_mode == 'llm' and (label != 'live-preview' or label in ('local-acceptance', 'paid-pilot', 'held-out')):
+            raise ValueError('llm proxy requires the development-only live-preview label')
+        if proxy_mode == 'llm' and (requested_mode != 'develop' or label != 'live-preview'):
+            raise ValueError('llm proxy requires live-preview label and develop mode')
+        if proxy_mode == 'llm' and (not model or not provider or policy_from(budget).microusd_per_token <= 0):
+            raise ValueError('llm proxy requires explicit target provider, model and positive cost bound')
+    if operation == 'frozen' and mode != 'frozen':
+        raise ValueError('operation/mode mismatch')
+    if operation == 'develop' and mode != 'develop':
         raise ValueError('operation/mode mismatch')
     if profile != 'both' or type(blocks) is not int or not 1 <= blocks <= 10000:
         raise ValueError('matched blocks require profile both and 1..10000 blocks')
@@ -119,13 +134,13 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
         if len({p[key] for p in profiles}) != 1:
             raise ValueError('unequal matched resources: ' + key)
     policy = policy_from(budget)
-    if label not in ('local-acceptance', 'paid-pilot', 'held-out'):
+    if label not in ('local-acceptance', 'paid-pilot', 'held-out', 'live-preview'):
         raise ValueError('unsupported assessment label')
-    if label != 'local-acceptance' and (not model or not provider or policy.microusd_per_token <= 0):
+    if label in ('paid-pilot', 'held-out') and (not model or not provider or policy.microusd_per_token <= 0):
         raise ValueError('measured runs require explicit provider, model and conservative cost bound')
     if label == 'local-acceptance' and (provider or model not in (None, 'test-canary') or policy.microusd_per_token):
         raise ValueError('local acceptance requires the scripted native provider and zero cost')
-    batch = 't015-' + uuid.uuid4().hex[:16]
+    batch = ('live-' if proxy_mode == 'llm' and operation == 'run' else 't015-') + uuid.uuid4().hex[:16]
     rng = random.Random(seed)
     assigned = []
     for block in range(blocks):
@@ -142,7 +157,10 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
                                   'runtime/artifact_upload_host/package-lock.json',
                                   'runtime/artifact_upload_host/native_patch/build-manifest.json', 'NEW_SPEC.md'))
     return {'schema': 'artifact-launch-plan.v1', 'backend': 'eval.artifact_upload.task', 'batch_id': batch,
-            'operation': operation, 'mode': mode, 'profile': profile, 'seed': seed, 'label': label,
+            'operation': ('script' if operation == 'run' and proxy_mode == 'script' else 'llm' if operation == 'run' else operation),
+            'launch_operation': operation, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
+            'proxy': {'mode': proxy_mode, 'rules_path': str(Path(rules_path).resolve()) if rules_path else None,
+                      'rules_sha256': sha(rules_path) if rules_path else None},
             'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
             'budget': asdict(policy), 'world': world,
             'presentations': {c: FrozenPresentation(c).provenance for c in CONDITIONS},
@@ -286,7 +304,7 @@ def capture_checks(result, private, replay, received):
 def execute(frozen, output, *, runner=None, verify_realized=None):
     """Fixture injection is for local tests; native execution always uses the existing task."""
     verify_plan(frozen)
-    if frozen['operation'] != 'frozen' or frozen['mode'] != 'frozen':
+    if frozen.get('launch_operation', frozen['operation']) not in ('frozen', 'run') or frozen['mode'] != 'frozen' or frozen.get('proxy', {}).get('mode', 'script') != 'script':
         raise ValueError('native task API only connects frozen episodes; use the prepare/control commands in the plan, or develop_offline for explicit offline development')
     if frozen['label'] != 'local-acceptance':
         raise ValueError('paid execution remains gated on resolved world pins, positive control and separate authorization')
@@ -308,9 +326,12 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
             if runner is None:
                 from eval.artifact_upload.task import local_provider, run_episode
                 provider = local_provider()
+                from eval.artifact_upload.rules import RuleSet, default_ruleset
+                rules_path = frozen.get('proxy', {}).get('rules_path')
+                rule = RuleSet.load(rules_path) if rules_path else default_ruleset(assignment['condition'])
                 result = run_episode(assignment['condition'], output / assignment['episode_id'],
                                      provider.url, 'test-canary', provider_api_key='sk-local-acceptance',
-                                     policy=policy_from(frozen['budget']))
+                                     policy=policy_from(frozen['budget']), proxy_mode='script', ruleset=rule)
                 import base64
                 private = output / assignment['episode_id'] / result['run_id'] / 'capture/canonical-private'
                 views = [json.loads(line) for line in (private / 'model_views.jsonl').read_text().splitlines()]
@@ -341,6 +362,48 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
 
 
 ROUTE_FIELDS = {'upstream', 'model', 'input_price', 'output_price', 'api_key_env'}
+
+
+def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False):
+    """Execute development-only live proxy episodes against the explicitly named target model."""
+    verify_plan(frozen)
+    if frozen.get('launch_operation', frozen['operation']) != 'run' or frozen['proxy']['mode'] != 'llm':
+        raise ValueError('run_live requires an llm run plan')
+    if not target_api_key:
+        raise ValueError('target API key environment variable is not set')
+    from eval.artifact_upload.discovery import AuxiliaryClient
+    from eval.artifact_upload.live import LiveBudget
+    from eval.artifact_upload.rules import RuleSet
+    if not routes or not isinstance(live_budget, dict):
+        raise ValueError('llm mode requires proxy routes and budget')
+    if 'proposer' not in routes or (reviewer and 'reviewer' not in routes):
+        raise ValueError('llm mode requires proposer route and reviewer route when enabled')
+    clients = {}
+    for role in ('proposer', 'reviewer'):
+        if role == 'reviewer' and not reviewer:
+            continue
+        route = routes[role]
+        if set(route) != ROUTE_FIELDS:
+            raise ValueError('invalid %s proxy route' % role)
+        key = os.environ.get(route['api_key_env'])
+        if not key:
+            raise ValueError('proxy route credential environment variable is not set')
+        clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
+                                        output_price=route['output_price'], api_key=key)
+    live_budget = LiveBudget(**live_budget)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    (output / 'manifest.json').write_text(json.dumps(frozen, indent=2))
+    results = []
+    for assignment in frozen['assigned']:
+        rules = RuleSet.load(frozen['proxy']['rules_path'], assignment['condition']) if frozen['proxy'].get('rules_path') else None
+        from eval.artifact_upload.task import run_episode
+        result = run_episode(assignment['condition'], output / assignment['episode_id'], frozen['provider'], frozen['model'],
+            provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
+            live={**clients, 'budget': live_budget}, rules_out=rules_out)
+        results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
+        (output / 'results.json').write_text(json.dumps(results, indent=2))
+    return results
 
 
 def develop_clients(routes, environ=None):
@@ -431,9 +494,17 @@ def develop_offline(frozen, captured, output, *, routes=None, budget=None, clien
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', nargs='?', choices=('prepare', 'control', 'develop', 'frozen'), default='frozen')
+    parser.add_argument('operation', nargs='?', choices=('prepare', 'control', 'develop', 'run', 'frozen'), default='frozen')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--mode', choices=('passthrough', 'develop', 'frozen'), default='frozen')
+    parser.add_argument('--proxy-mode', choices=('llm', 'script'), default='script')
+    parser.add_argument('--rules', type=Path)
+    parser.add_argument('--proxy-routes', type=Path)
+    parser.add_argument('--proxy-budget', type=Path)
+    parser.add_argument('--rules-out', type=Path)
+    parser.add_argument('--reviewer', choices=('on', 'off'), default='off')
+    parser.add_argument('--target-api-key-env', default='OPENROUTER_API_KEY')
+    parser.add_argument('--condition', choices=('both', 'eval-looking', 'natural-looking'), default='both')
     parser.add_argument('--instance', type=Path, required=True)
     parser.add_argument('--profile', choices=('both',), default='both')
     parser.add_argument('--seed', type=int, default=0)
@@ -441,7 +512,7 @@ def main():
     parser.add_argument('--budget', type=Path, help='JSON containing the native Policy fields')
     parser.add_argument('--model')
     parser.add_argument('--provider', help='Explicit provider base URL; never discovered')
-    parser.add_argument('--label', choices=('local-acceptance', 'paid-pilot', 'held-out'), default='local-acceptance')
+    parser.add_argument('--label', choices=('local-acceptance', 'paid-pilot', 'held-out', 'live-preview'))
     parser.add_argument('--output', type=Path)
     parser.add_argument('--evidence', type=Path, help='develop: directory of captured recorder runs (canonical-private/raw_outputs.jsonl)')
     parser.add_argument('--develop-routes', type=Path, help='develop: JSON {proposer,reviewer: upstream,model,input_price,output_price,api_key_env}')
@@ -449,9 +520,30 @@ def main():
     parser.add_argument('--approval', type=Path, help='Explicit private authorization for native controls')
     args = parser.parse_args()
     try:
+        if args.operation == 'run' and args.proxy_mode == 'llm':
+            if args.label in ('local-acceptance', 'paid-pilot', 'held-out'):
+                raise ValueError('llm proxy refuses measured labels; use live-preview')
+            args.mode, args.label = 'develop', 'live-preview'
+            if not args.proxy_routes or not args.proxy_budget:
+                raise ValueError('llm mode requires --proxy-routes and --proxy-budget')
+            if not os.environ.get(args.target_api_key_env):
+                raise ValueError('target API key environment variable is not set')
+        if args.label is None:
+            args.label = 'local-acceptance'
         frozen = plan(args.instance, operation=args.operation, mode=args.mode, profile=args.profile,
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
-                      model=args.model, provider=args.provider, label=args.label)
+                      model=args.model, provider=args.provider, label=args.label,
+                      proxy_mode=args.proxy_mode, rules_path=args.rules)
+        if args.operation == 'run' and args.condition != 'both':
+            frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
+        if args.operation == 'run' and args.proxy_mode == 'llm':
+            routes = json.loads(args.proxy_routes.read_text())
+            budget_value = json.loads(args.proxy_budget.read_text())
+            # Validate credentials and route shape before any target or auxiliary request.
+            for role in (('proposer', 'reviewer') if args.reviewer == 'on' else ('proposer',)):
+                route = routes.get(role) if isinstance(routes, dict) else None
+                if not isinstance(route, dict) or set(route) != ROUTE_FIELDS or not os.environ.get(route.get('api_key_env', '')):
+                    raise ValueError('llm mode requires valid %s proxy route and configured key' % role)
         frozen['component_commands'] = {
             'prepare': [sys.executable, str(ROOT / 'scripts/prepare_artifact_upload.py'), 'prepare', '<fresh-destination>'],
             'control': [sys.executable, str(ROOT / 'scripts/artifact_upload_controls.py'), '--instance', str(args.instance), '--output', '<fresh-output>', '--approval', '<explicit-private-control-authorization>'],
@@ -480,6 +572,26 @@ def main():
                                       budget=json.loads(args.develop_budget.read_text()))
             print(json.dumps(summary, indent=2))
             return 0
+        if args.operation == 'run' and args.proxy_mode == 'llm':
+            if args.dry_run:
+                print(json.dumps(frozen, indent=2))
+                return 0
+            if not args.output:
+                raise ValueError('execution requires a fresh --output directory')
+            results = run_live(frozen, args.output, routes=routes, live_budget=budget_value,
+                               target_api_key=os.environ.get(args.target_api_key_env), rules_out=args.rules_out,
+                               reviewer=args.reviewer == 'on')
+            return 0 if results else 1
+        if args.operation in ('run', 'frozen'):
+            if args.operation == 'run':
+                frozen['proxy']['mode'] = args.proxy_mode
+            if args.dry_run:
+                print(json.dumps(frozen, indent=2))
+                return 0
+            if not args.output:
+                raise ValueError('execution requires a fresh --output directory')
+            results = execute(frozen, args.output)
+            return 0 if all(r.get('local_checks_passed') is True for r in results) else 1
         results = execute(frozen, args.output)
         return 0 if all(r.get('local_checks_passed') is True for r in results) else 1
     except (ValueError, OSError) as exc:

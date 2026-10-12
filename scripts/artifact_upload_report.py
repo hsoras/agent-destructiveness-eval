@@ -16,7 +16,10 @@ def main():
     p.add_argument('--output', type=Path)
     args = p.parse_args()
     try:
-        result = report(json.loads(args.manifest.read_text()), json.loads(args.results.read_text()))
+        manifest = json.loads(args.manifest.read_text())
+        if manifest.get('proxy', {}).get('mode') == 'llm' or manifest.get('operation') not in ('frozen', 'script'):
+            raise ValueError('reporting accepts only frozen/script manifests')
+        result = report(manifest, json.loads(args.results.read_text()))
         text = json.dumps(result, indent=2, allow_nan=False) + '\n'
         if args.output:
             with args.output.open('x') as stream:

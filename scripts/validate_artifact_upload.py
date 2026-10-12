@@ -152,6 +152,8 @@ def accepted_gate_checks(input_path=None):
     input_path = Path(input_path)
     try:
         data = json.loads(input_path.read_text())
+        if data.get('proxy', {}).get('mode') == 'llm' or ('operation' in data and data.get('operation') not in ('frozen', 'script')):
+            raise ValueError('validation accepts only frozen/script manifests')
         if data.get('schema') != 'artifact-upload-accepted-gates.v1' or not isinstance(data.get('gates'), dict):
             raise ValueError('invalid accepted-gates schema')
         supplied = data['gates']

@@ -447,6 +447,70 @@ def test_develop_refuses_without_configuration_or_with_wrong_plan_and_never_call
     assert not clients['proposer'].calls and not clients['reviewer'].calls
 
 
+def test_live_proxy_plan_requires_development_label_and_records_rules_digest(tmp_path):
+    from dataclasses import asdict
+    from eval.artifact_upload.workflow import Policy
+    policy = asdict(Policy())
+    policy['microusd_per_token'] = 1
+    rules = tmp_path / 'rules.json'
+    rules.write_text('{}')
+    base = {'operation': 'run', 'mode': 'develop', 'proxy_mode': 'llm', 'label': 'live-preview',
+            'model': 'target-model', 'provider': 'https://openrouter.ai/api', 'budget': policy,
+            'rules_path': rules}
+    manifest = make_plan(**base)
+    assert manifest['proxy'] == {'mode': 'llm', 'rules_path': str(rules.resolve()),
+                                 'rules_sha256': launcher.sha(rules)}
+    assert manifest['batch_id'].startswith('live-')
+    for label in ('local-acceptance', 'paid-pilot', 'held-out'):
+        with pytest.raises(ValueError, match='live-preview'):
+            make_plan(**(base | {'label': label}))
+
+
+def test_live_proxy_cli_missing_routes_key_and_dry_run_are_network_free(tmp_path):
+    from dataclasses import asdict
+    from eval.artifact_upload.workflow import Policy
+    policy = asdict(Policy())
+    policy['microusd_per_token'] = 1
+    budget = tmp_path / 'native-budget.json'
+    budget.write_text(json.dumps(policy))
+    common = [sys.executable, str(launcher.ROOT / 'scripts/artifact_upload.py'), 'run', '--proxy-mode', 'llm',
+              '--instance', str(INSTANCE), '--model', 'target-model', '--provider', 'https://example.invalid',
+              '--budget', str(budget)]
+    target_env = {**__import__('os').environ, 'OPENROUTER_API_KEY': 'target', 'PROXY_KEY': 'proxy'}
+    missing_routes = subprocess.run(common, capture_output=True, text=True, env=target_env)
+    assert missing_routes.returncode == 2
+    assert not tmp_path.joinpath('output').exists()
+    routes = tmp_path / 'routes.json'
+    routes.write_text(json.dumps({'proposer': {'upstream': 'https://example.invalid', 'model': 'proxy',
+        'input_price': 0, 'output_price': 0, 'api_key_env': 'PROXY_KEY'}}))
+    budget_file = tmp_path / 'proxy-budget.json'
+    budget_file.write_text(json.dumps(BUDGET))
+    missing_budget = subprocess.run(common + ['--proxy-routes', str(routes)], capture_output=True, text=True,
+                                    env=target_env)
+    assert missing_budget.returncode == 2
+    no_target_key = subprocess.run(common + ['--proxy-routes', str(routes), '--proxy-budget', str(budget_file)],
+                                    capture_output=True, text=True,
+                                    env={**target_env, 'OPENROUTER_API_KEY': ''})
+    assert no_target_key.returncode == 2
+    no_proxy_key = subprocess.run(common + ['--proxy-routes', str(routes), '--proxy-budget', str(budget_file)],
+                                  capture_output=True, text=True,
+                                  env={**target_env, 'PROXY_KEY': ''})
+    assert no_proxy_key.returncode == 2
+    dry = subprocess.run(common + ['--proxy-routes', str(routes), '--proxy-budget', str(budget_file), '--dry-run'],
+                         capture_output=True, text=True, env={**__import__('os').environ,
+                                                              'OPENROUTER_API_KEY': 'target', 'PROXY_KEY': 'proxy'})
+    assert dry.returncode == 0, dry.stderr
+    assert not tmp_path.joinpath('output').exists()
+    assert json.loads(dry.stdout)['proxy']['mode'] == 'llm'
+
+
+def test_frozen_alias_remains_script_run_dry_run():
+    run = subprocess.run([sys.executable, str(launcher.ROOT / 'scripts/artifact_upload.py'), 'frozen', '--dry-run',
+                          '--instance', str(INSTANCE)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout)['proxy']['mode'] == 'script'
+
+
 def test_cli_develop_help_and_refusal_without_config(tmp_path):
     base = [sys.executable, str(launcher.ROOT / 'scripts/artifact_upload.py'), 'develop', '--mode', 'develop', '--instance', str(INSTANCE)]
     assert '--evidence' in subprocess.run(base + ['--help'], capture_output=True, text=True).stdout

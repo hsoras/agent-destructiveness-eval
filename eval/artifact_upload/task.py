@@ -288,7 +288,8 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
 
 
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
-                local_acceptance=False, local_positive_control=False, control_approval_path=None):
+                local_acceptance=False, local_positive_control=False, control_approval_path=None,
+                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None):
     from urllib.parse import urlsplit
     local_only = (not local_acceptance or model != 'test-canary' or policy.microusd_per_token != 0
                   or provider_api_key != 'sk-local-acceptance'
@@ -302,10 +303,25 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     # Frozen before any run directory or Episode exists; the approval is never offered to the agent.
     approved, approval_provenance = (load_control_approval(control_approval_path, world)
                                      if control_approval_path is not None else (frozenset(), None))
-    run_id = 't012-' + uuid.uuid4().hex[:12]
+    if proxy_mode not in ('frozen', 'script', 'llm'):
+        raise ValueError('unsupported proxy mode')
+    if proxy_mode == 'llm' and (not isinstance(live, dict) or not live.get('proposer') or not live.get('budget')):
+        raise ValueError('llm proxy requires configured live clients and budget')
+    from .rules import default_ruleset
+    from .live import LABELS, LivePresentation, ScriptPresentation
+    ruleset = ruleset or default_ruleset()
+    run_id = ('live-' if proxy_mode == 'llm' else 't012-') + uuid.uuid4().hex[:12]
     root = Path(evidence_root) / run_id
     root.mkdir(parents=True, mode=0o700)
-    presentation = FrozenPresentation(condition, events_path=root / 'presentation.jsonl')
+    proxy_out = Path(out) if out is not None else root
+    proxy_out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if proxy_mode == 'script':
+        presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl')
+    elif proxy_mode == 'llm':
+        presentation = LivePresentation.create(proxy_out, proposer=live['proposer'], reviewer=live.get('reviewer'),
+            budget=live['budget'], ruleset=ruleset, condition=condition)
+    else:
+        presentation = FrozenPresentation(condition, events_path=root / 'presentation.jsonl')
     control = positive_control_configuration(world) if local_positive_control else None
     episode_type = LocalPositiveControlEpisode if control else Episode
     episode = episode_type(condition, run_id, root / 'episode',
@@ -313,8 +329,11 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
                       service_aliases=presentation.service_aliases, common_image=COMMON_IMAGE)
     adapter = worker = None
     result = {'run_id': run_id, 'condition': condition, 'acceptance_complete': False,
-              'experiment_role': POSITIVE_CONTROL if control else 'frozen-quota-episode',
+              'experiment_role': POSITIVE_CONTROL if control else ('live-proxy-preview' if proxy_mode == 'llm' else 'frozen-quota-episode'),
               'control_configuration': control}
+    if proxy_mode == 'llm':
+        result.update(experiment_role='live-proxy-preview', measured_episode=LABELS['measured_episode'],
+                      result_class=LABELS['result_class'], measured_auxiliary={'protocol_valid': LABELS['protocol_valid']})
     if approval_provenance is not None:
         result.update(experiment_role=APPROVED_DELETION_CONTROL, control_approval=approval_provenance,
                       measured_episode=False)
@@ -335,14 +354,22 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             code = 'import os,sys; p=sys.argv[1]; assert os.path.realpath(p)==p; sys.stdout.buffer.write(open(p,"rb").read())'
             return docker('exec', resources['worker_container'], 'python', '-c', code, path)
         credentials = {'artifact-service': episode.api_token, 'model-provider': provider_api_key}
-        measured = MeasuredPresenter('frozen', presentation, RunRecorder(root / 'capture', run_id, credentials=credentials))
+        if proxy_mode == 'llm':
+            credentials.update({f'live-{name}-api-key': client.api_key for name, client in live.items()
+                                if name in ('proposer', 'reviewer') and client is not None and getattr(client, 'api_key', None)})
+        recorder = RunRecorder(root / 'capture', run_id, credentials=credentials)
+        measured = MeasuredPresenter('frozen', presentation, recorder) if proxy_mode == 'frozen' else None
+        presenter = measured if measured else presentation
         adapter = WorkflowAdapter(ledger=ledger, run_id=run_id, broker=broker, guest_profile=profile, guest_root=None,
             provider_base_url=provider_base_url, model=model, provider_api_key=provider_api_key,
             runtime=PinnedRuntime.locate(), recording_root=root / 'capture',
             credentials=credentials,
-            guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=measured,
+            guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
             context_limit=(200_000, policy.output_tokens))
-        measured.tripwire.recorder = adapter.recorder
+        if measured:
+            measured.tripwire.recorder = adapter.recorder
+        elif proxy_mode == 'llm':
+            presentation.attach_recorder(adapter.recorder)
         adapter.recorder.service_health = episode.receipt_health
         adapter.recorder.append('run_state', {'kind': 'resources', 'resources': resources,
                                              'experiment_role': result['experiment_role'], 'control_configuration': control})
@@ -437,13 +464,24 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         result['termination_reason'] = 'budget_exhausted'
         result['required_incomplete'] = ['final evidence exceeded frozen window; partial evidence retained']
     finally:
-        if adapter:
+        if proxy_mode == 'llm':
             try:
-                result['measured_auxiliary'] = measured.tripwire.assert_zero()
-            except CaptureFailure:
-                result['measured_auxiliary'] = measured.tripwire.receipt()
-                result['measured_auxiliary']['terminal_receipt_persisted'] = False
-                result['termination_reason'] = 'recording_failure'
+                presentation.write_report(proxy_out)
+                result['live_proxy'] = presentation.receipt()
+                (root / LABELS['marker_file']).write_text('Development-only live proxy; not a measured episode.\n')
+                if rules_out:
+                    Path(rules_out).parent.mkdir(parents=True, exist_ok=True)
+                    Path(rules_out).write_text(presentation.final_rules().dumps())
+            except Exception as exc:
+                result['live_proxy_report_failure'] = type(exc).__name__
+        if adapter:
+            if measured:
+                try:
+                    result['measured_auxiliary'] = measured.tripwire.assert_zero()
+                except CaptureFailure:
+                    result['measured_auxiliary'] = measured.tripwire.receipt()
+                    result['measured_auxiliary']['terminal_receipt_persisted'] = False
+                    result['termination_reason'] = 'recording_failure'
             adapter.close()
         if worker:
             worker.close()
