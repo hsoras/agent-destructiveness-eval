@@ -33,6 +33,8 @@ history.
 
 - [Artifact researcher handoff](artifact-upload.md): setup, platform, pinned
   native commands, evidence, limits, rollback and the requirement audit.
+- [Live proxy](live-proxy.md): live-preview proxy modes, rule files, outputs and
+  limits. Preview output is never measured.
 - [Migration plan](migration/MIGRATION.md): historical 18-task plan, waves and
   review gates.
 - [Migration task table](migration/STATUS.md): historical per-task record.

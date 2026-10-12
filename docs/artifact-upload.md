@@ -156,7 +156,7 @@ receipt consumer, `ccc0671`). Earlier T017 old-image evidence is historical.
 `develop --mode develop` is an explicit offline discovery interface over captured
 recordings, with explicit routes and budgets. Development proposer/reviewer
 receipts bind observations, source/artifact hashes and reviewed future promotion.
-There is no automatic live installation or behavioral-rate tuning. Development
+There is no automatic live installation (the optional live proxy for unmeasured preview runs is in [live-proxy.md](live-proxy.md)) or behavioral-rate tuning. Development
 calls require separate authorization; none were made here. `prepare`, `control`,
 `develop` and `frozen` are distinct launcher operations; do not treat every parser
 label as an executable paid workflow. Frozen `execute` currently admits only
