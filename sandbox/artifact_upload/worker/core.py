@@ -152,6 +152,7 @@ class _Stream:
         os.makedirs(self.spool_dir, exist_ok=True)
         self.path = os.path.join(self.spool_dir, "tool_" + uuid.uuid4().hex)
         self.sink = open(self.path, "wb"); self.sink.write(initial)
+        if tools.privileged(): os.fchown(self.sink.fileno(), tools.AGENT_UID, tools.AGENT_GID)
 
     def feed(self, data: bytes) -> None:
         self.total += len(data)
@@ -235,8 +236,13 @@ class GuestWorker:
         if not self.root.is_dir(): raise ValueError("guest root must be a directory")
         self.worker_id = worker_id
         self.kill_grace = kill_grace
-        self.output_dir = str(output_dir) if output_dir else os.path.join(tempfile.gettempdir(), f"artifact-worker-output-{os.getuid()}")
+        self.output_dir = str(output_dir) if output_dir else os.path.join(tempfile.gettempdir(), f"artifact-worker-output-{tools.AGENT_UID if tools.privileged() else os.getuid()}")
         self.protected = tuple(os.path.realpath(p) for p in protected_paths)
+        if tools.privileged():
+            # Root worker: no inherited supplementary groups, and a spool directory the agent identity owns.
+            os.setgroups([])
+            os.makedirs(self.output_dir, exist_ok=True)
+            os.chown(self.output_dir, tools.AGENT_UID, tools.AGENT_GID)
         self.rg = shutil.which("rg")
         self._lock = threading.RLock()
         self._execs: dict[tuple[str, str, str, str], _Execution] = {}
@@ -316,8 +322,9 @@ class GuestWorker:
         ctx = self._ctx()
         table = {"read": tools.read, "write": tools.write, "edit": tools.edit, "patch": tools.apply_patch, "find": tools.glob, "grep": tools.grep}
         if op not in table: raise WorkerError("unsupported_operation", f"unsupported operation: {op}")
-        out = table[op](ctx, a)
-        return out if op == "read" else tools.truncate_output(ctx, out)
+        with tools.as_agent():
+            out = table[op](ctx, a)
+            return out if op == "read" else tools.truncate_output(ctx, out)
 
     # ----------------------------------------------------- process handles
     def process_handle(self, call: dict[str, Any]) -> dict[str, str] | None:
@@ -470,13 +477,18 @@ class GuestWorker:
         try: self.check_path(cwd)
         except ToolError as e: return self._failed(call, key, str(e), e.code, stream)
         if not os.path.isdir(cwd): return self._failed(call, key, f"not a directory: {a.get('workdir', '.')}", "not_a_directory", stream)
-        env = os.environ.copy(); env.update(a.get("env", {}))
+        env = os.environ.copy()
+        if tools.privileged():
+            # The agent's shell must not see the harness: drop the worker's own import path and run identity.
+            for k in ("PYTHONPATH", "PYTHONSAFEPATH", "ARTIFACT_RUN_ID", "ARTIFACT_GUEST_ROOT", "ARTIFACT_WORKER_ID", "ARTIFACT_PROTECTED_PATHS", "ARTIFACT_AGENT_UID", "ARTIFACT_AGENT_GID"):
+                env.pop(k, None)
+        env.update(a.get("env", {}))
         with self._lock:
             if key in self._execs or key in self._finished or self.ledger.identity(key) is not None:
                 raise WorkerError("duplicate_execution", "execution key was already used")
             if sys.platform == "linux" and not self._execution_owner:
                 return self._launch_supervisor(call, stream)
-            proc = subprocess.Popen([select_shell(), "-c", a["command"]], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            proc = subprocess.Popen([select_shell(), "-c", a["command"]], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, **tools.spawn_kwargs())
             ex = _Execution(key, proc, self.worker_id, stream, self.output_dir)
             if self._execution_owner:
                 ex.record["supervisor"] = [os.getpid(), _proc_start(os.getpid())]
@@ -506,7 +518,8 @@ class GuestWorker:
         with open(self.ledger._path(key, ".supervisor.log"), "ab") as log:
             proc = subprocess.Popen([sys.executable, "-m", "sandbox.artifact_upload.worker.core", spec_path],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=log, start_new_session=True)
+                                    stderr=log, start_new_session=True,
+                                    env={**os.environ, "PYTHONSAFEPATH": "1"} if tools.privileged() else None)
         deadline = time.monotonic() + 10
         while (rec := self.ledger.identity(key)) is None:
             if proc.poll() is not None or time.monotonic() >= deadline:

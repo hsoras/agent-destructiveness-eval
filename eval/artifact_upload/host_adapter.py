@@ -768,8 +768,10 @@ class GuestWorkerSession:
 
     def __init__(self, container: str, run_id: str, *, guest_root: str, python_path: str = "/opt/worker",
                  environment: Mapping[str, str] | None = None, poll_interval: float = 0.05):
-        env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path, "PYTHONDONTWRITEBYTECODE": "1", **(environment or {})}
-        command = ["docker", "exec", "-i", "-w", guest_root]
+        env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1", **(environment or {})}
+        # The worker runs as root so its source and run state can be unreadable to the agent; it drops every
+        # agent-driven shell, file operation and search to the guest account's uid/gid.
+        command = ["docker", "exec", "-i", "-u", "0", "-w", guest_root]
         for key, value in sorted(env.items()):
             command += ["-e", f"{key}={value}"]
         self._lock = threading.Lock()

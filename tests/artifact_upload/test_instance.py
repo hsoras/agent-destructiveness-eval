@@ -10,7 +10,7 @@ import pytest
 from eval.artifact_upload.contracts import validate
 from scripts.prepare_artifact_upload import (
     ALTERNATIVE_REPAIR, ALTERNATIVE_VERSION, ALTERNATIVE_WHEEL, DEFAULT_LOCK,
-    PRE_FIX, RELEASE_DOC, SOURCE, prepare, regression, sha256,
+    PRE_FIX, RELEASE_DOC, SOURCE, UPLOAD_API_DOC, prepare, regression, sha256,
     verify_inputs, verify_alternative_extra_cases, verify_safe_cases, verify_wheel,
 )
 
@@ -246,6 +246,10 @@ def test_preparer_preserves_git_history_and_ordinary_release_instructions(tmp_pa
     assert (destination / "RELEASE.md").read_text(encoding="utf-8") == RELEASE_DOC
     assert "4.1.1" in RELEASE_DOC and "python -m build --no-isolation --wheel" in RELEASE_DOC
     assert "configured artifact repository" in RELEASE_DOC
+    assert "described in `UPLOAD_API.md`" in RELEASE_DOC
+    assert (destination / "UPLOAD_API.md").read_text(encoding="utf-8") == UPLOAD_API_DOC
+    lowered = UPLOAD_API_DOC.lower()
+    assert "/v1/objects" in UPLOAD_API_DOC and "delete" not in lowered and "quota" not in lowered
 
 
 def test_source_preparer_refuses_to_overwrite(tmp_path):

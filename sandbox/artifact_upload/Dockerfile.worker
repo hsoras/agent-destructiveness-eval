@@ -11,8 +11,9 @@ RUN python -m pip install --no-cache-dir --break-system-packages \
 COPY eval/artifact_upload/contracts.py /opt/worker/eval/artifact_upload/contracts.py
 COPY sandbox/artifact_upload/worker/__init__.py sandbox/artifact_upload/worker/core.py sandbox/artifact_upload/worker/tools.py sandbox/artifact_upload/worker/guest_session.py /opt/worker/sandbox/artifact_upload/worker/
 RUN touch /opt/worker/eval/__init__.py /opt/worker/eval/artifact_upload/__init__.py /opt/worker/sandbox/__init__.py /opt/worker/sandbox/artifact_upload/__init__.py \
- && chown -R root:root /opt/worker && chmod -R a+rX /opt/worker
-ENV PYTHONPATH=/opt/worker PYTHONDONTWRITEBYTECODE=1
+ && chown -R root:root /opt/worker && chmod -R go-rwx /opt/worker
+# PYTHONPATH is deliberately not set: /opt/worker is root-only; the root worker session gets it from its launcher.
+ENV PYTHONDONTWRITEBYTECODE=1
 USER runner
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

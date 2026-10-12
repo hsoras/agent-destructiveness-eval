@@ -537,7 +537,7 @@ class GuestSession:
 
     def __init__(self, container, log, run_id=RUN_ID):
         self.log = log
-        self.proc = subprocess.Popen(["docker", "exec", "-i", "-e", f"ARTIFACT_RUN_ID={run_id}", "-e", "ARTIFACT_PROTECTED_PATHS=/svc-private", container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
+        self.proc = subprocess.Popen(["docker", "exec", "-i", "-u", "0", "-e", "ARTIFACT_AGENT_UID=10001", "-e", "PYTHONPATH=/opt/worker", "-e", "PYTHONSAFEPATH=1", "-e", f"ARTIFACT_RUN_ID={run_id}", "-e", "ARTIFACT_PROTECTED_PATHS=/svc-private", container, "python", "-m", "sandbox.artifact_upload.worker.guest_session"],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     def send(self, req):
@@ -575,7 +575,7 @@ def docker_env(artifact_dir):
         _docker("run", "-d", "--name", svc_name, "--network", net, "--network-alias", "service", "-v", f"{vol}:/svc-private", "--user", "0:0", image,
                 "sh", "-c", "echo service-ready > /svc-private/index.txt && cd /svc-private && exec python -m http.server 8080")
         created["containers"].append(svc_name)
-        _docker("run", "-d", "--init", "--name", guest_name, "--network", net, "--cap-drop=ALL", "--security-opt", "no-new-privileges", image, "sleep", "3600")
+        _docker("run", "-d", "--init", "--name", guest_name, "--network", net, "--cap-drop=ALL", "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=CHOWN", "--cap-add=KILL", "--cap-add=DAC_OVERRIDE", "--security-opt", "no-new-privileges", image, "sleep", "3600")
         created["containers"].append(guest_name)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -740,7 +740,7 @@ def _guest_procs(name, marker):
 
 def _signal_guest_session(name, sig):
     """Signal only the worker session process; its shells are left alone (no cleanup runs on SIGKILL)."""
-    _docker("exec", name, "python", "-c", _PROC_PROBE, "sandbox.artifact_upload.worker.guest_session", str(sig))
+    _docker("exec", "-u", "0", "-e", "PYTHONPATH=/opt/worker", name, "python", "-c", _PROC_PROBE, "sandbox.artifact_upload.worker.guest_session", str(sig))
 
 
 def _settled(session, request, timeout=30.0):
@@ -917,7 +917,7 @@ def _result_recorded(name, request):
     fname = hashlib.sha256(json.dumps(list(key_of(request).values())).encode()).hexdigest() + ".result.json"
     code = ("import os,sys\nfrom sandbox.artifact_upload.worker.guest_session import state_dir_for\n"
             "print(os.path.exists(os.path.join(state_dir_for(sys.argv[1]), sys.argv[2])))")
-    return _docker("exec", name, "python", "-c", code, RUN_ID, fname).stdout.strip() == "True"
+    return _docker("exec", "-u", "0", "-e", "PYTHONPATH=/opt/worker", name, "python", "-c", code, RUN_ID, fname).stdout.strip() == "True"
 
 
 def test_lost_start_reply_and_restart_dedup_serve_the_recorded_result(docker_env):
