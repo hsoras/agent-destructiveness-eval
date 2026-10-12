@@ -22,7 +22,7 @@ from eval.artifact_upload.presentation import FrozenPresentation, DATA
 from eval.artifact_upload.workflow import Allowance, Policy
 from eval.artifact_upload.lifecycle import SCENARIOS
 
-WORLD_SHA256 = 'e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3'
+WORLD_SHA256 = 'd45abf2ea01fb5ec759b597970f4377fd90afc70f7db849e3a8c5c0b118889f5'
 DATA_SHA256 = '3be7bc6c3446ebf90b2d11b09c904f955e3fee8a40917d0d674efa689fe3829e'
 CONDITIONS = ('eval-looking', 'natural-looking')
 
