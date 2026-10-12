@@ -393,13 +393,15 @@ def test_provider_guard_adds_zdr_only_to_forwarded_body():
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     original = {'model': 'local', 'messages': []}
-    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], zdr=True).start()
+    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], zdr=True,
+                          provider_pin='decart/fp4').start()
     try:
         request = urllib.request.Request(guard.url + '/v1/chat/completions', data=json.dumps(original).encode(),
                                          headers={'Content-Type': 'application/json'})
         assert urllib.request.urlopen(request, timeout=2).status == 200
         assert audited == [original]
-        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny'}
+        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny', 'order': ['decart/fp4'],
+                                           'only': ['decart/fp4'], 'allow_fallbacks': False}
         assert 'provider' not in audited[0]
     finally:
         guard.close(); server.shutdown(); server.server_close(); thread.join()
@@ -416,18 +418,60 @@ def test_provider_guard_auto_enforces_openrouter_and_refuses_bad_body():
             self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], force_openrouter=True).start()
+    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], force_openrouter=True,
+                          provider_pin='decart/fp4').start()
     try:
-        original = {'model': 'm', 'provider': {'zdr': False, 'order': ['x']}}
+        original = {'model': 'm', 'provider': {'zdr': False, 'order': ['x'], 'only': ['x'], 'allow_fallbacks': True}}
         request = urllib.request.Request(guard.url + '/v1/chat/completions', data=json.dumps(original).encode(), headers={'Content-Type':'application/json'})
         urllib.request.urlopen(request, timeout=2).read()
-        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny', 'order': ['x']}
+        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny', 'order': ['decart/fp4'],
+                                           'only': ['decart/fp4'], 'allow_fallbacks': False}
         assert audited[0]['provider']['zdr'] is False
         request = urllib.request.Request(guard.url + '/bad', data=b'not-json', headers={'Content-Type':'application/json'})
         with pytest.raises(urllib.error.HTTPError) as error: urllib.request.urlopen(request, timeout=2)
         assert error.value.code == 400 and len(received) == 1
     finally:
         guard.close(); server.shutdown(); server.server_close(); thread.join()
+
+
+def test_provider_guard_fails_closed_without_pin_and_respects_opt_out():
+    import urllib.error
+    import urllib.request
+    received, audited = [], []
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args): pass
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    upstream = f'http://127.0.0.1:{server.server_port}'
+    def post(guard, payload):
+        request = urllib.request.Request(guard.url + '/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+        return urllib.request.urlopen(request, timeout=2).status
+    guards = []
+    try:
+        # (b) ZDR active (explicit or forced) with no pin: refused, nothing forwarded, no empty order/only lists
+        for guard in (ProviderGuard(upstream, lambda body: audited.append(body) or [], zdr=True),
+                      ProviderGuard(upstream, lambda body: audited.append(body) or [], force_openrouter=True)):
+            guards.append(guard.start())
+            with pytest.raises(urllib.error.HTTPError) as error: post(guard, {'model': 'm', 'messages': []})
+            assert error.value.code == 400 and guard.stats['forwarded'] == 0 and guard.stats['refused'] == 1
+        assert received == []
+        # (c) explicit opt-out forwards the body untouched, with no pin required
+        original = {'model': 'm', 'provider': {'zdr': False, 'order': ['x']}}
+        opt_out = ProviderGuard(upstream, lambda body: audited.append(body) or [], zdr=False).start()
+        guards.append(opt_out)
+        assert post(opt_out, original) == 200
+        assert received[-1] == original
+        # (d) non-OpenRouter default (no ZDR) is unchanged
+        plain = ProviderGuard(upstream, lambda body: audited.append(body) or []).start()
+        guards.append(plain)
+        assert post(plain, {'model': 'm', 'messages': []}) == 200
+        assert received[-1] == {'model': 'm', 'messages': []}
+    finally:
+        for guard in guards: guard.close()
+        server.shutdown(); server.server_close(); thread.join()
 
 
 def test_openrouter_host_detection_does_not_match_local_or_similar_hosts():

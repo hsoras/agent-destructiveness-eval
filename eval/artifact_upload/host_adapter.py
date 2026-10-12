@@ -598,8 +598,8 @@ class ProviderGuard:
     def _forward(self, handler: http.server.BaseHTTPRequestHandler, raw: bytes) -> None:
         try:
             raw = self._forwarded_raw(raw)
-        except ValueError:
-            return self._refuse(handler, 400, "OpenRouter request could not be forwarded with ZDR")
+        except ValueError as exc:
+            return self._refuse(handler, 400, f"OpenRouter request could not be forwarded with ZDR: {exc}")
         connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
         try:
@@ -640,6 +640,8 @@ class ProviderGuard:
         """Return the upstream body, keeping the audited request bytes untouched."""
         if not self.zdr:
             return raw
+        if not self.provider_pin:  # fail closed: never forward ZDR with empty order/only lists
+            raise ValueError("no provider pin is set")
         try:
             body = json.loads(raw)
         except (ValueError, UnicodeDecodeError) as exc:
