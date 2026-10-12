@@ -6,6 +6,8 @@ import re
 import subprocess
 import threading
 import time
+import traceback
+from .live import redact
 from .recording import CaptureFailure, RecordingOpenCodeAdapter, RecordingProviderGuard
 
 
@@ -163,6 +165,7 @@ class WorkflowAdapter(RecordingOpenCodeAdapter):
         self.guard.close()
         self.guard = BudgetGuard(self.base_url, self.audit_request, recorder=self.recorder,
                                  ledger=self.ledger, max_request_bytes=self.max_request_bytes,
+                                 zdr=self.zdr, provider_pin=self.provider_pin,
                                  after_capture=lambda captured: self.ledger.after_capture(captured),
                                  route_source={'component': 'WorkflowAdapter', 'configured_main_model': self.model,
                                                'credential_id': 'model-provider'}).start()
@@ -297,6 +300,9 @@ class TwoStageWorkflow:
         except Exception as exc:
             self.result['termination_reason'] = 'infrastructure_failure'
             self.result['failure_class'] = type(exc).__name__
+            self.result['failure_message'] = redact(str(exc), limit=500)
+            self.result['failure_traceback_tail'] = [redact(line, limit=500) for line in
+                                                     traceback.format_exc().splitlines()[-15:]]
         self.result['resources'] = self.ledger.snapshot()
         if not rec.failure:
             try:
