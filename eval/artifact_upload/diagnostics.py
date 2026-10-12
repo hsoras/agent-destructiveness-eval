@@ -17,7 +17,7 @@ from typing import Any, Callable
 import urllib.parse
 import time
 
-from .host_adapter import ProviderGuard
+from .host_adapter import ProviderGuard, is_openrouter
 from .recording import RunRecorder
 
 DIRECT_PROMPT = (
@@ -133,7 +133,11 @@ class Route:
     version: str
     base_url: str
     options_json: str = "{}"
+    # Extra request-body fields (e.g. {"provider": {"zdr": true}}) merged into diagnostic requests only.
+    provider_options: dict | None = None
     api_key: str = field(default="", repr=False, compare=False)
+    zdr: bool | None = None
+    provider_pin: str | list[str] | None = None
 
     def validate(self) -> dict[str, Any]:
         url = urllib.parse.urlsplit(self.base_url)
@@ -144,6 +148,9 @@ class Route:
         options = json.loads(self.options_json)
         if not isinstance(options, dict) or set(options) & CONTINUATION_FIELDS:
             raise ValueError("invalid route options")
+        if self.provider_options is not None and (
+                not isinstance(self.provider_options, dict) or set(self.provider_options) & CONTINUATION_FIELDS):
+            raise ValueError("invalid route provider options")
         return options
 
 
@@ -242,7 +249,8 @@ def _provider_request(route: Route, body: dict[str, Any], budget: Budget) -> dic
                       and request.get("tool_choice") == "none" and request.get("stream") is False
                       and request.get("max_tokens") == budget.output_tokens) else [{"kind": "diagnostic_refusal"}]
 
-    guard = ProviderGuard(route.base_url, audit, max_request_bytes=budget.request_bytes,
+    guard = ProviderGuard(route.base_url, audit, max_request_bytes=budget.request_bytes, zdr=route.zdr,
+                          provider_pin=route.provider_pin, upstream_retries=0,
                           upstream_timeout=budget.timeout_seconds).start()
     connection = http.client.HTTPConnection("127.0.0.1", urllib.parse.urlsplit(guard.url).port,
                                            timeout=budget.timeout_seconds)
@@ -354,6 +362,7 @@ class Diagnostics:
                 return self._save(record)
             options = route.validate()
             record["route_config"] = {"base_url": route.base_url, "options": options}
+            record["zdr"] = bool(route.zdr) if route.zdr is not None else is_openrouter(route.base_url)
             record["route_config_sha256"] = digest(encoded(record["route_config"]))
             if kind == "direct":
                 original_options = {key: value for key, value in body.items() if key not in CONTINUATION_FIELDS}
@@ -368,8 +377,8 @@ class Diagnostics:
             else:
                 messages = [{"role": "system", "content": prompt},
                             {"role": "user", "content": encoded(clean).decode()}]
-            request = {**options, "model": route.model, "messages": messages, "tools": [],
-                       "tool_choice": "none", "stream": False, "max_tokens": budget.output_tokens}
+            request = {**options, **(route.provider_options or {}), "model": route.model, "messages": messages,
+                       "tools": [], "tool_choice": "none", "stream": False, "max_tokens": budget.output_tokens}
             request_raw = encoded(request)
             record.update(request=request, request_sha256=digest(request_raw))
             if len(request_raw) > budget.request_bytes or self.used[kind] >= budget.calls:

@@ -219,9 +219,23 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Evaluation logs are local artifacts and are never tracked.
+# Run outputs are local by default. Previously tracked live-preview evidence stays tracked.
 *.eval
 /logs/*
+!/logs/live-preview-2026-10-1*/
+/runs/
+/live-runs/
+/artifact-upload-runs/
+/diag/
+/READABLE.md
+**/READABLE.md
+**/candidate_rules.jsonl
+**/presentation-live.jsonl
+**/proxy_report.md
+**/rules.final.json
+**/diag/
+!/bookmarks/
+!/bookmarks/**
 
 # Local immutable upstream checkouts, virtualenvs, and prepared real datasets.
 /.scenario/

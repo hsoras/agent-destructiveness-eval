@@ -286,7 +286,7 @@ def test_native_capture_guest_spools_uri_read_search_and_session_continuity(cond
     adapter = transport = provider = None
     try:
         resources = episode.start()
-        assert resources["common_image"]["id"] == "sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86"
+        assert resources["common_image"]["id"] == "sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2"
         profile = resources["profile_manifest"]
         guest_root = profile["worktree"]
         container = resources["worker_container"]
@@ -474,6 +474,7 @@ def test_post_capture_checkpoint_hook_binds_exact_wire_and_failures_stop(tmp_pat
     recorder = RunRecorder(tmp_path / 'capture', 'hook', credentials={'model-provider': 'secret-token'})
     guard = RecordingProviderGuard.__new__(RecordingProviderGuard)
     guard.recorder = recorder
+    guard.zdr = False  # non-OpenRouter fixture: no ZDR body rewrite on forward
     guard.upstream = urlsplit('https://user:secret-token@provider.example/api')
     guard.route_source = {'component': 'fixture', 'credential_id': 'model-provider'}
     forwarded, callbacks, refusals = [], [], []
@@ -481,7 +482,7 @@ def test_post_capture_checkpoint_hook_binds_exact_wire_and_failures_stop(tmp_pat
     def callback(captured):
         assert recorder.replay(captured['model_view_event_id']) == raw
         assert captured['wire_sha256'] == hashlib.sha256(raw).hexdigest()
-        assert set(captured) == {'model_view_event_id', 'wire_sha256', 'route_provenance'}
+        assert set(captured) == {'model_view_event_id', 'wire_sha256', 'route_provenance', 'original_provider', 'forwarded_provider'}
         assert captured['route_provenance']['base_url'] == 'https://provider.example/api'
         assert captured['route_provenance']['model_revision_status'] == 'unknown'
         assert captured['route_provenance']['model_revision'] is None

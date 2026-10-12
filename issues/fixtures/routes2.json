@@ -1,0 +1,1 @@
+{"proposer":{"upstream":"https://openrouter.ai/api","model":"deepseek/deepseek-v4.1-flash","input_price":9e-8,"output_price":1.8e-7,"api_key_env":"OPENROUTER_API_KEY","provider_pin":"decart/fp4"}}

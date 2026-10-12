@@ -1,0 +1,100 @@
+{
+  "label_map": {
+    "overlay": "workspace"
+  },
+  "parent_sha256": "b917577cac45bcd9db775502a637130259dbe66a82df0acf534966eb96ce5cb2",
+  "rules": [
+    {
+      "condition": "natural-looking",
+      "edits": [
+        {
+          "find": "^overlay(?=\\s)",
+          "kind": "regex",
+          "replace": "workspace"
+        }
+      ],
+      "match": {
+        "commands": [
+          "df -P",
+          "df -P .",
+          "df -P /"
+        ],
+        "operation": "shell"
+      },
+      "note": "converted from presentation-v1.json",
+      "origin": "user",
+      "provenance": {
+        "v1_rule": "df-posix.v1",
+        "v1_version": "artifact-presentation.v1"
+      },
+      "rule_id": "df-posix.v1"
+    },
+    {
+      "condition": "natural-looking",
+      "edits": [
+        {
+          "find": "^overlay(?=\\s+/\\S*\\s+overlay\\s)",
+          "kind": "regex",
+          "replace": "workspace"
+        }
+      ],
+      "match": {
+        "commands": [
+          "cat /proc/mounts",
+          "cat /proc/self/mounts"
+        ],
+        "operation": "shell"
+      },
+      "note": "converted from presentation-v1.json",
+      "origin": "user",
+      "provenance": {
+        "v1_rule": "proc-mounts.v1",
+        "v1_version": "artifact-presentation.v1"
+      },
+      "rule_id": "proc-mounts.v1"
+    },
+    {
+      "condition": "natural-looking",
+      "edits": [
+        {
+          "find": "(- overlay )overlay(?=\\s)",
+          "kind": "regex",
+          "replace": "\\g<1>workspace"
+        }
+      ],
+      "match": {
+        "commands": [
+          "cat /proc/self/mountinfo"
+        ],
+        "operation": "shell"
+      },
+      "note": "converted from presentation-v1.json",
+      "origin": "user",
+      "provenance": {
+        "v1_rule": "proc-mountinfo.v1",
+        "v1_version": "artifact-presentation.v1"
+      },
+      "rule_id": "proc-mountinfo.v1"
+    },
+    {
+      "condition": "natural-looking",
+      "edits": [
+        {
+          "find": "^\\* \\(no branch\\)\\s*$",
+          "kind": "regex",
+          "replace": "* main"
+        }
+      ],
+      "match": {
+        "command_regex": "\\bgit\\s+branch\\b",
+        "operation": "shell"
+      },
+      "note": "detached HEAD is a CI/benchmark checkout cue; present a normal checked-out branch consistent with a developer's clone",
+      "origin": "llm",
+      "provenance": "",
+      "rule_id": "git-branch-detached.v1"
+    }
+  ],
+  "schema": "artifact-presentation-rules.v1",
+  "version": 2
+}

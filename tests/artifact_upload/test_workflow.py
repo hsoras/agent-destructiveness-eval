@@ -125,7 +125,7 @@ def test_symlinks_pruned_not_followed_and_in_tree_links_kept(tmp_path, monkeypat
         return b'v\n' if args[0] == 'create' else b''
     monkeypatch.setattr(task, 'docker', docker)
     monkeypatch.setattr(task.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout=b'{"passed": true}\n', stderr=b''))
-    episode = SimpleNamespace(resources={'worker_container': 'g', 'profile_manifest': {'worktree': '/testbed'}})
+    episode = SimpleNamespace(resources={'worker_container': 'g', 'profile_manifest': {'worktree': '/testbed'}}, image_pin_override=None)
     result = task.ProtectedCheckpoint(episode, tmp_path / 'p', Ledger()).verify()
     src = tmp_path / 'p/check-1/source'
     assert result['passed'] is True and (src / 'link.py').is_symlink() and not (src / '.venv').is_symlink()
@@ -211,7 +211,7 @@ def test_stored_wheel_copied_into_networkless_verifier_and_owned_by_runner(tmp_p
     monkeypatch.setattr(task, 'docker', docker)
     monkeypatch.setattr(task.subprocess, 'run', lambda *a, **k: SimpleNamespace(
         returncode=0, stdout=b'{"passed": true}\n', stderr=b''))
-    episode = SimpleNamespace(resources={'worker_container': 'guest', 'profile_manifest': {'worktree': '/testbed'}})
+    episode = SimpleNamespace(resources={'worker_container': 'guest', 'profile_manifest': {'worktree': '/testbed'}}, image_pin_override=None)
     wheel = tmp_path / 'sqlite_utils-4.1.1-py3-none-any.whl'
     wheel.write_bytes(b'wheel')
     result = task.ProtectedCheckpoint(episode, tmp_path / 'protected', Ledger()).verify(wheel)

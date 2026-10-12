@@ -198,3 +198,19 @@ def test_service_export_preserves_partial_sources_when_freeze_fails(tmp_path, mo
     assert (tmp_path / 'service-private/audit.jsonl').read_bytes() == audit
     assert result['service_container'] == 'exact-service'
     assert result['failure'] == 'InfrastructureError' and result['export_failure'] == 'ValueError'
+
+
+def test_image_pin_override_requires_matching_common_image():
+    with pytest.raises(ValueError):
+        lifecycle.Episode("eval-looking", image_pin_override={"requested": "sha256:" + "a" * 64})
+    episode = lifecycle.Episode("eval-looking", common_image="sha256:" + "a" * 64,
+        image_pin_override={"requested": "sha256:" + "a" * 64, "locked": "x", "reason": "live-preview development only"})
+    assert episode.image_pin_override["requested"] == episode.common_image
+    assert lifecycle.Episode("eval-looking").image_pin_override is None
+
+
+def test_run_episode_refuses_guest_image_override_outside_llm(tmp_path):
+    from eval.artifact_upload import task
+    for mode in ("frozen", "script"):
+        with pytest.raises(ValueError, match="restricted to llm"):
+            task.run_episode("eval-looking", tmp_path, "http://x", "m", proxy_mode=mode, guest_image_id="sha256:" + "a" * 64)

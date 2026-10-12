@@ -16,6 +16,7 @@ import http.client
 import http.server
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -527,6 +528,18 @@ class RouterBridge:
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 
 
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+def is_openrouter(url: str) -> bool:
+    """Whether a configured upstream is hosted by OpenRouter."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
 class ProviderGuard:
     """Loopback proxy between the host runtime and the configured model provider.
 
@@ -537,11 +550,23 @@ class ProviderGuard:
     """
 
     def __init__(self, upstream_base_url: str, audit: Callable[[dict[str, Any]], list[dict[str, Any]]], *,
-                 max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0):
+                 max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0,
+                 zdr: bool | None = None, force_openrouter: bool = False,
+                 provider_pin: str | list[str] | None = None, upstream_retries: int = 3,
+                 retry_backoff: tuple[float, ...] = (1.0, 3.0, 8.0)):
+        self.upstream_retries, self.retry_backoff = max(0, int(upstream_retries)), tuple(retry_backoff)
+        self.retry_log: list[dict[str, Any]] = []
         self.upstream = urllib.parse.urlsplit(upstream_base_url)
         if self.upstream.scheme not in {"http", "https"} or not self.upstream.hostname:
             raise ValueError("provider_base_url must be an http(s) URL")
         self.audit, self.max_request_bytes, self.upstream_timeout = audit, max_request_bytes, upstream_timeout
+        self.zdr = bool(force_openrouter or (is_openrouter(upstream_base_url) if zdr is None else zdr))
+        self.provider_pin = ([provider_pin] if isinstance(provider_pin, str) else list(provider_pin or []))
+        self.is_openrouter = is_openrouter(upstream_base_url)
+        if self.is_openrouter and self.zdr and not self.provider_pin:
+            raise ValueError("OpenRouter ZDR requires --openrouter-provider (provider_pin)")
+        self.served_providers: dict[str, int] = {}
+        self.provider_mismatch = False
         self.stats = {"received": 0, "audited": 0, "forwarded": 0, "refused": 0}
         self.refusals: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -577,17 +602,54 @@ class ProviderGuard:
         handler.wfile.write(payload)
 
     def _forward(self, handler: http.server.BaseHTTPRequestHandler, raw: bytes) -> None:
-        connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
-        connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
         try:
-            headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
-            headers["Content-Length"] = str(len(raw))
-            path = self.upstream.path.rstrip("/") + handler.path
-            connection.request("POST", path, body=raw, headers=headers)
-            response = connection.getresponse()
-        except (OSError, http.client.HTTPException) as exc:
-            connection.close()
-            return self._refuse(handler, 502, f"provider unreachable: {type(exc).__name__}")
+            raw = self._forwarded_raw(raw)
+        except ValueError as exc:
+            return self._refuse(handler, 400, f"OpenRouter request could not be forwarded with ZDR: {exc}")
+        connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
+        headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
+        headers["Content-Length"] = str(len(raw))
+        path = self.upstream.path.rstrip("/") + handler.path
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
+            connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
+            status, retry_after, error = None, None, None
+            try:
+                connection.request("POST", path, body=raw, headers=headers)
+                response = connection.getresponse()
+                status = response.status
+                retry_after = response.getheader("Retry-After")
+            except (OSError, http.client.HTTPException) as exc:
+                connection.close()
+                error = type(exc).__name__
+            if error is None and status not in _RETRY_STATUSES:
+                break
+            if attempt > self.upstream_retries:  # out of retries: relay the final error unchanged
+                if error is not None:
+                    return self._refuse(handler, 502, f"provider unreachable: {error}")
+                break
+            served = None
+            if error is None:
+                try:
+                    served = self._served_provider(response.read())
+                except (OSError, http.client.HTTPException):
+                    pass
+                connection.close()
+            delay = self.retry_backoff[min(attempt - 1, len(self.retry_backoff) - 1)] if self.retry_backoff else 0.0
+            try:
+                if retry_after is not None and 0 <= float(retry_after) <= 10:
+                    delay = float(retry_after)
+            except ValueError:
+                pass
+            entry = {"attempt": attempt, "status": status, "error": error,
+                     "elapsed": round(time.monotonic() - started, 3), "served_provider": served}
+            with self._lock:
+                self.retry_log.append(entry)
+            self._on_retry(entry)
+            logging.getLogger(__name__).warning("upstream %s on attempt %d; retrying in %.1fs", status or error, attempt, delay)
+            time.sleep(delay)
         self._count("forwarded")
         try:
             handler.send_response(response.status)
@@ -596,13 +658,70 @@ class ProviderGuard:
                     handler.send_header(key, value)
             handler.send_header("Connection", "close")
             handler.end_headers()
+            captured = bytearray()
             while chunk := response.read1(65536):
+                captured.extend(chunk)
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
+            served = self._served_provider(bytes(captured))
+            if served:
+                self.served_providers[served] = self.served_providers.get(served, 0) + 1
+                if self.provider_pin and not any(self._provider_matches(served, pin) for pin in self.provider_pin):
+                    self.provider_mismatch = True
+                    logging.getLogger(__name__).error("LOUD: OpenRouter served provider %s did not match pin %s",
+                                                       served, self.provider_pin)
         except (OSError, http.client.HTTPException):
             pass  # the runtime went away or the stream broke; nothing further is relayed
         finally:
             connection.close()
+
+    def _on_retry(self, entry: dict[str, Any]) -> None:
+        """Hook for evidence recorders; a retry is the same audited request, never a new one."""
+
+    def _forwarded_raw(self, raw: bytes) -> bytes:
+        """Return the upstream body, keeping the audited request bytes untouched."""
+        if not self.zdr:
+            return raw
+        if not self.provider_pin:  # fail closed: never forward ZDR with empty order/only lists
+            raise ValueError("no provider pin is set")
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("OpenRouter request must be a JSON object to enforce ZDR") from exc
+        if not isinstance(body, dict):
+            raise ValueError("OpenRouter request must be a JSON object to enforce ZDR")
+        body["provider"] = {**(body.get("provider") if isinstance(body.get("provider"), dict) else {}),
+                            "zdr": True, "data_collection": "deny", "order": self.provider_pin,
+                            "only": self.provider_pin, "allow_fallbacks": False}
+        return json.dumps(body).encode()
+
+    @staticmethod
+    def _provider_matches(served: str, pin: str) -> bool:
+        normalize = lambda value: "".join(ch for ch in value.lower() if ch.isalnum())
+        return normalize(served) == normalize(pin.split("/", 1)[0])
+
+    @staticmethod
+    def _served_provider(raw: bytes) -> str | None:
+        try:
+            value = json.loads(raw)
+            if isinstance(value, dict) and isinstance(value.get("provider"), str):
+                return value["provider"]
+        except (ValueError, UnicodeDecodeError):
+            pass
+        found = None
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if line.startswith("data:"):
+                try:
+                    value = json.loads(line[5:].strip())
+                    if isinstance(value, dict) and isinstance(value.get("provider"), str):
+                        found = value["provider"]
+                except ValueError:
+                    continue
+        return found
+
+    def provider_summary(self) -> dict[str, Any]:
+        return {"pin": self.provider_pin, "served_providers": dict(self.served_providers),
+                "mismatch": self.provider_mismatch, "retries": len(self.retry_log), "retry_log": list(self.retry_log)}
 
     def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         guard = self
@@ -738,6 +857,15 @@ def _summarise(events: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any]
     return session_id, usage, [e for e in events if e.get("type") == "error"]
 
 
+def _provider_qualified_model_ok(model: str) -> bool:
+    """Accept ``vendor/model`` ids (slashes allowed) but nothing that could escape or corrupt the ref."""
+    if not model or model != model.strip() or model.startswith("/") or model.endswith("/"):
+        return False
+    if ".." in model or "//" in model:
+        return False
+    return all(ch.isprintable() and not ch.isspace() for ch in model)
+
+
 class HostOpenCodeAdapter:
     """Own one run's host OpenCode staging, router bridge and session continuity."""
 
@@ -746,15 +874,22 @@ class HostOpenCodeAdapter:
                  runtime: PinnedRuntime | None = None, registry: OperationRegistry | None = None,
                  presenter: Presenter | None = None, today: str | None = None, provider_api_key: str = "sk-none",
                  context_limit: tuple[int, int] | None = None, autocompact: bool = False,
-                 runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024):
-        if not model or "/" in model:
-            raise ValueError("model must be a bare model ID served by the configured provider")
+                 runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024,
+                 allow_provider_qualified_model: bool = False, zdr: bool | None = None,
+                 provider_pin: str | list[str] | None = None):
+        if not allow_provider_qualified_model:
+            if not model or "/" in model:
+                raise ValueError("model must be a bare model ID served by the configured provider")
+        elif not _provider_qualified_model_ok(model):
+            raise ValueError("model must be a provider-qualified model ID such as openai/gpt-oss-120b")
         self.run_id, self.broker, self.profile = run_id, broker, dict(guest_profile)
         self.registry = registry or OperationRegistry()
         self.runtime = runtime or PinnedRuntime.locate()
         self.model, self.base_url, self.api_key = model, provider_base_url, provider_api_key
         self.today, self.context_limit, self.autocompact = today, context_limit, autocompact
         self.max_request_bytes = max_request_bytes
+        self.zdr = zdr
+        self.provider_pin = provider_pin
         self.guard: ProviderGuard | None = None
         self.runtime_flags = dict(HOST_RUNTIME_FLAGS if runtime_flags is None else runtime_flags)
         self.stage = Path(stage_root) if stage_root else Path(tempfile.mkdtemp(prefix="artifact-host-stage-")).resolve()
@@ -862,7 +997,8 @@ class HostOpenCodeAdapter:
                 'import { tool } from "@opencode-ai/plugin";\nimport { routedTool } from "../lib/tool_stub.ts";\n'
                 f'export default routedTool("{name}", tool);\n')
         # Every provider request of a routed turn passes through the guard before it leaves the host.
-        self.guard = ProviderGuard(self.base_url, self.audit_request, max_request_bytes=self.max_request_bytes).start()
+        self.guard = ProviderGuard(self.base_url, self.audit_request, max_request_bytes=self.max_request_bytes,
+                                   zdr=self.zdr, provider_pin=self.provider_pin).start()
         self._write_opencode_config(self.config_dir, self.guard.url, router=True)
         self._staged = True
 

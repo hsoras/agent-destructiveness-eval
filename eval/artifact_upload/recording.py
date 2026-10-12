@@ -208,6 +208,9 @@ class RecordingProviderGuard(ProviderGuard):
         self.route_source = dict(route_source or {})
         super().__init__(*args, **kwargs)
 
+    def _on_retry(self, entry: dict[str, Any]) -> None:
+        self.recorder.append("proxy_events", {"kind": "upstream_retry", **entry})
+
     def _forward(self, handler: Any, raw: bytes) -> None:
         try:
             self.recorder.check()
@@ -224,7 +227,9 @@ class RecordingProviderGuard(ProviderGuard):
                      "model_revision": None, "model_revision_status": "unknown",
                      "source_config": self.route_source}
             captured = {"model_view_event_id": eid, "wire_sha256": hashlib.sha256(raw).hexdigest(),
-                        "route_provenance": route}
+                        "route_provenance": route,
+                        "original_provider": body.get("provider"),
+                        "forwarded_provider": json.loads(self._forwarded_raw(raw)).get("provider")}
             self.recorder.append("proxy_events", {"kind": "captured_route", **captured})
             if self.after_capture is not None:
                 try:
@@ -407,7 +412,8 @@ class RecordingOpenCodeAdapter(HostOpenCodeAdapter):
         super().stage_runtime()
         self.guard.close()
         self.guard = RecordingProviderGuard(self.base_url, self.audit_request, recorder=self.recorder,
-                                           max_request_bytes=self.max_request_bytes).start()
+                                           max_request_bytes=self.max_request_bytes, zdr=self.zdr,
+                                           provider_pin=self.provider_pin).start()
         self._write_opencode_config(self.config_dir, self.guard.url, router=True)
 
     def run_turn(self, prompt: str, **kwargs: Any) -> Any:
