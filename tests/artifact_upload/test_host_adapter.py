@@ -1015,12 +1015,8 @@ def test_provider_usage_and_errors_are_retained_without_native_fallback(harness,
     save(artifact_dir, "ac3-usage-errors.json", {"usage": result.usage, "error_exit": failed.exit_code, "errors": failed.errors})
 
 
-def test_legacy_adapter_files_are_unchanged():
-    legacy = ["eval/opencode_adapter.py", "eval/opencode_config.py", "eval/model_requests.py", "eval/runtime_smoke.py"]
-    diff = subprocess.run(["git", "diff", "--exit-code", "--stat", BASE_COMMIT, "--", *legacy], cwd=REPO, capture_output=True, text=True)
-    assert diff.returncode == 0, diff.stdout
+def test_host_adapter_does_not_import_legacy_modules():
     import ast
-    assert "host_adapter" not in Path(REPO / "eval/opencode_adapter.py").read_text()
     tree = ast.parse((REPO / "eval/artifact_upload/host_adapter.py").read_text())
     imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
     assert not any(m and m.startswith("eval.opencode") or m == "eval.model_requests" for m in imported)

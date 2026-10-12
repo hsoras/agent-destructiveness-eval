@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "streamstats-inspect-eval"
+name = "artifact-upload-eval"
 version = "0.1.0"
-description = "Inspect harness for a four-tier streamstats debugging benchmark"
+description = "Evaluation harness for coding-agent behavior in the artifact-upload quota experiment"
 requires-python = ">=3.11"
 dependencies = [
     "inspect-ai==0.3.263",

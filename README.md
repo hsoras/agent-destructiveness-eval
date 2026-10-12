@@ -17,10 +17,11 @@ rejection at the actual service, separate larger-quota functional publication,
 fresh unauthorized-rescue and scoped-approved controls, security/cancellation
 gate, capture and cleanup. All of this is scripted local-provider engineering
 evidence. **No research readiness is claimed:** no paid, appearance-separation,
-held-out or provider-semantic validation has been run. The legacy SQLite and
-Streamstats commands remain the default; the artifact backend is reachable only
-through its explicit entry points (`python -m eval.artifact_upload.task`,
-`scripts/artifact_upload.py`, `scripts/validate_artifact_upload.py`). See the
+held-out or provider-semantic validation has been run. This is the repository's only
+experiment; its entry points are `python -m eval.artifact_upload.task`,
+`scripts/artifact_upload.py` and `scripts/validate_artifact_upload.py`. The
+earlier SQLite-migration/Streamstats experiment was removed from the current
+tree and remains available only in Git history. See the
 [artifact researcher handoff](docs/artifact-upload.md) for setup, platform,
 pinned native commands, evidence, limits, rollback and the requirement audit.
 
@@ -116,36 +117,22 @@ that instance.
 
 ## Implementation and documentation
 
-The existing Python harness uses **Inspect, OpenCode, and Docker** for
-reproducible coding evaluations. Its SQLite backend exercises a migration over
-approximately **2.65 million records**, with bounded disk-backed storage,
-evaluator-owned regression and integrity checks, native session exports, and
-isolated awareness probes. Those backends and their logs remain separate from
-the artifact-upload experiment.
+The harness is Python (>=3.11) with a host OpenCode runtime, a Docker guest and a
+local artifact service. Raw run data and evidence stay outside the repository.
 
 - [NEW_SPEC.md](NEW_SPEC.md): artifact-upload requirements and experimental protocol.
-- [Migration plan](docs/migration/MIGRATION.md): 18 tasks, ordered execution waves,
-  parallel worktree ownership, review gates, and acceptance checks.
-- [Migration coordinator](scripts/migration/README.md): orchestration tooling and
-  execution requirements.
-- [SQLite implementation guide](docs/sqlite-migration.md): existing backend and calibration.
-- [SQLite and Streamstats notes](docs/sqlite-experiment-history.md): preserved
-  commands, configuration history, and prior experiment details.
+- [Artifact researcher handoff](docs/artifact-upload.md): setup, commands, evidence and limits.
+- [OpenCode runtime contract](docs/opencode-harness.md) and [interception contracts](docs/artifact-upload-contracts.md).
+- [Migration plan](docs/migration/MIGRATION.md): historical 18-task plan, waves and review gates.
+- [Migration coordinator](scripts/migration/README.md): historical orchestration tooling.
 
-Existing harness tests:
+Tests:
 
 ```sh
-uv sync --locked --extra dev --group migration-regression --inexact
-.venv/bin/python scripts/migration/prepare_regression.py
+uv sync --locked --extra dev
 .venv/bin/python -m pytest -q tests
 ```
 
-These checks validate existing infrastructure; the migration task briefs define
-the new backend's required tests and controls. Artifact selection, runtime
-interception, calibration, appearance pilots, and held-out behavioral validation
-remain explicit readiness gates.
-
-The full suite retains one [approved legacy baseline exception](docs/migration/BASELINE_EXCEPTIONS.md).
-Its raw pytest exit remains nonzero; the migration coordinator accepts only its
-exact recorded signature and source hashes. Any additional regression blocks
-integration.
+Artifact tests include genuine Docker, service and runtime checks; they do not
+skip when prerequisites are missing. Selection, appearance pilots and held-out
+behavioral validation remain explicit readiness gates.

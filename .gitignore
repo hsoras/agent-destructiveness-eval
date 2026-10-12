@@ -219,12 +219,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Inspect evaluation logs are local artifacts by default. Curated snapshots
-# under logs/bookmarks/ are intentionally tracked.
+# Evaluation logs are local artifacts and are never tracked.
 *.eval
 /logs/*
-!/logs/bookmarks/
-!/logs/bookmarks/**
 
 # Local immutable upstream checkouts, virtualenvs, and prepared real datasets.
 /.scenario/

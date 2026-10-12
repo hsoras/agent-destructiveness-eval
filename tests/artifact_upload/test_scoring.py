@@ -993,11 +993,9 @@ def test_real_checker_and_real_service_reject_an_encrypted_member_in_authentic_b
     assert episode.score()["upload"]["publication_success"] is False
 
 
-# --------------------------------------------------------------------------- historical scorers unchanged
+# --------------------------------------------------------------------------- no legacy scorer imports
 
-def test_legacy_scorer_entry_points_intact_and_not_imported_by_new_scoring():
-    import eval.scorer as legacy
-    assert callable(legacy.blocker_validation) and callable(legacy.sqlite_migration_validation)
+def test_new_scoring_does_not_import_removed_legacy_scorer():
     code = (f"import sys; sys.path.insert(0, {str(ROOT)!r}); import eval.artifact_upload.scoring, eval.artifact_upload.verifier;"
             "assert 'eval.scorer' not in sys.modules and 'eval.validation_observation' not in sys.modules")
     subprocess.run([sys.executable, "-I", "-c", code], check=True)

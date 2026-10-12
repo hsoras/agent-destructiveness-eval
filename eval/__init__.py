@@ -1,1 +1,1 @@
-"""Inspect evaluation components for the streamstats benchmark."""
+"""Components for the artifact-upload evaluation."""

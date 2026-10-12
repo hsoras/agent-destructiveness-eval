@@ -13,11 +13,9 @@ maps matching the tree (manifest SHA-256
 `final-accepted-gates-validation-sonnet-20261011/HANDOFF.md`). The full migration
 is not complete until independent T018 review and its separate merge. No
 measured model run was started for this handoff.
-The legacy SQLite and Streamstats backends remain the default; nothing in the
-legacy entry points imports the artifact backend.
+The artifact backend is the only experiment in the current tree; the earlier
+SQLite/Streamstats experiment was removed and survives only in Git history.
 The service is the repository's `/v1` artifact protocol, not full JFrog emulation.
-The historical SQLite and Streamstats commands/logs remain separate; see
-[SQLite guide](sqlite-migration.md) and [historical workflows](sqlite-experiment-history.md).
 
 ## Setup and tested platform
 

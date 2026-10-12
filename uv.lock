@@ -2402,7 +2402,7 @@ wheels = [
 ]
 
 [[package]]
-name = "streamstats-inspect-eval"
+name = "artifact-upload-eval"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
