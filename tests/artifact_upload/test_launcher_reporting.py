@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import asdict
 import json
 from pathlib import Path
 import subprocess
@@ -556,3 +557,31 @@ def test_native_capture_fails_duplicate_missing_or_changed_bodies_and_keeps_rece
     assert result['exact_provider_capture'] is False
     # The received bodies are persisted before the comparison result is used.
     assert json.loads((private / 'local-provider-requests.json').read_text()) == received
+
+
+OVERRIDE_ID = 'sha256:' + 'ab' * 32
+PRICED = {**asdict(launcher.policy_from()), 'microusd_per_token': 1}
+LIVE_KW = dict(operation='run', proxy_mode='llm', label='live-preview', mode='develop', model='m', provider='http://x',
+               budget=PRICED)
+
+
+@pytest.mark.parametrize('kw', [
+    dict(proxy_mode='script', label='local-acceptance', operation='run'),
+    dict(proxy_mode='script', label='live-preview', operation='run'),
+    dict(operation='frozen'),
+    dict(proxy_mode='llm', operation='run', label='paid-pilot', model='m', provider='http://x', budget=PRICED),
+])
+def test_guest_image_override_refused_outside_llm_live_preview(kw):
+    with pytest.raises(ValueError):
+        make_plan(guest_image_id=OVERRIDE_ID, **kw)
+
+
+def test_guest_image_override_recorded_and_validated():
+    with pytest.raises(ValueError, match='sha256'):
+        make_plan(guest_image_id='latest', **LIVE_KW)
+    frozen = make_plan(guest_image_id=OVERRIDE_ID, **LIVE_KW)
+    override = frozen['image_pin_override']
+    assert override == {'requested': OVERRIDE_ID, 'locked': frozen['source_identities']['common_image']['id'],
+                        'reason': 'live-preview development only'}
+    assert 'image_pin_override' not in make_plan(**LIVE_KW)
+    assert 'image_pin_override' not in make_plan()

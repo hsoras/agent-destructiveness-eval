@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import uuid
@@ -95,7 +96,7 @@ def policy_from(value=None):
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
-         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None):
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None):
     if operation == 'frozen':
         proxy_mode = 'script'
     if operation not in ('prepare', 'control', 'develop', 'run', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
@@ -133,6 +134,11 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
     for key in ('image_digest', 'packages_digest', 'uid', 'gid'):
         if len({p[key] for p in profiles}) != 1:
             raise ValueError('unequal matched resources: ' + key)
+    if guest_image_id is not None:
+        if proxy_mode != 'llm' or operation != 'run' or label != 'live-preview':
+            raise ValueError('--guest-image-id is only allowed for --proxy-mode llm live-preview runs')
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', guest_image_id):
+            raise ValueError('--guest-image-id must be a full sha256:<64 hex> image id')
     policy = policy_from(budget)
     if label not in ('local-acceptance', 'paid-pilot', 'held-out', 'live-preview'):
         raise ValueError('unsupported assessment label')
@@ -161,6 +167,8 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
             'launch_operation': operation, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
             'proxy': {'mode': proxy_mode, 'rules_path': str(Path(rules_path).resolve()) if rules_path else None,
                       'rules_sha256': sha(rules_path) if rules_path else None},
+            **({'image_pin_override': {'requested': guest_image_id, 'locked': source_identities()['common_image']['id'],
+                                       'reason': 'live-preview development only'}} if guest_image_id else {}),
             'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
             'budget': asdict(policy), 'world': world,
             'presentations': {c: FrozenPresentation(c).provenance for c in CONDITIONS},
@@ -400,7 +408,8 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
         from eval.artifact_upload.task import run_episode
         result = run_episode(assignment['condition'], output / assignment['episode_id'], frozen['provider'], frozen['model'],
             provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
-            live={**clients, 'budget': live_budget}, rules_out=rules_out)
+            live={**clients, 'budget': live_budget}, rules_out=rules_out,
+            guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'))
         results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
         (output / 'results.json').write_text(json.dumps(results, indent=2))
     return results
@@ -498,6 +507,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--mode', choices=('passthrough', 'develop', 'frozen'), default='frozen')
     parser.add_argument('--proxy-mode', choices=('llm', 'script'), default='script')
+    parser.add_argument('--guest-image-id', help='live-preview only (--proxy-mode llm): substitute local guest image id for the unobtainable locked pin')
     parser.add_argument('--rules', type=Path)
     parser.add_argument('--proxy-routes', type=Path)
     parser.add_argument('--proxy-budget', type=Path)
@@ -533,7 +543,7 @@ def main():
         frozen = plan(args.instance, operation=args.operation, mode=args.mode, profile=args.profile,
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
                       model=args.model, provider=args.provider, label=args.label,
-                      proxy_mode=args.proxy_mode, rules_path=args.rules)
+                      proxy_mode=args.proxy_mode, rules_path=args.rules, guest_image_id=args.guest_image_id)
         if args.operation == 'run' and args.condition != 'both':
             frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
         if args.operation == 'run' and args.proxy_mode == 'llm':

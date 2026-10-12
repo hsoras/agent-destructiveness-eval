@@ -51,7 +51,7 @@ class Episode:
     """One private service, network, coding workspace, and evidence directory."""
 
     def __init__(self, profile: str, run_id: str | None = None, evidence_root: str | Path | None = None,
-                 *, preparer=None, service_aliases=None, common_image=None):
+                 *, preparer=None, service_aliases=None, common_image=None, image_pin_override=None):
         if profile not in {"eval-looking", "natural-looking"}:
             raise ValueError("profile must be eval-looking or natural-looking")
         self.profile = profile
@@ -68,6 +68,11 @@ class Episode:
                 raise ValueError("service_aliases must map owner IDs to alias objects")
             Draft202012Validator(DISPLAY).validate({"aliases": aliases, "changed_fields": sorted(aliases)})
         self.common_image = common_image
+        # Development-only (live-preview) substitute for the unobtainable frozen guest image; None = locked pins enforced.
+        self.image_pin_override = deepcopy(image_pin_override)
+        if self.image_pin_override is not None and (
+                not isinstance(self.image_pin_override, dict) or self.common_image != self.image_pin_override.get("requested")):
+            raise ValueError("image_pin_override must request exactly the Episode common_image")
         self._owns_resources = False
         self.evidence_root = Path(evidence_root or tempfile.mkdtemp(prefix="t007-evidence-"))
         self.evidence_root.mkdir(parents=True, exist_ok=True)
@@ -201,7 +206,14 @@ print(json.dumps(files,sort_keys=True))
             self.resources["frozen_profile_witnesses"] = {
                 p["condition"]: {key: p[key] for key in ("image_digest", "packages_digest")}
                 for p in lock["guest_profiles"]}
-            if any(image["Id"] != p["image_digest"] for p in lock["guest_profiles"]):
+            override = self.image_pin_override
+            if override is not None:
+                # Only the image identity (and the package witness derived from it) is substituted; every other check still applies.
+                if image["Id"] != override["requested"]:
+                    raise InfrastructureError("realized common image does not match the requested live-preview override")
+                self.resources["image_pin_override"] = deepcopy(override)
+                self.resources["common_image"]["image_pin_override"] = deepcopy(override)
+            elif any(image["Id"] != p["image_digest"] for p in lock["guest_profiles"]):
                 raise InfrastructureError("realized common image does not match both frozen profile witnesses")
             self._owns_resources = True
             self._compose("up", "-d", "--build", "service", "worker-eval" if self.profile == "eval-looking" else "worker-natural")
@@ -227,7 +239,7 @@ print(json.dumps(files,sort_keys=True))
             packages = _run(["docker", "exec", worker, "sh", "-c", "dpkg-query -W; python -m pip list --format=json"]).stdout
             (self.evidence_root / f"{self.project}.packages.txt").write_text(packages)
             self.resources["realized_packages_sha256"] = hashlib.sha256(packages.encode()).hexdigest()
-            if any(self.resources["realized_packages_sha256"] != p["packages_digest"]
+            if self.image_pin_override is None and any(self.resources["realized_packages_sha256"] != p["packages_digest"]
                    for p in lock["guest_profiles"]):
                 raise InfrastructureError("realized packages do not match both frozen profile witnesses")
             self.resources["common_image"]["frozen_pin_completed"] = True

@@ -132,6 +132,9 @@ class ProtectedCheckpoint:
     def __call__(self):
         return self.verify()
 
+    def _image(self):
+        return self.episode.common_image if self.episode.image_pin_override else COMMON_IMAGE
+
     def _docker(self, *args, timeout=120):
         self.ledger.check()
         remaining = self.ledger.snapshot()['remaining']['overhead']['wall_seconds']
@@ -167,7 +170,7 @@ class ProtectedCheckpoint:
         container = None
         try:
             container = self._docker('create', '--name', name, '--network', 'none', '--memory', '2g', '--cpus', '2',
-                               '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', COMMON_IMAGE).decode().strip()
+                               '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', self._image()).decode().strip()
             self._docker('start', container)
             self._docker('exec', '-u', '0', container, 'mkdir', '-p', '/tmp/protected/scripts',
                    '/tmp/protected/eval/artifact_upload', '/private/tmp', '/tmp/source')
@@ -195,7 +198,7 @@ class ProtectedCheckpoint:
             done = subprocess.run(command, capture_output=True, timeout=max(1, remaining))
             private_write(target / 'stdout.log', done.stdout)
             private_write(target / 'stderr.log', done.stderr)
-            private_write(target / 'exit.json', json.dumps({'exit': done.returncode, 'image': COMMON_IMAGE,
+            private_write(target / 'exit.json', json.dumps({'exit': done.returncode, 'image': self._image(),
                           'network': 'none', 'source': str(source), 'protected_script_sha256': hashlib.sha256(
                               (ROOT / 'scripts/prepare_artifact_upload.py').read_bytes()).hexdigest()}).encode())
             if done.returncode:
@@ -289,7 +292,7 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
 
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
-                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None):
+                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None):
     from urllib.parse import urlsplit
     local_only = (not local_acceptance or model != 'test-canary' or policy.microusd_per_token != 0
                   or provider_api_key != 'sk-local-acceptance'
@@ -307,6 +310,10 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         raise ValueError('unsupported proxy mode')
     if proxy_mode == 'llm' and (not isinstance(live, dict) or not live.get('proposer') or not live.get('budget')):
         raise ValueError('llm proxy requires configured live clients and budget')
+    if guest_image_id is not None and proxy_mode != 'llm':
+        raise ValueError('guest image override is restricted to llm live-preview runs')
+    override = ({'requested': guest_image_id, 'locked': COMMON_IMAGE, 'reason': 'live-preview development only'}
+                if guest_image_id is not None else None)
     from .rules import default_ruleset
     from .live import LABELS, LivePresentation, ScriptPresentation
     ruleset = ruleset or default_ruleset()
@@ -326,7 +333,8 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     episode_type = LocalPositiveControlEpisode if control else Episode
     episode = episode_type(condition, run_id, root / 'episode',
                       **({'control_configuration': control} if control else {}), preparer=presentation.prepare,
-                      service_aliases=presentation.service_aliases, common_image=COMMON_IMAGE)
+                      service_aliases=presentation.service_aliases, common_image=guest_image_id or COMMON_IMAGE,
+                      **({'image_pin_override': override} if override else {}))
     adapter = worker = None
     result = {'run_id': run_id, 'condition': condition, 'acceptance_complete': False,
               'experiment_role': POSITIVE_CONTROL if control else ('live-proxy-preview' if proxy_mode == 'llm' else 'frozen-quota-episode'),
@@ -334,6 +342,8 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     if proxy_mode == 'llm':
         result.update(experiment_role='live-proxy-preview', measured_episode=LABELS['measured_episode'],
                       result_class=LABELS['result_class'], measured_auxiliary={'protocol_valid': LABELS['protocol_valid']})
+    if override:
+        result['image_pin_override'] = dict(override)
     if approval_provenance is not None:
         result.update(experiment_role=APPROVED_DELETION_CONTROL, control_approval=approval_provenance,
                       measured_episode=False)
