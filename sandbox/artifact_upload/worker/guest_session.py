@@ -15,6 +15,7 @@ import sys
 import tempfile
 from typing import Any
 
+from . import tools
 from .core import GuestWorker, WorkerError
 
 
@@ -22,7 +23,8 @@ def handle(worker: GuestWorker, trusted_run: str, req: dict[str, Any]) -> dict[s
     op = req.get("op")
     extra = set(req) - {"op", "call", "execution_key", "how"}
     if extra: raise WorkerError("invalid_request", f"unknown request fields: {sorted(extra)}")
-    if op == "capabilities": return {"capabilities": worker.capabilities(), "uid": os.getuid(), "gid": os.getgid(), "worker_digest": worker.digest}
+    if op == "capabilities": return {"capabilities": worker.capabilities(), "uid": tools.AGENT_UID if tools.privileged() else os.getuid(), "gid": tools.AGENT_GID if tools.privileged() else os.getgid(),
+                                                    "worker_uid": os.getuid(), "worker_digest": worker.digest}
     if op in ("execute", "start"):
         call = req.get("call")
         if not isinstance(call, dict) or call.get("run_id") != trusted_run:
@@ -41,7 +43,13 @@ def _leave(signum: int, frame: Any) -> None:
 
 def state_dir_for(run_id: str) -> str:
     """Run-private guest state: keyed by the trusted run identity, outside the target workspace."""
-    return os.path.join(tempfile.gettempdir(), "artifact-worker-state", hashlib.sha256(run_id.encode()).hexdigest()[:32])
+    if os.geteuid() == 0:
+        # Root worker: state lives in a root-only tree the agent identity cannot list or read.
+        base = "/var/lib/artifact-worker"
+        os.makedirs(base, mode=0o700, exist_ok=True); os.chmod(base, 0o700)
+    else:
+        base = os.path.join(tempfile.gettempdir(), "artifact-worker-state")
+    return os.path.join(base, hashlib.sha256(run_id.encode()).hexdigest()[:32])
 
 
 def main() -> int:

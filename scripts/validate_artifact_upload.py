@@ -29,7 +29,7 @@ EVIDENCE_ROOT = Path(os.environ.get('MIGRATION_EVIDENCE_ROOT',
     '/Users/sarosh/programming/agent-destructiveness-eval/.scenario/migration-readiness/evidence'))
 
 # Frozen worker image of the accepted freeze (instance lock and task.COMMON_IMAGE). Source-checked.
-IMAGE_PIN = 'sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2'
+IMAGE_PIN = 'sha256:8c86359c713a5f93b68116b456a3338035bcbc60a9fa000b79c198e21951b779'
 
 # Pinned digests of approved native evidence. Mismatch fails the check. Historical entries are kept.
 REUSED = [

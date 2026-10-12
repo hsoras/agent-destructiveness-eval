@@ -7,6 +7,8 @@ permission prompts, bus events) are disabled and declared in DISABLED_FEATURES.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import errno
 import json
 import os
@@ -17,6 +19,38 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Callable
+
+# ---- privilege split: the worker may run as root; everything the agent drives runs as the agent uid/gid.
+AGENT_UID = int(os.environ.get("ARTIFACT_AGENT_UID", "1000"))
+AGENT_GID = int(os.environ.get("ARTIFACT_AGENT_GID", str(AGENT_UID)))
+
+
+def privileged() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def spawn_kwargs() -> dict:
+    """subprocess.Popen/run arguments that drop an agent-driven child to the agent identity (empty when not root)."""
+    return {"user": AGENT_UID, "group": AGENT_GID, "extra_groups": []} if privileged() else {}
+
+
+@contextlib.contextmanager
+def as_agent():
+    """Perform in-process file access with the agent's filesystem identity (per thread; no-op when not root).
+
+    Changing the fsuid from 0 clears the filesystem override capabilities, so the worker cannot read
+    root-only paths on the agent's behalf.
+    """
+    if not privileged():
+        yield
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.setfsgid(AGENT_GID); libc.setfsuid(AGENT_UID)
+    try:
+        yield
+    finally:
+        libc.setfsuid(0); libc.setfsgid(0)
+
 
 DISABLED_FEATURES = ("lsp", "automatic_formatters", "persistent_terminals", "command_expansion", "delegation")
 DEFAULT_READ_LIMIT = 2000
@@ -547,7 +581,7 @@ def glob(ctx: Ctx, a: dict) -> str:
     if os.path.isfile(search): raise ToolError(f"glob path must be a directory: {search}", "find_failed")
     if not os.path.isdir(search): raise ToolError(f"No such file or directory: '{search}'", "find_failed")
     rg = _need_rg(ctx)
-    p = subprocess.run([rg, "--no-config", "--files", "--glob=!.git/*", "--hidden", f"--glob={a['pattern']}", "."], cwd=search, env=rg_env(), stdin=subprocess.DEVNULL, capture_output=True)
+    p = subprocess.run([rg, "--no-config", "--files", "--glob=!.git/*", "--hidden", f"--glob={a['pattern']}", "."], cwd=search, env=rg_env(), stdin=subprocess.DEVNULL, capture_output=True, **spawn_kwargs())
     if p.returncode not in (0, 1):
         raise ToolError(p.stderr.decode("utf-8", "replace").strip() or f"ripgrep failed with code {p.returncode}", "find_failed")
     files = []
@@ -591,7 +625,7 @@ def grep(ctx: Ctx, a: dict) -> str:
     if a.get("include"): cmd.append(f"--glob={a['include']}")
     cmd += ["--", a["pattern"], *(file or ["."])]
     if not os.path.isdir(cwd): return "No files found"
-    p = subprocess.run(cmd, cwd=cwd, env=rg_env(), stdin=subprocess.DEVNULL, capture_output=True)
+    p = subprocess.run(cmd, cwd=cwd, env=rg_env(), stdin=subprocess.DEVNULL, capture_output=True, **spawn_kwargs())
     if p.returncode not in (0, 1, 2):
         raise ToolError(p.stderr.decode("utf-8", "replace").strip() or f"ripgrep failed with code {p.returncode}", "grep_failed")
     items, partial = [], p.returncode == 2

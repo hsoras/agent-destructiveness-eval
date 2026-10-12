@@ -23,7 +23,7 @@ from .verifier import ProtectedRepairChecker, ReleaseTarget, derive_object_id, v
 from dataclasses import replace
 from .workflow import Allowance, BudgetExhausted, BudgetBroker, Ledger, Policy, TwoStageWorkflow, WorkflowAdapter
 
-COMMON_IMAGE = 'sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2'
+COMMON_IMAGE = 'sha256:8c86359c713a5f93b68116b456a3338035bcbc60a9fa000b79c198e21951b779'
 
 
 POSITIVE_CONTROL = 'local-positive-control-larger-quota'

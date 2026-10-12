@@ -297,7 +297,8 @@ def test_source_identities_name_algorithms_and_cover_deployed_worker_scope():
 # worker-freeze-sol-20261011/full-native-receipt.json SHA256
 # 7cfad1ae2e40a840a7d0592b35de4c983162fb41d17429fa9b9148acd39cd89e.
 # Historical T012 receipts retain 08f8350672543345e9f13459f2d1be25ede50db62c5ab765a76a9e6daa16a2a2.
-SAVED_REALIZED_WORKER = 'ea8ec833d4451e9c8ba5d4bf8d5c26b599e45d5c222a1aa8cc60b33d71243052'
+# 2026-10-12 uid-split re-baseline: the worker files changed (previous frozen digest ea8ec833...052).
+SAVED_REALIZED_WORKER = '66e889f5128b37ed79784dce5362f46e07b52ab5494151ecf6777894188e15d6'
 
 
 def test_saved_genuine_worker_receipt_matches_frozen_deployed_digest():
