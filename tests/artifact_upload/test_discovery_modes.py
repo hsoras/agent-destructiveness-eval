@@ -590,3 +590,74 @@ def test_real_transport_deadline_stops_trickling_response_without_retry():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def _retry_upstream(script):
+    """Fake upstream replaying scripted (status, body, headers) tuples; the last repeats."""
+    calls = []
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.0'
+        def log_message(self, *_args): pass
+        def do_POST(self):
+            calls.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            status, body, headers = script[min(len(calls) - 1, len(script) - 1)]
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers(); self.wfile.write(body)
+            self.wfile.flush()
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    return server, thread, calls
+
+
+def _post_guard(script, **kwargs):
+    import urllib.error
+    import urllib.request
+    server, thread, calls = _retry_upstream(script)
+    audited = []
+    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [],
+                          retry_backoff=(0.01,), **kwargs).start()
+    try:
+        request = urllib.request.Request(guard.url + '/v1/chat/completions', data=b'{"model":"m"}', headers={'Content-Type': 'application/json'})
+        try:
+            response = urllib.request.urlopen(request, timeout=5)
+            status, body = response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, exc.read()
+        return status, body, calls, audited, guard
+    finally:
+        guard.close(); server.shutdown(); server.server_close(); thread.join()
+
+
+def test_provider_guard_retries_transient_502_then_relays_200():
+    status, body, calls, audited, guard = _post_guard([(502, b'{"error":"x"}', {}), (200, b'{"ok":1}', {})])
+    assert status == 200 and body == b'{"ok":1}'
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert len(audited) == 1 and guard.stats['received'] == 1 and guard.stats['audited'] == 1 and guard.stats['forwarded'] == 1
+    summary = guard.provider_summary()
+    assert summary['retries'] == 1 and summary['retry_log'][0]['attempt'] == 1 and summary['retry_log'][0]['status'] == 502
+
+
+def test_provider_guard_relays_final_error_after_exhausting_retries():
+    status, body, calls, audited, guard = _post_guard([(502, b'{"error":"down"}', {})])
+    assert status == 502 and body == b'{"error":"down"}'
+    assert len(calls) == 4 and guard.provider_summary()['retries'] == 3 and len(audited) == 1
+
+
+def test_provider_guard_does_not_retry_4xx_or_when_disabled():
+    status, _, calls, _, guard = _post_guard([(400, b'{}', {}), (200, b'{}', {})])
+    assert status == 400 and len(calls) == 1 and guard.provider_summary()['retries'] == 0
+    status, _, calls, _, guard = _post_guard([(502, b'{}', {}), (200, b'{}', {})], upstream_retries=0)
+    assert status == 502 and len(calls) == 1 and guard.provider_summary()['retries'] == 0
+
+
+def test_provider_guard_honors_short_retry_after_on_429():
+    status, _, calls, _, guard = _post_guard([(429, b'{}', {'Retry-After': '0'}), (200, b'{}', {})])
+    assert status == 200 and len(calls) == 2
+
+
+def test_provider_guard_never_retries_after_streaming_started():
+    # Headers+first bytes were relayed as a 200 stream that then breaks: no second upstream call.
+    status, body, calls, _, guard = _post_guard([(200, b'data: {"provider":"p"}\n\n', {'Content-Type': 'text/event-stream'}), (200, b'{}', {})])
+    assert status == 200 and len(calls) == 1 and guard.provider_summary()['retries'] == 0

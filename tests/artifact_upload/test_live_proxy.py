@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from eval.artifact_upload.discovery import AuxiliaryError, MeasuredPresenter, Reply
-from eval.artifact_upload.live import LABELS, LiveBudget, LivePresentation, ScriptPresentation, _Unfenced
+from eval.artifact_upload.discovery import AuxiliaryError, AuxiliaryHTTPError, MeasuredPresenter, Reply
+from eval.artifact_upload.live import LABELS, LiveBudget, LivePresentation, ScriptPresentation, _Unfenced, _soft_failure
 from eval.artifact_upload.presentation import FrozenPresentation
 from eval.artifact_upload.recording import RunRecorder
 from eval.artifact_upload.rules import RuleSet, default_ruleset
@@ -325,7 +325,7 @@ def test_null_content_is_not_attributeerror_and_does_not_halt(tmp_path):
         out = live.present(call('ls -la && git log --oneline -5'), result('total 0\n'))
         assert out.output == 'total 0\n'
         rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
-        assert rec['reason'].startswith('rejected:AuxiliaryError: ') and 'finish_reason=length' in rec['reason']
+        assert rec['reason'] == 'aux-soft-failure:AuxiliaryError' and 'finish_reason=length' in rec['soft_failure']['message']
         u = live.usage()
         assert u['halted'] is False and u['calls'] == 1
         assert u['reported_cost_usd'] == pytest.approx(2 * (1000 * 1e-7 + 2048 * 1e-6))
@@ -474,3 +474,54 @@ def test_read_and_grep_never_sent_and_default_budget():
     assert not eligibility(call(op='read'), result(), b)[0] and not eligibility(call(op='grep'), result(), b)[0]
     lb = LiveBudget(1.0, .1)
     assert (lb.pairs, lb.seconds, lb.output_tokens) == (100, 90.0, 4096)
+
+
+def _script(*steps):
+    """Proposer replies in order: an exception is raised, a callable is applied to the payload, else returned."""
+    it = iter(steps)
+    def fn(p):
+        step = next(it)
+        if isinstance(step, Exception):
+            raise step
+        return step(p) if callable(step) else step
+    return fn
+
+
+def test_one_timeout_then_success_applies_rule_and_does_not_halt(tmp_path):
+    live, _ = build(tmp_path, _script(TimeoutError('timed out'), proposing(change())))
+    assert live.present(call(cid='a'), result()).output == RAW  # soft failure: fail open to raw
+    out = live.present(call(cid='b'), result(RAW.replace('100', '101'))).output
+    assert 'ephemeral' in out
+    u = live.usage()
+    assert u['halted'] is False and u['calls'] == 2 and u['aux_soft_failures'] == 1 and u['consecutive_failures'] == 0
+    first = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
+    assert first['reason'] == 'aux-soft-failure:TimeoutError'
+    assert first['soft_failure']['class'] == 'TimeoutError' and first['soft_failure']['seconds'] >= 0
+    assert live.receipt()['usage']['last_soft_error']['message'] == 'timed out'
+
+
+def test_three_consecutive_timeouts_halt_with_budget_halt(tmp_path):
+    live, _ = build(tmp_path, lambda p: TimeoutError('timed out'))
+    outs = [live.present(call(cid=str(i)), result(RAW.replace('100', str(100 + i)))) for i in range(4)]
+    assert all(o.output.startswith('Filesystem') for o in outs)
+    reasons = [e['reason'] for e in lines(tmp_path / 'out' / 'presentation-live.jsonl')]
+    assert reasons[-1] == 'budget-halt'
+    u = live.usage()
+    assert u['halted'] is True and u['calls'] == 3 and u['aux_soft_failures'] == 3 and u['consecutive_failures'] == 3
+    assert [r['reason'] for r in lines(tmp_path / 'out' / 'candidate_rules.jsonl')] == ['aux-soft-failure:TimeoutError'] * 3
+
+
+def test_success_resets_consecutive_soft_failures(tmp_path):
+    T = TimeoutError('timed out')
+    live, _ = build(tmp_path, _script(T, T, proposing(), T, T, proposing()))
+    for i in range(6):
+        live.present(call(cid=str(i)), result(RAW.replace('100', str(100 + i))))
+    u = live.usage()
+    assert u['halted'] is False and u['calls'] == 6 and u['aux_soft_failures'] == 4 and u['consecutive_failures'] == 0
+
+
+def test_soft_failure_classification():
+    assert _soft_failure(TimeoutError('timed out')) and _soft_failure(ConnectionResetError()) and _soft_failure(AuxiliaryHTTPError(503))
+    assert _soft_failure(AuxiliaryError('auxiliary reply content empty', cost_usd=0.0))
+    assert not _soft_failure(AuxiliaryHTTPError(400)) and not _soft_failure(RuntimeError('boom'))
+    assert not _soft_failure(ValueError('auxiliary response lacks usage'))

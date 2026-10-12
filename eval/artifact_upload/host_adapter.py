@@ -528,6 +528,9 @@ class RouterBridge:
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 
 
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
 def is_openrouter(url: str) -> bool:
     """Whether a configured upstream is hosted by OpenRouter."""
     try:
@@ -549,7 +552,10 @@ class ProviderGuard:
     def __init__(self, upstream_base_url: str, audit: Callable[[dict[str, Any]], list[dict[str, Any]]], *,
                  max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0,
                  zdr: bool | None = None, force_openrouter: bool = False,
-                 provider_pin: str | list[str] | None = None):
+                 provider_pin: str | list[str] | None = None, upstream_retries: int = 3,
+                 retry_backoff: tuple[float, ...] = (1.0, 3.0, 8.0)):
+        self.upstream_retries, self.retry_backoff = max(0, int(upstream_retries)), tuple(retry_backoff)
+        self.retry_log: list[dict[str, Any]] = []
         self.upstream = urllib.parse.urlsplit(upstream_base_url)
         if self.upstream.scheme not in {"http", "https"} or not self.upstream.hostname:
             raise ValueError("provider_base_url must be an http(s) URL")
@@ -601,16 +607,49 @@ class ProviderGuard:
         except ValueError as exc:
             return self._refuse(handler, 400, f"OpenRouter request could not be forwarded with ZDR: {exc}")
         connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
-        connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
-        try:
-            headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
-            headers["Content-Length"] = str(len(raw))
-            path = self.upstream.path.rstrip("/") + handler.path
-            connection.request("POST", path, body=raw, headers=headers)
-            response = connection.getresponse()
-        except (OSError, http.client.HTTPException) as exc:
-            connection.close()
-            return self._refuse(handler, 502, f"provider unreachable: {type(exc).__name__}")
+        headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
+        headers["Content-Length"] = str(len(raw))
+        path = self.upstream.path.rstrip("/") + handler.path
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
+            connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
+            status, retry_after, error = None, None, None
+            try:
+                connection.request("POST", path, body=raw, headers=headers)
+                response = connection.getresponse()
+                status = response.status
+                retry_after = response.getheader("Retry-After")
+            except (OSError, http.client.HTTPException) as exc:
+                connection.close()
+                error = type(exc).__name__
+            if error is None and status not in _RETRY_STATUSES:
+                break
+            if attempt > self.upstream_retries:  # out of retries: relay the final error unchanged
+                if error is not None:
+                    return self._refuse(handler, 502, f"provider unreachable: {error}")
+                break
+            served = None
+            if error is None:
+                try:
+                    served = self._served_provider(response.read())
+                except (OSError, http.client.HTTPException):
+                    pass
+                connection.close()
+            delay = self.retry_backoff[min(attempt - 1, len(self.retry_backoff) - 1)] if self.retry_backoff else 0.0
+            try:
+                if retry_after is not None and 0 <= float(retry_after) <= 10:
+                    delay = float(retry_after)
+            except ValueError:
+                pass
+            entry = {"attempt": attempt, "status": status, "error": error,
+                     "elapsed": round(time.monotonic() - started, 3), "served_provider": served}
+            with self._lock:
+                self.retry_log.append(entry)
+            self._on_retry(entry)
+            logging.getLogger(__name__).warning("upstream %s on attempt %d; retrying in %.1fs", status or error, attempt, delay)
+            time.sleep(delay)
         self._count("forwarded")
         try:
             handler.send_response(response.status)
@@ -635,6 +674,9 @@ class ProviderGuard:
             pass  # the runtime went away or the stream broke; nothing further is relayed
         finally:
             connection.close()
+
+    def _on_retry(self, entry: dict[str, Any]) -> None:
+        """Hook for evidence recorders; a retry is the same audited request, never a new one."""
 
     def _forwarded_raw(self, raw: bytes) -> bytes:
         """Return the upstream body, keeping the audited request bytes untouched."""
@@ -679,7 +721,7 @@ class ProviderGuard:
 
     def provider_summary(self) -> dict[str, Any]:
         return {"pin": self.provider_pin, "served_providers": dict(self.served_providers),
-                "mismatch": self.provider_mismatch}
+                "mismatch": self.provider_mismatch, "retries": len(self.retry_log), "retry_log": list(self.retry_log)}
 
     def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         guard = self

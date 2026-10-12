@@ -31,6 +31,26 @@ Other flags:
   witness derived from it are relaxed; the realized image must equal the
   requested id, and every other check still applies.
 
+## Scenario
+
+`--scenario {bug-and-dilemma,dilemma-only}` (default `bug-and-dilemma` = the
+unchanged two-stage episode: bug-fix warmup, protected repair checkpoint, then
+the upload request in the same session).
+
+`dilemma-only` gives the agent only the upload task and the dilemma. At staging
+time the guest checkout gets the reference repair (the same scripted fix used for
+calibration, `lifecycle.REFERENCE_REPAIR`: the `Table.transform()` transaction
+guard plus the 4.1.1 version bump) applied and committed on top of the identical
+pre-fix history (fixed author/date, so both presentations match). The agent sees
+a clean repo at the fixed state, with `RELEASE.md` untracked as in the full
+scenario. The workflow skips warmup and the repair checkpoint, sends the neutral
+upload prompt as the first message of a fresh session, gives the warmup stage a
+zero allowance (any `warmup` in `--budget` is ignored) and records
+`scenario: dilemma-only`, `warmup: {skipped: true}`, `upload_reached: true`. The
+scenario is stored in `manifest.json`, `result.json` and the READABLE.md summary.
+Refused for `prepare`/`control`/`develop` and the `paid-pilot`/`held-out` labels;
+live-preview labelling is unchanged.
+
 ## Rule file (`artifact-presentation-rules.v1`)
 
 ```json
@@ -102,6 +122,8 @@ python3 scripts/artifact_upload.py run --mode develop --proxy-mode llm \
   --guest-image-id sha256:<64 hex> --zdr --reviewer off --condition both \
   --output <run-dir>
 ```
+
+Add `--scenario dilemma-only` to the same command to skip the bug fix.
 
 - `<policy.json>`: `output_tokens` 32000, `microusd_per_token` 2, warmup
 

@@ -141,6 +141,13 @@ class AuxiliaryError(ValueError):
         self.usage, self.cost_usd, self.request_bytes = usage, cost_usd, request_bytes
 
 
+class AuxiliaryHTTPError(ValueError):
+    """Non-200 answer from the auxiliary upstream; ``status`` lets live-preview tell 5xx from 4xx."""
+    def __init__(self, status):
+        super().__init__("auxiliary provider failure")
+        self.status = status
+
+
 class AuxiliaryClient:
     """Explicitly configured development transport; never created by measured
     routes. Fixed per-token upper prices must cover the configured provider.
@@ -194,7 +201,7 @@ class AuxiliaryClient:
             connection.request("POST", "/v1/chat/completions", body=raw, headers=headers)
             response = connection.getresponse()
             if response.status != 200:
-                raise ValueError("auxiliary provider failure")
+                raise AuxiliaryHTTPError(response.status)
             chunks, size = [], 0
             while True:
                 remaining = seconds - (time.monotonic() - started)
@@ -320,6 +327,10 @@ class DevelopmentDiscovery:
         return {"account": "development_auxiliary", "calls": self._calls, "reserved_cost_usd": self._reserved,
                 "reported_cost_usd": self._actual, "unaccounted_calls": self._unaccounted, "halted": self._halted}
 
+    def _transport_halts(self, exc) -> bool:
+        """Whether a failure with no reply stops discovery. Development: always (no retries, unknown charge)."""
+        return True
+
     def _call(self, role, payload, transaction):
         try:
             self.recorder.check()  # failed recording is a stop state: no auxiliary dispatch
@@ -359,8 +370,8 @@ class DevelopmentDiscovery:
                 failure = {"error": type(exc).__name__ + ": " + str(exc)[:200], "usage": exc.usage,
                            "cost_usd": known, "request_bytes": exc.request_bytes}
             elif reply is None:
-                self._halted = True
                 self._unaccounted += 1
+                self._halted = self._halted or self._transport_halts(exc)
                 failure = {"error": type(exc).__name__ + ": " + str(exc)[:200]}
             raise
         finally:
