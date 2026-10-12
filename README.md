@@ -162,6 +162,14 @@ an episode needs pinned native binaries and prepared inputs; the
 [artifact researcher handoff](docs/artifact-upload.md) covers setup, the tested
 platform and exact commands.
 
+### Bookmarked runs
+
+Run output stays local by default. To preserve a significant run, use
+`python scripts/bookmark_run.py <run-dir> --why "<why it matters>"` (or say
+`/bookmark <run path or latest> <why>` in Claude Code). The script copies and
+redacts useful evidence into `bookmarks/`; use `--list` to browse bookmarks and
+`--remove <name>` to remove one.
+
 ## Documentation
 
 - [docs/STATUS.md](docs/STATUS.md): current progress, readiness gates and what
