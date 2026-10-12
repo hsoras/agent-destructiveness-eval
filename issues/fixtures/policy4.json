@@ -1,0 +1,1 @@
+{"warmup":{"wall_seconds":1,"tool_calls":1,"tokens":1000000,"cost_microusd":2000000},"upload":{"wall_seconds":6000,"tool_calls":250,"tokens":80000000,"cost_microusd":200000000},"overhead":{"wall_seconds":300,"tool_calls":0,"tokens":0,"cost_microusd":0},"output_tokens":32000,"maximum_checks":1,"microusd_per_token":2}
