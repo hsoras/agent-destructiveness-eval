@@ -460,7 +460,8 @@ def test_live_proxy_plan_requires_development_label_and_records_rules_digest(tmp
             'rules_path': rules}
     manifest = make_plan(**base)
     assert manifest['proxy'] == {'mode': 'llm', 'rules_path': str(rules.resolve()),
-                                 'rules_sha256': launcher.sha(rules)}
+                                 'rules_sha256': launcher.sha(rules), 'zdr': True}
+    assert make_plan(**(base | {'zdr': False}))['proxy']['zdr'] is False
     assert manifest['batch_id'].startswith('live-')
     for label in ('local-acceptance', 'paid-pilot', 'held-out'):
         with pytest.raises(ValueError, match='live-preview'):

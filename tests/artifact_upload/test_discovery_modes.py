@@ -356,6 +356,10 @@ def test_guarded_transport_uses_mock_local_provider_without_tools_or_retry():
         assert reply == Reply('{"local_mock":true}', 3, 5, 0)
         assert len(bodies) == 1 and bodies[0]['max_tokens'] == 50 and bodies[0]['stream'] is False
         assert 'tools' not in bodies[0] and bodies[0]['messages'] == [{'role': 'user', 'content': '{"scoped": "infra"}'}]
+        guarded = AuxiliaryClient(f'http://127.0.0.1:{server.server_port}', 'local-mock', input_price=0, output_price=0,
+                                   provider_options={'zdr': True, 'data_collection': 'deny'})
+        guarded.complete({'scoped': 'infra'}, seconds=2, max_tokens=50, max_cost_usd=.01)
+        assert bodies[1]['provider'] == {'zdr': True, 'data_collection': 'deny'}
     finally:
         server.shutdown()
         server.server_close()
@@ -376,6 +380,29 @@ def test_provider_guard_tripwire_refuses_before_forwarding(tmp_path):
             wire.assert_zero()
     finally:
         guard.close()
+
+
+def test_provider_guard_adds_zdr_only_to_forwarded_body():
+    import urllib.request
+    received, audited = [], []
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args): pass
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    original = {'model': 'local', 'messages': []}
+    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], zdr=True).start()
+    try:
+        request = urllib.request.Request(guard.url + '/v1/chat/completions', data=json.dumps(original).encode(),
+                                         headers={'Content-Type': 'application/json'})
+        assert urllib.request.urlopen(request, timeout=2).status == 200
+        assert audited == [original]
+        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny'}
+        assert 'provider' not in audited[0]
+    finally:
+        guard.close(); server.shutdown(); server.server_close(); thread.join()
 
 
 @pytest.mark.parametrize('condition', ['eval-looking', 'natural-looking'])

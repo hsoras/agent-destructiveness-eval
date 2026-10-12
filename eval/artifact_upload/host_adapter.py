@@ -537,11 +537,13 @@ class ProviderGuard:
     """
 
     def __init__(self, upstream_base_url: str, audit: Callable[[dict[str, Any]], list[dict[str, Any]]], *,
-                 max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0):
+                 max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0,
+                 zdr: bool = False):
         self.upstream = urllib.parse.urlsplit(upstream_base_url)
         if self.upstream.scheme not in {"http", "https"} or not self.upstream.hostname:
             raise ValueError("provider_base_url must be an http(s) URL")
         self.audit, self.max_request_bytes, self.upstream_timeout = audit, max_request_bytes, upstream_timeout
+        self.zdr = zdr
         self.stats = {"received": 0, "audited": 0, "forwarded": 0, "refused": 0}
         self.refusals: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -577,6 +579,7 @@ class ProviderGuard:
         handler.wfile.write(payload)
 
     def _forward(self, handler: http.server.BaseHTTPRequestHandler, raw: bytes) -> None:
+        raw = self._forwarded_raw(raw)
         connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
         try:
@@ -603,6 +606,15 @@ class ProviderGuard:
             pass  # the runtime went away or the stream broke; nothing further is relayed
         finally:
             connection.close()
+
+    def _forwarded_raw(self, raw: bytes) -> bytes:
+        """Return the upstream body, keeping the audited request bytes untouched."""
+        if not self.zdr:
+            return raw
+        body = json.loads(raw)
+        body["provider"] = {**(body.get("provider") if isinstance(body.get("provider"), dict) else {}),
+                            "zdr": True, "data_collection": "deny"}
+        return json.dumps(body).encode()
 
     def _handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         guard = self
@@ -756,7 +768,7 @@ class HostOpenCodeAdapter:
                  presenter: Presenter | None = None, today: str | None = None, provider_api_key: str = "sk-none",
                  context_limit: tuple[int, int] | None = None, autocompact: bool = False,
                  runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024,
-                 allow_provider_qualified_model: bool = False):
+                 allow_provider_qualified_model: bool = False, zdr: bool = False):
         if not allow_provider_qualified_model:
             if not model or "/" in model:
                 raise ValueError("model must be a bare model ID served by the configured provider")
@@ -768,6 +780,7 @@ class HostOpenCodeAdapter:
         self.model, self.base_url, self.api_key = model, provider_base_url, provider_api_key
         self.today, self.context_limit, self.autocompact = today, context_limit, autocompact
         self.max_request_bytes = max_request_bytes
+        self.zdr = zdr
         self.guard: ProviderGuard | None = None
         self.runtime_flags = dict(HOST_RUNTIME_FLAGS if runtime_flags is None else runtime_flags)
         self.stage = Path(stage_root) if stage_root else Path(tempfile.mkdtemp(prefix="artifact-host-stage-")).resolve()
@@ -875,7 +888,7 @@ class HostOpenCodeAdapter:
                 'import { tool } from "@opencode-ai/plugin";\nimport { routedTool } from "../lib/tool_stub.ts";\n'
                 f'export default routedTool("{name}", tool);\n')
         # Every provider request of a routed turn passes through the guard before it leaves the host.
-        self.guard = ProviderGuard(self.base_url, self.audit_request, max_request_bytes=self.max_request_bytes).start()
+        self.guard = ProviderGuard(self.base_url, self.audit_request, max_request_bytes=self.max_request_bytes, zdr=self.zdr).start()
         self._write_opencode_config(self.config_dir, self.guard.url, router=True)
         self._staged = True
 

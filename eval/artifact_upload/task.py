@@ -292,7 +292,7 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
 
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
-                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None):
+                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=True):
     from urllib.parse import urlsplit
     local_only = (not local_acceptance or model != 'test-canary' or policy.microusd_per_token != 0
                   or provider_api_key != 'sk-local-acceptance'
@@ -376,7 +376,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             credentials=credentials,
             guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
             context_limit=(200_000, policy.output_tokens),
-            allow_provider_qualified_model=proxy_mode == 'llm')
+            allow_provider_qualified_model=proxy_mode == 'llm', zdr=(proxy_mode == 'llm' and zdr))
         if measured:
             measured.tripwire.recorder = adapter.recorder
         elif proxy_mode == 'llm':

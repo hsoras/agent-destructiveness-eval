@@ -136,11 +136,12 @@ class AuxiliaryClient:
     No tools, streaming, automatic retries, or target context are sent.
     Local acceptance substitutes mocked replies instead of calling providers.
     """
-    def __init__(self, upstream, model, *, input_price, output_price, api_key=None):
+    def __init__(self, upstream, model, *, input_price, output_price, api_key=None, provider_options=None):
         if not model or any(not math.isfinite(x) or x < 0 for x in (input_price, output_price)):
             raise ValueError("model and nonnegative per-token prices required")
         self.upstream, self.model, self.api_key = upstream, model, api_key
         self.input_price, self.output_price = input_price, output_price
+        self.provider_options = provider_options
 
     def complete(self, payload, *, seconds, max_tokens, max_cost_usd):
         prompt = json.dumps(payload, sort_keys=True, ensure_ascii=True)
@@ -149,6 +150,8 @@ class AuxiliaryClient:
             raise ValueError("request cannot fit reserved cost")
         body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens, "stream": False}
+        if self.provider_options is not None:
+            body["provider"] = dict(self.provider_options)
         raw = json.dumps(body).encode()
         def audit(actual):
             return [] if actual == body else [{"reason": "unexpected auxiliary request"}]

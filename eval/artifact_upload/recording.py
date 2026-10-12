@@ -224,7 +224,9 @@ class RecordingProviderGuard(ProviderGuard):
                      "model_revision": None, "model_revision_status": "unknown",
                      "source_config": self.route_source}
             captured = {"model_view_event_id": eid, "wire_sha256": hashlib.sha256(raw).hexdigest(),
-                        "route_provenance": route}
+                        "route_provenance": route,
+                        "original_provider": body.get("provider"),
+                        "forwarded_provider": json.loads(self._forwarded_raw(raw)).get("provider")}
             self.recorder.append("proxy_events", {"kind": "captured_route", **captured})
             if self.after_capture is not None:
                 try:
