@@ -46,7 +46,7 @@ import time
 import uuid
 
 from .contracts import argument_digest
-from .discovery import AuxiliaryError, DevelopmentDiscovery, Reply, _object, sha
+from .discovery import AuxiliaryError, AuxiliaryHTTPError, DevelopmentDiscovery, Reply, _object, sha
 from .host_adapter import PassthroughPresenter, Presented
 from .presentation import FrozenPresentation
 from .rules import RuleError, RuleSet, check_rendering, protected_facts
@@ -315,6 +315,7 @@ class LiveDecision:
     proposal: dict | None = None
     review: dict | None = None
     warnings: list = field(default_factory=list)  # tolerated defects in an empty (no-change) proposal
+    soft_failure: dict | None = None  # transport soft failure: class, message, elapsed seconds
 
 
 def _profile_view(manifest: dict) -> dict:
@@ -348,6 +349,26 @@ def _no_change_warnings(proposal: dict, raw_sha: str, ruleset: RuleSet) -> list:
     return warnings
 
 
+SOFT_HALT_AFTER = 3  # consecutive soft failures before live discovery halts for the episode
+
+
+def _soft_failure(exc) -> bool:
+    """Transport trouble that can be passed through: timeout, connection error, HTTP 5xx, or a 200 whose
+    reply is unusable with known cost. Unknown usage and 4xx stay hard (halting) failures."""
+    if isinstance(exc, AuxiliaryError):
+        return True
+    if isinstance(exc, AuxiliaryHTTPError):
+        return exc.status >= 500
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+class _SoftFailure(Exception):
+    """Raised by LiveDiscovery._call for a soft failure; discover() turns it into a fail-open decision."""
+    def __init__(self, record, consecutive):
+        super().__init__(record["class"] + ": " + record["message"])
+        self.record, self.cls, self.consecutive = record, record["class"], consecutive
+
+
 class LiveDiscovery(DevelopmentDiscovery):
     """Wide-coverage rule proposer. Reuses DevelopmentDiscovery._call (budget, receipts, halting)."""
 
@@ -360,14 +381,37 @@ class LiveDiscovery(DevelopmentDiscovery):
         self._calls, self._reserved, self._actual, self._halted, self._unaccounted = 0, 0.0, 0.0, False, 0
         self._decisions, self._reviews, self._promoted = {}, {}, set()
         self.aux_seconds = 0.0
+        self.soft_failures, self.consecutive_failures, self.last_soft_error = 0, 0, None
         self._recent = []  # last shell commands seen (consistency context for the proposer)
 
     def usage(self):
-        return {**super().usage(), "aux_seconds": self.aux_seconds}
+        return {**super().usage(), "aux_seconds": self.aux_seconds, "aux_soft_failures": self.soft_failures,
+                "consecutive_failures": self.consecutive_failures, "last_soft_error": self.last_soft_error}
 
     def exhausted(self) -> bool:
         return (self._halted or self._calls >= 2 * self.budget.pairs or
                 self._reserved + self.budget.max_call_cost_usd > self.budget.cost_usd + 1e-12)
+
+    def _transport_halts(self, exc) -> bool:
+        # Soft failures never halt on their own; _call halts after SOFT_HALT_AFTER in a row.
+        return not _soft_failure(exc)
+
+    def _call(self, role, payload, transaction):
+        started = time.monotonic()
+        try:
+            reply = super()._call(role, payload, transaction)
+        except Exception as exc:
+            if not _soft_failure(exc):
+                raise
+            self.soft_failures += 1
+            self.consecutive_failures += 1
+            seconds = round(time.monotonic() - started, 2)
+            self.last_soft_error = {"class": type(exc).__name__, "message": redact(str(exc)), "seconds": seconds}
+            if self.consecutive_failures >= SOFT_HALT_AFTER:
+                self._halted = True
+            raise _SoftFailure(self.last_soft_error, self.consecutive_failures) from exc
+        self.consecutive_failures = 0
+        return reply
 
     def _validate(self, proposal, raw_sha, ruleset: RuleSet):
         if isinstance(proposal, dict) and proposal.get("changes") == []:
@@ -440,6 +484,9 @@ class LiveDiscovery(DevelopmentDiscovery):
                 if not isinstance(review, dict) or review.get("verdict") != "approve":
                     return LiveDecision(False, "review-rejected", transaction, proposal=proposal, review=review)
             return LiveDecision(True, "accepted", transaction, candidate, enriched, proposal, review)
+        except _SoftFailure as exc:  # fail open: this output is shown raw; the next call may succeed
+            return LiveDecision(False, "aux-soft-failure:" + exc.cls, transaction, proposal=proposal, review=review,
+                                soft_failure={**exc.record, "consecutive_failures": exc.consecutive, "halted": self._halted})
         except Exception as exc:  # noqa: BLE001 - message is redacted
             return LiveDecision(False, "rejected:%s: %s" % (type(exc).__name__, redact(str(exc))), transaction, proposal=proposal, review=review)
         finally:
@@ -565,7 +612,8 @@ class LivePresentation(_FrozenPreparation):
         _jsonl(self.out_dir / "candidate_rules.jsonl", {
             "transaction_id": decision.transaction_id, "command": command, "raw_sha256": _digest(raw),
             "accepted": decision.accepted, "reason": decision.reason, "proposal": decision.proposal,
-            "review": decision.review, "warnings": decision.warnings, "ruleset_sha256_before": before.sha256,
+            "review": decision.review, "warnings": decision.warnings, "soft_failure": decision.soft_failure,
+            "ruleset_sha256_before": before.sha256,
             "ruleset_sha256_after": decision.ruleset.sha256 if decision.ruleset else None,
             "changes": decision.changes, "proposal_digest": argument_digest(decision.proposal) if decision.proposal else None})
         if decision.review is not None:
@@ -595,6 +643,9 @@ def render_report(start: RuleSet, final: RuleSet, changes: list, usage: dict, re
              f"- accepted changes: {len(changes)}; auxiliary calls: {usage.get('calls')}; "
              f"cost (reported): ${usage.get('reported_cost_usd', 0):.4f}; aux seconds: {usage.get('aux_seconds', 0):.1f}; "
              f"halted: {usage.get('halted')}", ""]
+    last = usage.get("last_soft_error")
+    lines.insert(4, f"- soft failures: {usage.get('aux_soft_failures', 0)} (consecutive: {usage.get('consecutive_failures', 0)}); "
+                    f"last soft error: " + (f"{last['class']} after {last['seconds']}s: {last['message']}" if last else "none"))
     if openrouter_provider is not None:
         lines.insert(2, f"- OpenRouter provider: `{json.dumps(openrouter_provider, sort_keys=True)}`")
 
