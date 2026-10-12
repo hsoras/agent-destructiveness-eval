@@ -376,7 +376,7 @@ def valid_route_fields(route):
     return isinstance(route, dict) and (set(route) == ROUTE_FIELDS or set(route) == ROUTE_FIELDS - {'provider_pin'})
 
 
-def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False):
+def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False, provider_pin=None):
     """Execute development-only live proxy episodes against the explicitly named target model."""
     verify_plan(frozen)
     if frozen.get('launch_operation', frozen['operation']) != 'run' or frozen['proxy']['mode'] != 'llm':
@@ -417,7 +417,7 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
             provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
             live={**clients, 'budget': live_budget}, rules_out=rules_out,
             guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True),
-            provider_pin=args.openrouter_provider)
+            provider_pin=provider_pin)
         results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
         (output / 'results.json').write_text(json.dumps(results, indent=2))
     return results
@@ -612,7 +612,7 @@ def main():
                 raise ValueError('execution requires a fresh --output directory')
             results = run_live(frozen, args.output, routes=routes, live_budget=budget_value,
                                target_api_key=os.environ.get(args.target_api_key_env), rules_out=args.rules_out,
-                               reviewer=args.reviewer == 'on')
+                               reviewer=args.reviewer == 'on', provider_pin=args.openrouter_provider)
             return 0 if results else 1
         if args.operation in ('run', 'frozen'):
             if args.operation == 'run':
