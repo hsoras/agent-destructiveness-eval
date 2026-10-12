@@ -1246,3 +1246,52 @@ def test_real_runtime_timeout_retains_native_streams_and_cancels_guest(harness, 
     assert guest_exec(guest, f"test -e {marker}").returncode != 0, "timed-out command still mutated the guest"
     save(artifact_dir, "timeout-real-runtime.json", {"elapsed_seconds": elapsed, "receipt": receipt, "journal": entry,
                                                     "binary_sha256": host_adapter.RUNTIME_SHA256})
+
+
+def _unstaged_adapter(tmp_path, model, **kwargs):
+    runtime = SimpleNamespace(binary=Path("/opt/opencode"))
+    profile = {"profile_id": "p", "condition": "eval-looking", "account": "agent", "uid": 1000, "gid": 1000, "hostname": "guest",
+               "home": "/home/agent", "worktree": "/work", "image_digest": "sha256:0", "packages_digest": "0" * 64,
+               "differences": [], "invariants": []}
+    return host_adapter.HostOpenCodeAdapter(run_id="r", broker=None, guest_profile=profile, guest_root=None,
+                                            provider_base_url="http://127.0.0.1:9", model=model,
+                                            stage_root=tmp_path / "stage", runtime=runtime, **kwargs)
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-oss-120b", "/bare", "bare/", ""])
+def test_default_model_must_be_a_bare_id(tmp_path, model):
+    with pytest.raises(ValueError, match="model must be a bare model ID served by the configured provider"):
+        _unstaged_adapter(tmp_path, model)
+
+
+@pytest.mark.parametrize("model", ["", " ", "openai/ gpt", "/openai/x", "openai/x/", "openai/../x", "openai//x", "openai/x\n", "openai/\x07x"])
+def test_provider_qualified_model_rejects_unsafe_ids(tmp_path, model):
+    with pytest.raises(ValueError, match="provider-qualified model ID"):
+        _unstaged_adapter(tmp_path, model, allow_provider_qualified_model=True)
+
+
+def test_provider_qualified_model_accepted_only_when_requested(tmp_path):
+    assert _unstaged_adapter(tmp_path, "openai/gpt-oss-120b", allow_provider_qualified_model=True).model == "openai/gpt-oss-120b"
+
+
+def test_provider_qualified_config_and_model_ref(tmp_path, monkeypatch):
+    adapter = _unstaged_adapter(tmp_path, "openai/gpt-oss-120b", allow_provider_qualified_model=True)
+    config = tmp_path / "config"
+    config.mkdir()
+    adapter._write_opencode_config(config, "http://127.0.0.1:4000", router=False)
+    provider = json.loads((config / "opencode.json").read_text())["provider"]["openrouter"]
+    assert provider["options"]["baseURL"] == "http://127.0.0.1:4000/v1"
+    assert provider["models"] == {"openai/gpt-oss-120b": {"name": "openai/gpt-oss-120b"}}
+    seen = {}
+
+    def capture(command, **kwargs):
+        seen["command"] = command
+        raise RuntimeError("stop before launch")
+
+    monkeypatch.setattr(host_adapter.subprocess, "Popen", capture)
+    with pytest.raises(RuntimeError, match="stop before launch"):
+        adapter._run_process(tmp_path / "root", tmp_path, config, ["hi"], tmp_path / "log")
+    ref = seen["command"][seen["command"].index("--model") + 1]
+    assert ref == "openrouter/openai/gpt-oss-120b"
+    # OpenCode splits the ref at the first slash: provider "openrouter", model "openai/gpt-oss-120b".
+    assert tuple(ref.split("/", 1)) == ("openrouter", "openai/gpt-oss-120b")

@@ -228,3 +228,45 @@ def test_presenters_expose_everything_task_touches(tmp_path, monkeypatch):
     assert live.provenance['auxiliary_model_calls'] == 3
     with pytest.raises(ValueError):
         LivePresentation.create(tmp_path / 'nocond', proposer=Mock('p', None), budget=LiveBudget(1, .1)).service_aliases
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize('proxy_mode, allowed', [('llm', True), ('script', False)])
+def test_run_episode_allows_provider_qualified_model_only_in_llm_mode(tmp_path, monkeypatch, proxy_mode, allowed):
+    from types import SimpleNamespace
+    from eval.artifact_upload import live, task
+    seen = {}
+
+    class FakeEpisode:
+        def __init__(self, *args, **kwargs):
+            self.api_token = 'tok'
+
+        def start(self):
+            return {'profile_manifest': {'worktree': '/guest/work'}, 'worker_container': 'worker'}
+
+    class FakeWorkflowAdapter:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            raise _Stop()
+
+    class FakeLivePresentation:
+        @staticmethod
+        def create(*args, **kwargs):
+            return SimpleNamespace(service_aliases={}, prepare=None)
+
+    monkeypatch.setattr(task, 'Episode', FakeEpisode)
+    monkeypatch.setattr(task, 'WorkflowAdapter', FakeWorkflowAdapter)
+    monkeypatch.setattr(task, 'GuestWorkerSession', lambda *a, **k: None)
+    monkeypatch.setattr(task, 'ExecutionBroker', lambda *a, **k: None)
+    monkeypatch.setattr(task, 'PinnedRuntime', SimpleNamespace(locate=lambda: None))
+    monkeypatch.setattr(live, 'LivePresentation', FakeLivePresentation)
+    live_clients = {'proposer': SimpleNamespace(api_key='k'), 'budget': LiveBudget(1, .1)} if proxy_mode == 'llm' else None
+    kwargs = dict(proxy_mode=proxy_mode, live=live_clients) if live_clients else dict(proxy_mode=proxy_mode)
+    # The fake adapter stops the run; the llm cleanup in run_episode's finally may raise too, so only `seen` is asserted.
+    with pytest.raises(Exception):
+        task.run_episode('eval-looking', tmp_path / 'evidence', 'http://127.0.0.1:9', 'openai/gpt-oss-120b', **kwargs)
+    assert seen.get('model') == 'openai/gpt-oss-120b'
+    assert seen.get('allow_provider_qualified_model', False) is allowed

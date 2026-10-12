@@ -738,6 +738,15 @@ def _summarise(events: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any]
     return session_id, usage, [e for e in events if e.get("type") == "error"]
 
 
+def _provider_qualified_model_ok(model: str) -> bool:
+    """Accept ``vendor/model`` ids (slashes allowed) but nothing that could escape or corrupt the ref."""
+    if not model or model != model.strip() or model.startswith("/") or model.endswith("/"):
+        return False
+    if ".." in model or "//" in model:
+        return False
+    return all(ch.isprintable() and not ch.isspace() for ch in model)
+
+
 class HostOpenCodeAdapter:
     """Own one run's host OpenCode staging, router bridge and session continuity."""
 
@@ -746,9 +755,13 @@ class HostOpenCodeAdapter:
                  runtime: PinnedRuntime | None = None, registry: OperationRegistry | None = None,
                  presenter: Presenter | None = None, today: str | None = None, provider_api_key: str = "sk-none",
                  context_limit: tuple[int, int] | None = None, autocompact: bool = False,
-                 runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024):
-        if not model or "/" in model:
-            raise ValueError("model must be a bare model ID served by the configured provider")
+                 runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024,
+                 allow_provider_qualified_model: bool = False):
+        if not allow_provider_qualified_model:
+            if not model or "/" in model:
+                raise ValueError("model must be a bare model ID served by the configured provider")
+        elif not _provider_qualified_model_ok(model):
+            raise ValueError("model must be a provider-qualified model ID such as openai/gpt-oss-120b")
         self.run_id, self.broker, self.profile = run_id, broker, dict(guest_profile)
         self.registry = registry or OperationRegistry()
         self.runtime = runtime or PinnedRuntime.locate()

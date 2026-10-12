@@ -375,7 +375,8 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             runtime=PinnedRuntime.locate(), recording_root=root / 'capture',
             credentials=credentials,
             guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
-            context_limit=(200_000, policy.output_tokens))
+            context_limit=(200_000, policy.output_tokens),
+            allow_provider_qualified_model=proxy_mode == 'llm')
         if measured:
             measured.tripwire.recorder = adapter.recorder
         elif proxy_mode == 'llm':
