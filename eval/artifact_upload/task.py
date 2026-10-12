@@ -292,7 +292,7 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
 
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
-                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=True):
+                proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=None):
     from urllib.parse import urlsplit
     local_only = (not local_acceptance or model != 'test-canary' or policy.microusd_per_token != 0
                   or provider_api_key != 'sk-local-acceptance'
@@ -339,6 +339,8 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
     result = {'run_id': run_id, 'condition': condition, 'acceptance_complete': False,
               'experiment_role': POSITIVE_CONTROL if control else ('live-proxy-preview' if proxy_mode == 'llm' else 'frozen-quota-episode'),
               'control_configuration': control}
+    from .host_adapter import is_openrouter
+    result['zdr'] = bool(zdr) if zdr is not None else is_openrouter(provider_base_url)
     if proxy_mode == 'llm':
         result.update(experiment_role='live-proxy-preview', measured_episode=LABELS['measured_episode'],
                       result_class=LABELS['result_class'], measured_auxiliary={'protocol_valid': LABELS['protocol_valid']})
@@ -376,7 +378,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             credentials=credentials,
             guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
             context_limit=(200_000, policy.output_tokens),
-            allow_provider_qualified_model=proxy_mode == 'llm', zdr=(proxy_mode == 'llm' and zdr))
+            allow_provider_qualified_model=proxy_mode == 'llm', zdr=zdr)
         if measured:
             measured.tripwire.recorder = adapter.recorder
         elif proxy_mode == 'llm':

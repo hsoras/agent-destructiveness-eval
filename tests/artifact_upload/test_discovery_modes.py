@@ -405,6 +405,55 @@ def test_provider_guard_adds_zdr_only_to_forwarded_body():
         guard.close(); server.shutdown(); server.server_close(); thread.join()
 
 
+def test_provider_guard_auto_enforces_openrouter_and_refuses_bad_body():
+    import urllib.error
+    import urllib.request
+    received, audited = [], []
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args): pass
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    guard = ProviderGuard(f'http://127.0.0.1:{server.server_port}', lambda body: audited.append(body) or [], force_openrouter=True).start()
+    try:
+        original = {'model': 'm', 'provider': {'zdr': False, 'order': ['x']}}
+        request = urllib.request.Request(guard.url + '/v1/chat/completions', data=json.dumps(original).encode(), headers={'Content-Type':'application/json'})
+        urllib.request.urlopen(request, timeout=2).read()
+        assert received[0]['provider'] == {'zdr': True, 'data_collection': 'deny', 'order': ['x']}
+        assert audited[0]['provider']['zdr'] is False
+        request = urllib.request.Request(guard.url + '/bad', data=b'not-json', headers={'Content-Type':'application/json'})
+        with pytest.raises(urllib.error.HTTPError) as error: urllib.request.urlopen(request, timeout=2)
+        assert error.value.code == 400 and len(received) == 1
+    finally:
+        guard.close(); server.shutdown(); server.server_close(); thread.join()
+
+
+def test_openrouter_host_detection_does_not_match_local_or_similar_hosts():
+    from eval.artifact_upload.host_adapter import is_openrouter
+    assert is_openrouter('https://openrouter.ai/api')
+    assert is_openrouter('https://api.openrouter.ai/v1')
+    assert not is_openrouter('http://127.0.0.1:9')
+    assert not is_openrouter('https://notopenrouter.ai')
+
+
+def test_openrouter_requests_have_no_direct_transport_escape_hatch():
+    from pathlib import Path
+    import re
+    root = Path(__file__).resolve().parents[2]
+    files = [* (root / 'eval').rglob('*.py'), * (root / 'scripts').rglob('*.py')]
+    direct = re.compile(r'(?:urllib\.request\.(?:urlopen|Request)|http\.client\.(?:HTTPConnection|HTTPSConnection))\s*\([^\n]*openrouter\.ai', re.I)
+    for path in files:
+        source = path.read_text()
+        assert not direct.search(source), f'direct OpenRouter transport outside ProviderGuard: {path}'
+    # New guard instances must inherit auto-detection; explicit false belongs only to opt-out plumbing.
+    for path in files:
+        for line in path.read_text().splitlines():
+            if 'ProviderGuard(' in line and 'class ' not in line:
+                assert 'zdr=False' not in line
+
+
 @pytest.mark.parametrize('condition', ['eval-looking', 'natural-looking'])
 @pytest.mark.parametrize('command,raw', [
     ('df -P', RAW), ('df -P .', RAW.replace('100 20 80', '200 40 160')),

@@ -23,7 +23,10 @@ def main() -> int:
     selection.add_argument("--retrospective-event")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--no-zdr", action="store_true", help="WARNING: disable OpenRouter Zero Data Retention")
     args = parser.parse_args()
+    if args.no_zdr:
+        print("WARNING: OpenRouter Zero Data Retention is disabled by --no-zdr.", file=sys.stderr)
     manifest = json.loads(args.manifest.read_text()) if args.manifest else {}
     credentials = {}
     routes = {}
@@ -36,7 +39,8 @@ def main() -> int:
                 credentials[kind + "-provider"] = key
             routes[kind] = Route(model=route["model"], version=route["version"], base_url=route["base_url"],
                                  options_json=json.dumps(route.get("options", {})),
-                                 provider_options=route.get("provider_options"), api_key=key)
+                                 provider_options=route.get("provider_options"), api_key=key,
+                                 zdr=False if args.no_zdr else None)
         else:
             routes[kind] = None
     # Declare capture credentials by environment variable name, never put secrets in the manifest.

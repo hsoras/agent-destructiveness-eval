@@ -527,6 +527,15 @@ class RouterBridge:
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 
 
+def is_openrouter(url: str) -> bool:
+    """Whether a configured upstream is hosted by OpenRouter."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
 class ProviderGuard:
     """Loopback proxy between the host runtime and the configured model provider.
 
@@ -538,12 +547,12 @@ class ProviderGuard:
 
     def __init__(self, upstream_base_url: str, audit: Callable[[dict[str, Any]], list[dict[str, Any]]], *,
                  max_request_bytes: int = 32 * 1024 * 1024, upstream_timeout: float = 300.0,
-                 zdr: bool = False):
+                 zdr: bool | None = None, force_openrouter: bool = False):
         self.upstream = urllib.parse.urlsplit(upstream_base_url)
         if self.upstream.scheme not in {"http", "https"} or not self.upstream.hostname:
             raise ValueError("provider_base_url must be an http(s) URL")
         self.audit, self.max_request_bytes, self.upstream_timeout = audit, max_request_bytes, upstream_timeout
-        self.zdr = zdr
+        self.zdr = bool(force_openrouter or (is_openrouter(upstream_base_url) if zdr is None else zdr))
         self.stats = {"received": 0, "audited": 0, "forwarded": 0, "refused": 0}
         self.refusals: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -579,7 +588,10 @@ class ProviderGuard:
         handler.wfile.write(payload)
 
     def _forward(self, handler: http.server.BaseHTTPRequestHandler, raw: bytes) -> None:
-        raw = self._forwarded_raw(raw)
+        try:
+            raw = self._forwarded_raw(raw)
+        except ValueError:
+            return self._refuse(handler, 400, "OpenRouter request could not be forwarded with ZDR")
         connection_class = http.client.HTTPSConnection if self.upstream.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.upstream.hostname, self.upstream.port, timeout=self.upstream_timeout)
         try:
@@ -611,7 +623,12 @@ class ProviderGuard:
         """Return the upstream body, keeping the audited request bytes untouched."""
         if not self.zdr:
             return raw
-        body = json.loads(raw)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("OpenRouter request must be a JSON object to enforce ZDR") from exc
+        if not isinstance(body, dict):
+            raise ValueError("OpenRouter request must be a JSON object to enforce ZDR")
         body["provider"] = {**(body.get("provider") if isinstance(body.get("provider"), dict) else {}),
                             "zdr": True, "data_collection": "deny"}
         return json.dumps(body).encode()
@@ -768,7 +785,7 @@ class HostOpenCodeAdapter:
                  presenter: Presenter | None = None, today: str | None = None, provider_api_key: str = "sk-none",
                  context_limit: tuple[int, int] | None = None, autocompact: bool = False,
                  runtime_flags: Mapping[str, str] | None = None, max_request_bytes: int = 32 * 1024 * 1024,
-                 allow_provider_qualified_model: bool = False, zdr: bool = False):
+                 allow_provider_qualified_model: bool = False, zdr: bool | None = None):
         if not allow_provider_qualified_model:
             if not model or "/" in model:
                 raise ValueError("model must be a bare model ID served by the configured provider")

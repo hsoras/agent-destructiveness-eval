@@ -17,7 +17,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from eval.artifact_upload.contracts import validate
-from eval.artifact_upload.host_adapter import RUNTIME_SHA256, RUNTIME_SOURCE_COMMIT, RUNTIME_VERSION
+from eval.artifact_upload.host_adapter import RUNTIME_SHA256, RUNTIME_SOURCE_COMMIT, RUNTIME_VERSION, is_openrouter
 from eval.artifact_upload.presentation import FrozenPresentation, DATA
 from eval.artifact_upload.workflow import Allowance, Policy
 
@@ -96,7 +96,7 @@ def policy_from(value=None):
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
-         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=True):
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None):
     if operation == 'frozen':
         proxy_mode = 'script'
     if operation not in ('prepare', 'control', 'develop', 'run', 'frozen') or mode not in ('passthrough', 'develop', 'frozen'):
@@ -167,7 +167,7 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
             'launch_operation': operation, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
             'proxy': {'mode': proxy_mode, 'rules_path': str(Path(rules_path).resolve()) if rules_path else None,
                       'rules_sha256': sha(rules_path) if rules_path else None,
-                      **({'zdr': bool(zdr)} if operation == 'run' and proxy_mode == 'llm' else {})},
+                      'zdr': bool(zdr) if zdr is not None else is_openrouter(provider or '')},
             **({'image_pin_override': {'requested': guest_image_id, 'locked': source_identities()['common_image']['id'],
                                        'reason': 'live-preview development only'}} if guest_image_id else {}),
             'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
@@ -399,7 +399,7 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
             raise ValueError('proxy route credential environment variable is not set')
         clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
                                         output_price=route['output_price'], api_key=key,
-                                        provider_options={'zdr': True, 'data_collection': 'deny'} if frozen['proxy'].get('zdr', True) else None)
+                                        provider_options=None)
     live_budget = LiveBudget(**live_budget)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -510,7 +510,7 @@ def main():
     parser.add_argument('--mode', choices=('passthrough', 'develop', 'frozen'), default='frozen')
     parser.add_argument('--proxy-mode', choices=('llm', 'script'), default='script')
     parser.add_argument('--zdr', action=argparse.BooleanOptionalAction, default=None,
-                        help='run --proxy-mode llm: require OpenRouter Zero Data Retention (default: on)')
+                        help='force OpenRouter Zero Data Retention; use --no-zdr only to opt out')
     parser.add_argument('--guest-image-id', help='live-preview only (--proxy-mode llm): substitute local guest image id for the unobtainable locked pin')
     parser.add_argument('--rules', type=Path)
     parser.add_argument('--proxy-routes', type=Path)
@@ -534,8 +534,8 @@ def main():
     parser.add_argument('--approval', type=Path, help='Explicit private authorization for native controls')
     args = parser.parse_args()
     try:
-        if args.zdr is not None and not (args.operation == 'run' and args.proxy_mode == 'llm'):
-            raise ValueError('--zdr/--no-zdr is only valid for run --proxy-mode llm')
+        if args.zdr is False:
+            print('WARNING: OpenRouter Zero Data Retention is disabled by --no-zdr.', file=sys.stderr)
         if args.operation == 'run' and args.proxy_mode == 'llm':
             if args.label in ('local-acceptance', 'paid-pilot', 'held-out'):
                 raise ValueError('llm proxy refuses measured labels; use live-preview')
@@ -550,7 +550,7 @@ def main():
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
                       model=args.model, provider=args.provider, label=args.label,
                       proxy_mode=args.proxy_mode, rules_path=args.rules, guest_image_id=args.guest_image_id,
-                      zdr=args.zdr is not False)
+                      zdr=args.zdr)
         if args.operation == 'run' and args.condition != 'both':
             frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
         if args.operation == 'run' and args.proxy_mode == 'llm':
