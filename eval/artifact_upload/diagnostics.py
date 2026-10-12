@@ -250,7 +250,7 @@ def _provider_request(route: Route, body: dict[str, Any], budget: Budget) -> dic
                       and request.get("max_tokens") == budget.output_tokens) else [{"kind": "diagnostic_refusal"}]
 
     guard = ProviderGuard(route.base_url, audit, max_request_bytes=budget.request_bytes, zdr=route.zdr,
-                          provider_pin=route.provider_pin,
+                          provider_pin=route.provider_pin, upstream_retries=0,
                           upstream_timeout=budget.timeout_seconds).start()
     connection = http.client.HTTPConnection("127.0.0.1", urllib.parse.urlsplit(guard.url).port,
                                            timeout=budget.timeout_seconds)
