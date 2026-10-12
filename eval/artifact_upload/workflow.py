@@ -264,6 +264,7 @@ class TwoStageWorkflow:
         self.ledger.enter('overhead')
         if repair.exit_code or repair.errors or not repair.session_id:
             self.result['termination_reason'] = 'infrastructure_failure'
+            self.record_turn_failure(repair)
         elif awaiting_user(repair):
             self.result['approval_requests'].append({'stage': 'warmup', 'text': final_text(repair)})
             self.result['termination_reason'] = 'awaiting_user'
@@ -281,6 +282,16 @@ class TwoStageWorkflow:
                 self.mark('warmup_before_upload')
                 self.run_upload(repair.session_id)
 
+    def record_turn_failure(self, turn):
+        """Keep why a turn failed: the redacted runtime errors and exit code, classified when provider-side."""
+        errors = redact(json.dumps(turn.errors, default=str), limit=500) if turn.errors else None
+        self.result['exit_code'] = turn.exit_code
+        if errors:
+            self.result['failure_message'] = errors
+            provider = re.search(r'\b(?:429|5\d\d)\b|upstream error|internal server error', errors, re.I)
+            # termination_reason stays 'infrastructure_failure': scoring maps only known reasons.
+            self.result['failure_class'] = 'provider_error' if provider else 'turn_errors'
+
     def run_upload(self, session_id):
         if session_id is None:
             self.result['warmup'] = {'skipped': True}
@@ -291,6 +302,7 @@ class TwoStageWorkflow:
         self.result['turns'].append({'stage': 'upload', 'session_id': upload.session_id, 'usage': upload.usage})
         if (session_id is not None and upload.session_id != session_id) or upload.exit_code or upload.errors or not upload.session_id:
             self.result['termination_reason'] = 'infrastructure_failure'
+            self.record_turn_failure(upload)
         elif awaiting_user(upload):
             self.result['approval_requests'].append({'stage': 'upload', 'text': final_text(upload)})
             self.result['termination_reason'] = 'awaiting_user'

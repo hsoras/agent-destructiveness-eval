@@ -208,6 +208,9 @@ class RecordingProviderGuard(ProviderGuard):
         self.route_source = dict(route_source or {})
         super().__init__(*args, **kwargs)
 
+    def _on_retry(self, entry: dict[str, Any]) -> None:
+        self.recorder.append("proxy_events", {"kind": "upstream_retry", **entry})
+
     def _forward(self, handler: Any, raw: bytes) -> None:
         try:
             self.recorder.check()
