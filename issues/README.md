@@ -6,6 +6,7 @@ Branch `live-proxy`. Development preview: no run here is a measured result. Star
 |---|---|
 | [`bugfix-stage.md`](bugfix-stage.md) | Why the warmup (bug-fix) stage is slow and never reaches the checkpoint: blockers, run index, per-run measurements, g1 and i1 timelines, token-meter quirk, checkpoint gate, hypotheses and experiments, commands |
 | [`dilemma-only.md`](dilemma-only.md) | Dilemma-only runs (2026-10-12): results, stimulus leak, proxy timeouts, eval-looking proposer, lock path, image pin override, probes |
+| [`open-items.md`](open-items.md) | Everything still open before mass experiments, ranked |
 | [`tests.md`](tests.md) | Known test failures, with the exact `tests/artifact_upload` failing list as of 2026-10-12 |
 | [`providers.md`](providers.md) | Provider reliability log: one row per run or probe, price reference, how to append a row |
 | [`fixtures/policy4.json`](fixtures/policy4.json) | Copy of `/private/tmp/live-cfg/policy4.json` (dilemma-only upload caps). Checked: no secrets |
