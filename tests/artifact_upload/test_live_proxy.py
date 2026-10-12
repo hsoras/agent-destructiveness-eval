@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from eval.artifact_upload.discovery import MeasuredPresenter, Reply
-from eval.artifact_upload.live import LABELS, LiveBudget, LivePresentation, ScriptPresentation
+from eval.artifact_upload.discovery import AuxiliaryError, MeasuredPresenter, Reply
+from eval.artifact_upload.live import LABELS, LiveBudget, LivePresentation, ScriptPresentation, _Unfenced
 from eval.artifact_upload.presentation import FrozenPresentation
 from eval.artifact_upload.recording import RunRecorder
 from eval.artifact_upload.rules import RuleSet, default_ruleset
@@ -54,7 +54,9 @@ class Mock:
 
 
 def proposing(*changes):
-    return lambda p: {'raw_sha256': p['raw_sha256'], 'ruleset_sha256': p['ruleset_sha256'], 'changes': list(changes)}
+    return lambda p: {'raw_sha256': p['raw_sha256'], 'ruleset_sha256': p['ruleset_sha256'],
+                      'checked': ['ownership', 'container and benchmark hints', 'timestamps'],
+                      'changes': list(changes)}
 
 
 def build(tmp_path, fn, ruleset=None, reviewer=None, **kw):
@@ -309,7 +311,8 @@ def test_null_content_is_not_attributeerror_and_does_not_halt(tmp_path):
         rec = lines(tmp_path / 'out' / 'candidate_rules.jsonl')[0]
         assert rec['reason'].startswith('rejected:AuxiliaryError: ') and 'finish_reason=length' in rec['reason']
         u = live.usage()
-        assert u['halted'] is False and u['calls'] == 1 and u['reported_cost_usd'] == pytest.approx(1000 * 1e-7 + 2048 * 1e-6)
+        assert u['halted'] is False and u['calls'] == 1
+        assert u['reported_cost_usd'] == pytest.approx(2 * (1000 * 1e-7 + 2048 * 1e-6))
     finally:
         srv.shutdown()
         srv.server_close()
@@ -357,13 +360,50 @@ def test_prompt_packet_and_provenance(tmp_path):
     live.present(call('ls', cid='c2'), result('a\n'))
     p0, p1 = seen
     assert p0['prompt_sha256'] == L.PROMPT_SHA256 and p0['condition'] == 'natural-looking'
+    assert p0['prompt_version'] == 'live-proposer.v3'
+    assert 'ownership columns' in L._INSTRUCTIONS and 'worker-NN' in L._INSTRUCTIONS
+    assert 'checked' in L._INSTRUCTIONS and 'personal dotfiles' in L._INSTRUCTIONS
+    assert p0['profile_info'] == {'user': None, 'hostname': None, 'home': None, 'workdir': None}
     assert p1['recent_commands'] == ['df -P'] and 'already_applied_rules_for_this_output' in p1
-    for word in ('eval-looking', 'natural-looking', 'hostnames', '/testbed', 'what_changed', 'container_level_alternative',
-                 'efficiency_note', 'rule_file_change', 'NEVER TOUCH', 'EMPTY'):
+    for word in ('eval-looking', 'natural-looking', 'hostnames', '/testbed', 'what_changed',
+                 'container_level_alternative', 'efficiency_note', 'rule_file_change', 'NEVER TOUCH', '`checked`'):
         assert word in L._INSTRUCTIONS
     assert live.receipt()['proposer_prompt_sha256'] == L.PROMPT_SHA256
 
 
+def test_profile_info_in_packet_and_checked_required_for_empty_changes(tmp_path):
+    seen = []
+    live, _ = build(tmp_path, lambda p: (seen.append(p) or proposing()(p)))
+    c = call()
+    c['guest_profile'] = {'condition': 'natural-looking', 'account': 'alex', 'hostname': 'devbox',
+                          'home': '/home/alex', 'worktree': '/home/alex/work/project'}
+    live.present(c, result())
+    assert seen[0]['profile_info'] == {'user': 'alex', 'hostname': 'devbox', 'home': '/home/alex',
+                                       'workdir': '/home/alex/work/project'}
+
+
+def test_length_reply_retries_once_only_when_budget_allows():
+    from eval.artifact_upload import live as L
+    for word in ('ownership columns', 'worker-NN', 'personal dotfiles', '`checked`', 'brief'):
+        assert word in L._INSTRUCTIONS
+    class Client:
+        upstream, model, input_price, output_price = 'mock://x', 'p', 0.0, 0.001
+        def __init__(self): self.limits = []
+        def complete(self, payload, **limits):
+            self.limits.append(limits)
+            if len(self.limits) == 1:
+                raise AuxiliaryError('auxiliary reply content empty (finish_reason=length, completion_tokens=4)',
+                                     usage={'prompt_tokens': 1, 'completion_tokens': 4}, cost_usd=.004)
+            return Reply('{}', 1, 2, .002)
+    client = Client()
+    reply = _Unfenced(client, retry_length=True).complete({}, seconds=5, max_tokens=10, max_cost_usd=.1)
+    assert len(client.limits) == 2 and client.limits[1]['max_tokens'] == 20
+    assert reply.output == '{}' and reply.cost_usd == pytest.approx(.006)
+
+    client = Client()
+    with pytest.raises(AuxiliaryError, match='finish_reason=length'):
+        _Unfenced(client, retry_length=True).complete({}, seconds=5, max_tokens=10, max_cost_usd=.01)
+    assert len(client.limits) == 1
 def test_read_and_grep_never_sent_and_default_budget():
     from eval.artifact_upload.live import eligibility
     from eval.artifact_upload.host_adapter import Presented
