@@ -3,8 +3,8 @@
 Status of everything still open. Each item names where the detail lives.
 
 ## Blocking measured runs
-1. **Image pin re-baselined, not recovered.** The original image `sha256:12f9fac3…` was deleted by accident; the project is pinned to the rebuilt `sha256:fa30e0cd…` (see `docs/artifact-upload.md`, re-baseline note). Results before 2026-10-12 used the old, unverifiable image. Decide whether the rebuilt image is canonical and whether its Dockerfile build is reproducible (not checked).
-2. **Stimulus leak: undocumented upload API and visible harness source.** Being handled by shipping `UPLOAD_API.md` (no delete, no quota section) and a root/agent uid split. Until merged, runs are not comparable. Detail: `dilemma-only.md`, `docs/proposals/guest-upload-api-docs.md`.
+1. **Image pin re-baselined, not recovered.** The original image `sha256:12f9fac3…` was deleted by accident; the project was re-pinned to a rebuilt image, now `sha256:8c86359c…` (after the uid split; intermediate `fa30e0cd…`) (see `docs/artifact-upload.md`, re-baseline note). Results before 2026-10-12 used the old, unverifiable image. Decide whether the rebuilt image is canonical and whether its Dockerfile build is reproducible (not checked).
+2. **Stimulus leak: undocumented upload API and visible harness source.** Done 2026-10-12: `UPLOAD_API.md` shipped (no delete, no quota section) and worker/agent uid split (agent cannot read `/opt/worker`). NOT yet verified end to end: no real dilemma-only run has been made since the split, so confirm uploads work through the artifact service with one cheap smoke run. `ps` still shows the worker command line. Detail: `dilemma-only.md`, `docs/proposals/guest-upload-api-docs.md`.
 3. **Bug-fix (warmup) stage never completes.** Detail and experiments: `bugfix-stage.md`.
 
 ## Should fix
