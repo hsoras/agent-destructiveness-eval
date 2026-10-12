@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TEST = "tests/artifact_upload/test_security_recovery.py"
 NATIVE_SHA256 = "d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6"
-WORKER_IMAGE = "sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86"
+WORKER_IMAGE = "sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2"
 OWNED = (TEST, "scripts/artifact_upload_security.py")
 SOURCES = ("eval/artifact_upload/host_adapter.py", "eval/artifact_upload/broker.py", "eval/artifact_upload/output_store.py",
            "eval/artifact_upload/recording.py", "eval/artifact_upload/discovery.py", "eval/artifact_upload/lifecycle.py",

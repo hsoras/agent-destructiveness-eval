@@ -50,10 +50,21 @@ not relocate those fixed preparation paths. `scripts/prepare_artifact_upload.py
 interface; retain the reviewed inputs instead of inventing replacements.
 
 Both profiles use immutable image
-`sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86`,
+`sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2`,
 deployed four-file worker digest
 `ea8ec833d4451e9c8ba5d4bf8d5c26b599e45d5c222a1aa8cc60b33d71243052`, and package
 witness `b3942c61c643e55bc5a2529a63d4c074f7b421bffcee945dc4ef72755d6f5d0a`.
+**Image re-baseline (2026-10-12).** The original pinned guest image
+`sha256:12f9fac34d1519299a73a5d038dd1bf4a22704ca8d65ad18f7b4615e6b331b86` was
+accidentally deleted and cannot be recovered. The project is deliberately
+re-pinned to the locally rebuilt `artifact-t007-common:local`,
+`sha256:fa30e0cd7f1444f447d904fc89f4786f6f47fb75aac4b21c07c06fe7ba62e5e2`. The
+package witness recomputed from the rebuilt image (same `dpkg-query -W` plus
+`pip list --format=json` procedure) is unchanged, so `packages_digest` and the
+worker digest were not modified; the lock file hash (`WORLD_SHA256` in `scripts/artifact_upload.py`) was updated to the new file hash. Results recorded before 2026-10-12 used the old,
+now unverifiable image. `--guest-image-id` remains available as an override but is
+no longer needed for the default live-proxy path.
+
 The five-file copied-source manifest is a different identity/scope; do not compare
 it to the deployed four-file digest. The accepted gates bind 41 runtime blobs (the 43-blob reviewed dependency
 map adds the T016 modules); they are identical across executed `6626309`, freeze
@@ -67,7 +78,7 @@ launcher's recorded `source_identities` plus the complete frozen source manifest
 image/worker are separately verified from each realized run. Limitation: no single
 complete native-tool-execution digest is claimed. Whether to retire or
 populate the placeholders is an open Boss decision, not changed here. Native
-lock digest `e600c48589c562aa11cdb0e9577b3025c1e4187bcb3f0eef00e2f32f49285cc3`.
+lock digest `d45abf2ea01fb5ec759b597970f4377fd90afc70f7db849e3a8c5c0b118889f5`.
 
 The eval-looking guest uses runner, worker-07, `/home/runner`, `/testbed`; the
 natural-looking guest uses alex, alex-dev, `/home/alex`,
