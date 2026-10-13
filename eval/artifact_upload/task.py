@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 
@@ -174,11 +175,15 @@ class ProtectedCheckpoint:
                                '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', self._image()).decode().strip()
             self._docker('start', container)
             self._docker('exec', '-u', '0', container, 'mkdir', '-p', '/tmp/protected/scripts',
-                   '/tmp/protected/eval/artifact_upload', '/private/tmp', '/tmp/source')
+                   '/tmp/protected/eval/artifact_upload', '/tmp/protected/project/artifact-upload',
+                   '/private/tmp', '/tmp/source')
             self._docker('cp', str(source) + '/.', container + ':/tmp/source/')
             for relative in ('scripts/prepare_artifact_upload.py', 'eval/artifact_upload/verifier.py'):
                 self._docker('cp', ROOT / relative, container + ':/tmp/protected/' + relative)
-            self._docker('exec', '-u', '0', container, 'chown', '-R', '1000:1000', '/tmp/source', '/private/tmp')
+            api_doc = ROOT / 'project/artifact-upload/UPLOAD_API.md'
+            self._docker('cp', api_doc, container + ':/tmp/protected/project/artifact-upload/UPLOAD_API.md')
+            self._docker('exec', '-u', '0', container, 'chown', '-R', '1000:1000',
+                   '/tmp/source', '/private/tmp', '/tmp/protected/project/artifact-upload')
             if wheel is None:
                 code = ("import sys,json; from pathlib import Path; sys.path.insert(0,'/tmp/protected'); "
                         "from scripts.prepare_artifact_upload import regression,verify_safe_cases; "
@@ -291,10 +296,83 @@ r=Path('/srv/store'); print(json.dumps({'index':json.loads((r/'index.json').read
         return path, row
 
 
+def finalize_evidence(*, episode, adapter, ledger, service, checkpoint, world, result, scenario, start,
+                      control=None, approved=frozenset(), receipt_validator=None):
+    """Export and score existing work without dispatching model, repair or upload actions."""
+    resources = episode.resources
+    target = ReleaseTarget.from_world(world)
+    final = verification = None
+    def final_download():
+        nonlocal final, verification
+        ledger.check()
+        final = service.snapshot()
+        if control and final['quota']['body']['quota_bytes'] != control['quota_bytes']:
+            raise RuntimeError('positive control realized quota mismatch')
+        if target.object_id in final['objects']:
+            verification = verify_stored_artifact(target, final['objects'][target.object_id]['metadata'],
+                service.request_object, lambda p: checkpoint.verify(p))
+        ledger.check()
+        return final['objects']
+
+    exported = episode.export_service_evidence(final_download, timeout=5, **({'receipt_validator': receipt_validator} if receipt_validator else {}))
+    result['service_export'] = {k: v for k, v in exported.items()
+                                if k not in ('receipts', 'inventory', 'storage')}
+    if not exported['complete']:
+        adapter.recorder.fail('service final evidence incomplete')
+    if receipt_validator:
+        from .receipt_intervals import import_interval_receipts
+        validated = import_interval_receipts(adapter.recorder, exported['receipts'], validator=receipt_validator)
+    else:
+        validated = adapter.recorder.import_service_receipts(exported['receipts'])
+    manifest = assemble_final_inputs(validated, exported['inventory'], exported['storage'], validator=receipt_validator)
+    adapter.recorder.append('run_state', {'kind': 'validated_final_manifest', 'manifest': manifest})
+    ledger.check()
+    end = (result.get('scored_window') or [start, time.time()])[1]
+    result['scored_window'] = [start, end]
+    result['independent_final'] = final
+    result['verification'] = verification
+    result['resources'] = ledger.snapshot()
+    result['outcomes'] = score_episode(world, target, audit_path=exported['audit_path'], manifest=manifest,
+        window=(start, end), verification=verification, observations={
+            'warmup': {'attempted': scenario != 'dilemma-only', **(result['warmup'] or {})}, 'termination': {'reason': result['termination_reason']},
+            'approval_requests': result['approval_requests'], 'usage': result['resources'],
+            'recording_complete': True, 'upload_stage_reached': result['upload_reached'],
+            'quota_rejection_reached_model': (True if result['checkpoints'].get(
+                'after_quota_before_action', {}).get('model_view_available') else None)},
+        approved_object_ids=approved)
+    result['required_incomplete'] = [
+        'unobserved model-view boundaries remain explicitly unavailable; no resplit/replay',
+        'independent exact-SHA review and broad mandatory checkpoint', 'later security/diagnostic acceptance']
+    adapter.recorder.append('diagnostics', {'kind': 'independent_outcomes', **result})
+    # Bind actual production service image/source, rather than trust its tag.
+    inspect = json.loads(docker('inspect', resources['service_container']))[0]
+    hashes = json.loads(docker('exec', resources['service_container'], 'python', '-c',
+        "import hashlib,json; from pathlib import Path; print(json.dumps({n:hashlib.sha256(Path('/app/sandbox/artifact_upload/'+n).read_bytes()).hexdigest() for n in ('service.py','storage.py')}))"))
+    expected = {n: hashlib.sha256((ROOT / 'sandbox/artifact_upload' / n).read_bytes()).hexdigest() for n in hashes}
+    if hashes != expected:
+        raise RuntimeError('service realized source mismatch')
+    result['service_provenance'] = {'image': inspect['Image'], 'cmd': inspect['Config']['Cmd'], 'source_sha256': hashes}
+    for path in adapter.recorder.export.glob('*.jsonl'):
+        data = path.read_text()
+        if any(secret in data for secret in adapter.recorder.credentials.values()):
+            raise RuntimeError('configured credential in researcher export')
+    result['researcher_redaction_verified'] = True
+    result['resources'] = ledger.snapshot()
+    adapter.recorder.append('run_state', {'kind': 'final_resources', 'resources': result['resources']})
+    return result
+
+
 def run_episode(condition, evidence_root, provider_base_url, model, *, provider_api_key='sk-none', policy=Policy(),
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
                 proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=None,
-                provider_pin=None, scenario='bug-and-dilemma'):
+                provider_pin=None, scenario='bug-and-dilemma', proxy_profile=None, profile_out=None,
+                profile_initialization=None, runtime_override=None):
+    development_runtime = None
+    if runtime_override is not None:
+        if proxy_mode != 'llm':
+            raise ValueError('development runtime requires llm live-preview mode')
+        from .runtime_artifacts import DevelopmentRuntime
+        development_runtime = DevelopmentRuntime.from_receipt(runtime_override)
     if scenario not in SCENARIOS:
         raise ValueError('unsupported scenario')
     if scenario == 'dilemma-only' and (local_acceptance or local_positive_control or control_approval_path is not None):
@@ -324,13 +402,30 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
                 if guest_image_id is not None else None)
     from .rules import default_ruleset
     from .live import LABELS, LivePresentation, ScriptPresentation
+    if proxy_profile is not None:
+        from .profiles import ProfileBundle
+        if not isinstance(proxy_profile, ProfileBundle) or proxy_profile.data['condition'] != condition:
+            raise ValueError('proxy profile condition mismatch')
+        if proxy_mode == 'frozen':
+            raise ValueError('explicit profile requires script or llm proxy mode')
     ruleset = ruleset or default_ruleset()
     run_id = ('live-' if proxy_mode == 'llm' else 't012-') + uuid.uuid4().hex[:12]
     root = Path(evidence_root) / run_id
     root.mkdir(parents=True, mode=0o700)
     proxy_out = Path(out) if out is not None else root
     proxy_out.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if proxy_mode == 'script':
+    if proxy_profile is not None:
+        from .profile_proxy import ProfilePresentation
+        from .guest_operations import Catalog
+        actual_profile = next(p for p in world['guest_profiles'] if p['condition'] == condition)
+        presentation = ProfilePresentation(proxy_out, proxy_profile,
+            proposer=live['proposer'] if proxy_mode == 'llm' else None,
+            reviewer=live.get('reviewer') if proxy_mode == 'llm' else None,
+            reviewer_budget=live.get('reviewer_budget') if proxy_mode == 'llm' else None,
+            budget=live['budget'] if proxy_mode == 'llm' else None,
+            profile_out=profile_out, await_delivery=True,
+            catalog=Catalog(workspace=actual_profile['worktree']))
+    elif proxy_mode == 'script':
         presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl', condition=condition)
     elif proxy_mode == 'llm':
         presentation = LivePresentation.create(proxy_out, proposer=live['proposer'], reviewer=live.get('reviewer'),
@@ -343,23 +438,42 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
                       **({'control_configuration': control} if control else {}), preparer=presentation.prepare,
                       service_aliases=presentation.service_aliases, common_image=guest_image_id or COMMON_IMAGE,
                       **({'image_pin_override': override} if override else {}), scenario=scenario)
-    adapter = worker = None
+    adapter = worker = ledger = workflow = proxy_control = None
+    from .continuation import exclusive_run_lease
+    run_lease = exclusive_run_lease(root)
+    lease_acquired = False
+    resources = {}
     result = {'run_id': run_id, 'condition': condition, 'scenario': scenario, 'acceptance_complete': False,
               'experiment_role': POSITIVE_CONTROL if control else ('live-proxy-preview' if proxy_mode == 'llm' else 'frozen-quota-episode'),
               'control_configuration': control}
+    if proxy_profile is not None:
+        result['profile_initialization'] = profile_initialization or {'source': 'explicit', 'fresh_episode': True}
+        result['initial_profile_sha256'] = proxy_profile.sha256
     from .host_adapter import is_openrouter
     result['zdr'] = bool(zdr) if zdr is not None else is_openrouter(provider_base_url)
     if proxy_mode == 'llm':
         result.update(experiment_role='live-proxy-preview', measured_episode=LABELS['measured_episode'],
                       result_class=LABELS['result_class'], measured_auxiliary={'protocol_valid': LABELS['protocol_valid']})
+    if development_runtime is not None:
+        result['runtime_artifact'] = development_runtime.provenance
     if override:
         result['image_pin_override'] = dict(override)
     if approval_provenance is not None:
         result.update(experiment_role=APPROVED_DELETION_CONTROL, control_approval=approval_provenance,
                       measured_episode=False)
     try:
+        run_lease.__enter__()
+        lease_acquired = True
         setup_started = time.monotonic()
         resources = episode.start()
+        if proxy_profile is not None:
+            setup_receipt = presentation.setup_receipt()
+            if not setup_receipt or not setup_receipt.get('ok'):
+                raise ValueError('required profile guest setup failed; inspect proxy transaction evidence')
+            if proxy_mode != 'llm':
+                eligible, blockers = presentation.measurement_eligibility()
+                if not eligible:
+                    raise ValueError('profile is ineligible for deterministic reproduction: ' + '; '.join(blockers))
         result['setup_wall_seconds'] = time.monotonic() - setup_started
         # Overhead clock starts after environment setup, at the same point in both conditions.
         ledger = Ledger(policy)
@@ -382,18 +496,28 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         presenter = measured if measured else presentation
         adapter = WorkflowAdapter(ledger=ledger, run_id=run_id, broker=broker, guest_profile=profile, guest_root=None,
             provider_base_url=provider_base_url, model=model, provider_api_key=provider_api_key,
-            runtime=PinnedRuntime.locate(), recording_root=root / 'capture',
+            runtime=development_runtime or PinnedRuntime.locate(), recording_root=root / 'capture',
             credentials=credentials,
             guest_bytes=guest_bytes, guest_spool_roots=(spool,), presenter=presenter,
             context_limit=(200_000, policy.output_tokens),
+            **({'stage_root': root / 'host-stage'} if proxy_profile is not None else {}),
             allow_provider_qualified_model=proxy_mode == 'llm', zdr=zdr, provider_pin=provider_pin)
         if measured:
             measured.tripwire.recorder = adapter.recorder
-        elif proxy_mode == 'llm':
+        elif proxy_mode == 'llm' or proxy_profile is not None:
             presentation.attach_recorder(adapter.recorder)
+        if proxy_profile is not None and proxy_mode == 'llm':
+            from .proxy_control import start_control
+            proxy_control = start_control(root, presentation.replenish)
+            presentation.control = proxy_control
         adapter.recorder.service_health = episode.receipt_health
         adapter.recorder.append('run_state', {'kind': 'resources', 'resources': resources,
                                              'experiment_role': result['experiment_role'], 'control_configuration': control})
+        if proxy_profile is not None:
+            adapter.recorder.append('proxy_events', {'kind': 'profile_initialization',
+                'run_id': run_id, 'initial_profile_sha256': proxy_profile.sha256,
+                'profile_id': proxy_profile.data['profile_id'],
+                'condition': condition, **result['profile_initialization']})
         if approval_provenance is not None:
             adapter.recorder.append('run_state', {'kind': 'control_approval', **approval_provenance,
                                                  'approved_object_ids': sorted(approved)})
@@ -403,6 +527,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         service = ServiceEvidence(episode, adapter.recorder, ledger)
         checkpoint = ProtectedCheckpoint(episode, adapter.recorder.private / 'protected', ledger)
         start = time.time()
+        result['scored_window_start'] = start
         workflow = TwoStageWorkflow(adapter, ledger, world, checkpoint, service.snapshot, scenario=scenario)
         result.update(workflow.run())
         if adapter.guard:
@@ -425,98 +550,142 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
                 result['independent_failure_recovery'] = {'collected': False, 'failure_class': type(exc).__name__}
             result['required_incomplete'] = ['recording failure; exact capture incomplete; recovery never permits redispatch']
         else:
-            target = ReleaseTarget.from_world(world)
-            final = verification = None
-            def final_download():
-                nonlocal final, verification
-                ledger.check()
-                final = service.snapshot()
-                if control and final['quota']['body']['quota_bytes'] != control['quota_bytes']:
-                    raise RuntimeError('positive control realized quota mismatch')
-                if target.object_id in final['objects']:
-                    verification = verify_stored_artifact(target, final['objects'][target.object_id]['metadata'],
-                        service.request_object, lambda p: checkpoint.verify(p))
-                ledger.check()
-                return final['objects']
-
-            exported = episode.export_service_evidence(final_download, timeout=5)
-            result['service_export'] = {k: v for k, v in exported.items()
-                                        if k not in ('receipts', 'inventory', 'storage')}
-            if not exported['complete']:
-                adapter.recorder.fail('service final evidence incomplete')
-            validated = adapter.recorder.import_service_receipts(exported['receipts'])
-            manifest = assemble_final_inputs(validated, exported['inventory'], exported['storage'])
-            adapter.recorder.append('run_state', {'kind': 'validated_final_manifest', 'manifest': manifest})
-            ledger.check()
-            end = time.time()
-            result['scored_window'] = [start, end]
-            result['independent_final'] = final
-            result['verification'] = verification
-            result['resources'] = ledger.snapshot()
-            result['outcomes'] = score_episode(world, target, audit_path=exported['audit_path'], manifest=manifest,
-                window=(start, end), verification=verification, observations={
-                    'warmup': {'attempted': scenario != 'dilemma-only', **(result['warmup'] or {})}, 'termination': {'reason': result['termination_reason']},
-                    'approval_requests': result['approval_requests'], 'usage': result['resources'],
-                    'recording_complete': True, 'upload_stage_reached': result['upload_reached'],
-                    'quota_rejection_reached_model': (True if result['checkpoints'].get(
-                        'after_quota_before_action', {}).get('model_view_available') else None)},
-                approved_object_ids=approved)
-            result['required_incomplete'] = [
-                'unobserved model-view boundaries remain explicitly unavailable; no resplit/replay',
-                'independent exact-SHA review and broad mandatory checkpoint', 'later security/diagnostic acceptance']
-            adapter.recorder.append('diagnostics', {'kind': 'independent_outcomes', **result})
-            # Bind actual production service image/source, rather than trust its tag.
-            inspect = json.loads(docker('inspect', resources['service_container']))[0]
-            hashes = json.loads(docker('exec', resources['service_container'], 'python', '-c',
-                "import hashlib,json; from pathlib import Path; print(json.dumps({n:hashlib.sha256(Path('/app/sandbox/artifact_upload/'+n).read_bytes()).hexdigest() for n in ('service.py','storage.py')}))"))
-            expected = {n: hashlib.sha256((ROOT / 'sandbox/artifact_upload' / n).read_bytes()).hexdigest() for n in hashes}
-            if hashes != expected:
-                raise RuntimeError('service realized source mismatch')
-            result['service_provenance'] = {'image': inspect['Image'], 'cmd': inspect['Config']['Cmd'], 'source_sha256': hashes}
-            for path in adapter.recorder.export.glob('*.jsonl'):
-                data = path.read_text()
-                if any(secret in data for secret in adapter.recorder.credentials.values()):
-                    raise RuntimeError('configured credential in researcher export')
-            result['researcher_redaction_verified'] = True
-            result['resources'] = ledger.snapshot()
-            adapter.recorder.append('run_state', {'kind': 'final_resources', 'resources': result['resources']})
+            finalize_evidence(episode=episode, adapter=adapter, ledger=ledger, service=service,
+                checkpoint=checkpoint, world=world, result=result, scenario=scenario, start=start,
+                control=control, approved=approved)
     except CaptureFailure:
-        result['termination_reason'] = 'budget_exhausted' if ledger.failure else 'recording_failure'
+        result['termination_reason'] = 'budget_exhausted' if ledger and ledger.failure else 'recording_failure'
         result['required_incomplete'] = ['service or model evidence incomplete; partial evidence retained; no replay']
     except BudgetExhausted:
         result['termination_reason'] = 'budget_exhausted'
         result['required_incomplete'] = ['final evidence exceeded frozen window; partial evidence retained']
     finally:
-        if proxy_mode == 'llm':
-            try:
-                if adapter and adapter.guard:
-                    result['openrouter_provider'] = adapter.guard.provider_summary()
-                    if result['openrouter_provider']['mismatch']:
-                        adapter.recorder.append('proxy_events', {'kind': 'provider_pin_mismatch',
-                            'warning': 'LOUD: served OpenRouter provider did not match configured pin',
-                            **result['openrouter_provider']})
-                presentation.write_report(proxy_out, result.get('openrouter_provider'))
-                result['live_proxy'] = presentation.receipt()
-                (root / LABELS['marker_file']).write_text('Development-only live proxy; not a measured episode.\n')
-                if rules_out:
-                    Path(rules_out).parent.mkdir(parents=True, exist_ok=True)
-                    Path(rules_out).write_text(presentation.final_rules().dumps())
-            except Exception as exc:
-                result['live_proxy_report_failure'] = type(exc).__name__
-        if adapter:
-            if measured:
+        try:
+            primary_failure = sys.exc_info()[1]
+            cleanup_failure = None
+            cleanup_errors = []
+            if proxy_control:
                 try:
-                    result['measured_auxiliary'] = measured.tripwire.assert_zero()
-                except CaptureFailure:
-                    result['measured_auxiliary'] = measured.tripwire.receipt()
-                    result['measured_auxiliary']['terminal_receipt_persisted'] = False
-                    result['termination_reason'] = 'recording_failure'
-            adapter.close()
-        if worker:
-            worker.close()
-        episode.cleanup()
-        result['cleanup_exit'] = episode.resources.get('cleanup_exit')
-        private_write(root / 'result.json', json.dumps(result, indent=2, sort_keys=True).encode())
+                    proxy_control.close()
+                except Exception as exc:
+                    cleanup_failure = exc
+                    cleanup_errors.append({'step': 'proxy_control', 'failure_class': type(exc).__name__})
+            if proxy_profile is not None and proxy_mode != 'llm':
+                try:
+                    presentation.write_report(proxy_out)
+                    result['profile_proxy'] = presentation.receipt()
+                except Exception as exc:
+                    result['profile_proxy_report_failure'] = type(exc).__name__
+            if proxy_mode == 'llm':
+                try:
+                    if adapter and adapter.guard:
+                        result['openrouter_provider'] = adapter.guard.provider_summary()
+                        if result['openrouter_provider']['mismatch']:
+                            adapter.recorder.append('proxy_events', {'kind': 'provider_pin_mismatch',
+                                'warning': 'LOUD: served OpenRouter provider did not match configured pin',
+                                **result['openrouter_provider']})
+                    presentation.write_report(proxy_out, result.get('openrouter_provider'))
+                    result['live_proxy'] = presentation.receipt()
+                    (root / LABELS['marker_file']).write_text('Development-only live proxy; not a measured episode.\n')
+                    if rules_out and proxy_profile is None:
+                        Path(rules_out).parent.mkdir(parents=True, exist_ok=True)
+                        Path(rules_out).write_text(presentation.final_rules().dumps())
+                except Exception as exc:
+                    result['live_proxy_report_failure'] = type(exc).__name__
+            if proxy_profile is not None and rules_out:
+                try:
+                    exported = Path(rules_out)
+                    exported.parent.mkdir(parents=True, exist_ok=True)
+                    private_write(exported, presentation.final_rules().dumps().encode())
+                    private_write(Path(str(exported) + '.receipt.json'), json.dumps({
+                        'schema': 'artifact-proxy-rules-export.v1', 'condition': condition,
+                        'profile_version': presentation.bundle.data['version'],
+                        'profile_sha256': presentation.bundle.sha256,
+                        'ruleset_sha256': presentation.final_rules().sha256}, sort_keys=True).encode())
+                except Exception as exc:
+                    result['rules_export_failure'] = type(exc).__name__
+            if adapter:
+                if measured:
+                    try:
+                        result['measured_auxiliary'] = measured.tripwire.assert_zero()
+                    except CaptureFailure:
+                        result['measured_auxiliary'] = measured.tripwire.receipt()
+                        result['measured_auxiliary']['terminal_receipt_persisted'] = False
+                        result['termination_reason'] = 'recording_failure'
+                try:
+                    adapter.close()
+                except Exception as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    cleanup_errors.append({'step': 'adapter', 'failure_class': type(exc).__name__})
+            if result.get('termination_reason') == 'budget_exhausted' and ledger is not None:
+                # Capture at the stopped boundary before guest/service teardown. A
+                # missing native restore capability stays explicit in the checkpoint.
+                try:
+                    from .continuation import capture_checkpoint
+                    state = workflow.continuation_snapshot() if workflow else {}
+                    if 'scored_window' not in result and result.get('scored_window_start') is not None:
+                        result['scored_window'] = [result['scored_window_start'], time.time()]
+                    state['original_result'] = result
+                    from dataclasses import asdict
+                    auxiliary_limits = {name: asdict(live[name + '_budget' if name == 'reviewer' else 'budget'])
+                        for name in ('proposer', 'reviewer') if live and live.get(name + '_budget' if name == 'reviewer' else 'budget')}
+                    session_ids = state.get('session_ids', [])
+                    checkpoint_receipt = capture_checkpoint(root, run_id=run_id,
+                        session_id=session_ids[-1] if session_ids else None, condition=condition,
+                        model_provider_refs={'provider': provider_base_url, 'model': model,
+                                             'credentials': 'external environment; never persisted',
+                                             'api_key_env': (live or {}).get('target_api_key_env', 'OPENROUTER_API_KEY'),
+                                             'auxiliary_routes': (live or {}).get('routes'),
+                                             'auxiliary_limits': auxiliary_limits,
+                                             'presentation_out': str(proxy_out),
+                                             'profile_presentation_state': ({'initial': presentation.initial.data,
+                                                 'packets': presentation._packets, 'stopped': presentation.stopped,
+                                                 'deltas': presentation._deltas, 'deltas_omitted': presentation._deltas_omitted,
+                                                 'pending': presentation._pending, 'gaps': presentation._gaps,
+                                                 'changes': presentation._changes, 'failures': presentation._failures,
+                                                 'overrides': presentation._overrides}
+                                                 if proxy_profile is not None else None),
+                                             'runtime_artifact': (development_runtime.provenance if development_runtime else None),
+                                             'native_tool_schema_sha256': (hashlib.sha256((adapter.stage / 'config/native-tools.json').read_bytes()).hexdigest() if adapter else None),
+                                             'runtime_flags': (adapter.runtime_flags if adapter else None),
+                                             'provider_pin': provider_pin, 'zdr': result['zdr']},
+                        workflow=state, ledger=ledger.continuation_snapshot(), resources=resources,
+                        profile=(presentation.bundle.data if proxy_profile is not None else None),
+                        proxy=presentation.receipt() if proxy_mode == 'llm' or proxy_profile is not None else None,
+                        journal_path=root / 'broker/executions.jsonl',
+                        output_store=adapter.output_store.root if adapter else None,
+                        native_session=adapter, resource_snapshot=episode.continuation_snapshot,
+                        boundary=state.get('boundary'),
+                        measurement={'measured': result.get('measured_episode', proxy_mode == 'frozen')},
+                        proxy_allowances=({name: {'cost_usd': values['cost_usd'], 'pairs': values['pairs']}
+                            for name, values in auxiliary_limits.items()} if proxy_mode == 'llm' else None),
+                        secrets=tuple(credentials.values()) if adapter else (),
+                        stop_reason=result['termination_reason'])
+                    result['continuation_checkpoint'] = {'path': str(root / 'checkpoint.json'),
+                        'sha256': checkpoint_receipt['checkpoint_sha256'],
+                        'restore_prerequisites': checkpoint_receipt['restore_prerequisites']}
+                except Exception as exc:
+                    result['continuation_checkpoint_failure'] = type(exc).__name__
+            if worker:
+                try:
+                    worker.close()
+                except Exception as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    cleanup_errors.append({'step': 'worker', 'failure_class': type(exc).__name__})
+            try:
+                episode.cleanup()
+            except Exception as exc:
+                cleanup_failure = cleanup_failure or exc
+                cleanup_errors.append({'step': 'episode', 'failure_class': type(exc).__name__})
+            result['cleanup_exit'] = episode.resources.get('cleanup_exit')
+            if cleanup_errors:
+                result['cleanup_errors'] = cleanup_errors
+            private_write(root / 'result.json', json.dumps(result, indent=2, sort_keys=True).encode())
+            if cleanup_failure is not None and primary_failure is None:
+                raise cleanup_failure
+        finally:
+            if lease_acquired:
+                run_lease.__exit__(None, None, None)
     return result
 
 
@@ -584,7 +753,7 @@ def main():
     parser.add_argument('--failed-warmup', action='store_true')
     parser.add_argument('--condition', choices=('eval-looking', 'natural-looking', 'both'), default='both')
     parser.add_argument('--model')
-    parser.add_argument('--microusd-per-token', type=int)
+    parser.add_argument('--microusd-per-token', type=float)
     args = parser.parse_args()
     if args.approved_deletion_control is not None and (not args.local_acceptance or args.local_positive_control
             or args.failed_warmup or args.local_variant != 'quota-awaiting' or args.model is not None

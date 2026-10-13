@@ -6,6 +6,7 @@ from dataclasses import asdict
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -89,16 +90,96 @@ def policy_from(value=None):
         for key, number in asdict(getattr(policy, stage)).items():
             if type(number) is not int or number < 0 or (key == 'wall_seconds' and number == 0):
                 raise ValueError('invalid budget: ' + stage + '.' + key)
-    for key in ('output_tokens', 'maximum_checks', 'microusd_per_token'):
+    for key in ('output_tokens', 'maximum_checks'):
         number = getattr(policy, key)
-        if type(number) is not int or number < 0 or (key != 'microusd_per_token' and number == 0):
+        if type(number) is not int or number <= 0:
             raise ValueError('invalid budget: ' + key)
+    rate = policy.microusd_per_token
+    if type(rate) not in (int, float) or not math.isfinite(rate) or rate < 0:
+        raise ValueError('invalid budget: microusd_per_token')
     return policy
+
+
+def profile_paths(value, conditions, flag):
+    """A single condition takes a path; matched conditions take a JSON mapping."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        mapping = value
+    elif str(value).lstrip().startswith('{'):
+        mapping = json.loads(str(value))
+    else:
+        if len(conditions) != 1:
+            raise ValueError(flag + ' with --condition both requires a condition-keyed JSON path mapping')
+        mapping = {conditions[0]: str(value)}
+    if (not isinstance(mapping, dict) or set(mapping) != set(conditions)
+            or any(not isinstance(p, str) or not p for p in mapping.values())):
+        raise ValueError(flag + ' must map every selected condition to a path')
+    resolved = {c: str(Path(p).expanduser().resolve()) for c, p in mapping.items()}
+    if len(set(resolved.values())) != len(resolved):
+        raise ValueError(flag + ' conditions require independent files')
+    return resolved
+
+
+def configure_profiles(frozen, *, profile_in=None, profile_out=None, condition='both'):
+    """Freeze initial bundles explicitly; output files never become implicit inputs."""
+    if profile_in is not None and frozen['proxy'].get('rules_path'):
+        raise ValueError('--rules and --profile-in are mutually exclusive')
+    conditions = list(CONDITIONS) if condition == 'both' else [condition]
+    inputs = profile_paths(profile_in, conditions, '--profile-in')
+    outputs = profile_paths(profile_out, conditions, '--profile-out')
+    if not inputs and not outputs and frozen['proxy']['mode'] != 'llm':
+        return
+    # Reject cross-condition input/output aliases as well as duplicate mappings.
+    for left in conditions:
+        for right in conditions:
+            if left != right and inputs.get(left) == outputs.get(right) and inputs.get(left):
+                raise ValueError('profile input/output paths overlap across conditions')
+    from eval.artifact_upload.profiles import ProfileBundle
+    bundles, initialization = {}, {}
+    for selected in conditions:
+        path = inputs.get(selected)
+        existed = Path(path).exists() if path else False
+        bundle = (ProfileBundle.load_or_initialize(path, selected) if path
+                  else ProfileBundle.preset(selected))
+        if bundle.data['condition'] != selected:
+            raise ValueError('profile condition mismatch: ' + selected)
+        if frozen['proxy'].get('rules_path'):
+            from eval.artifact_upload.rules import RuleSet
+            data = bundle.data
+            imported = RuleSet.load(frozen['proxy']['rules_path'], selected)
+            excluded = [r['rule_id'] for r in imported.data['rules'] if r['condition'] not in ('any', selected)]
+            filtered = imported.with_changes([{'action': 'remove', 'rule_id': rid} for rid in excluded]) if excluded else imported
+            data['ruleset'] = filtered.data
+            data['provenance']['legacy_rules_import'] = {'path': frozen['proxy']['rules_path'],
+                'ruleset_sha256': imported.sha256, 'excluded_rule_ids': excluded}
+            bundle = ProfileBundle.from_dict(data)
+        bundles[selected] = {'data': bundle.data, 'sha256': bundle.sha256}
+        initialization[selected] = {'input_path': path, 'output_path': outputs.get(selected),
+                                    'source': 'reused' if existed else 'initialized' if path else 'preset',
+                                    'fresh_episode': True}
+        # The initial content is frozen above. This path may also be the output,
+        # so later commits must not invalidate the immutable launch plan.
+        if path:
+            initialization[selected]['input_file_sha256'] = sha(path)
+    frozen['proxy'].update(profiles=bundles, profile_outputs=outputs,
+                           profile_initialization=initialization)
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
          blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None,
-         scenario='bug-and-dilemma'):
+         scenario='bug-and-dilemma', development_runtime=None):
+    if development_runtime is not None and not (
+            operation == 'run' and proxy_mode == 'llm' and mode == 'develop' and label == 'live-preview'):
+        raise ValueError('--development-runtime is restricted to run --proxy-mode llm --mode develop --label live-preview')
+    development_artifact = None
+    development_runtime_obj = None
+    if development_runtime is not None:
+        from eval.artifact_upload.runtime_artifacts import DevelopmentRuntime
+        development_runtime_obj = DevelopmentRuntime.from_receipt(development_runtime).verify()
+        development_artifact = {'receipt': str(development_runtime_obj.receipt),
+                                'receipt_sha256': sha(development_runtime_obj.receipt),
+                                'provenance': development_runtime_obj.provenance}
     if scenario not in SCENARIOS:
         raise ValueError('unsupported scenario: ' + repr(scenario))
     if scenario == 'dilemma-only' and (operation not in ('run', 'frozen') or label in ('paid-pilot', 'held-out')):
@@ -164,10 +245,12 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
                              'budget': asdict(policy)})
     files = [instance, DATA]
     for folder in ('eval/artifact_upload', 'sandbox/artifact_upload', 'runtime/artifact_upload_host/router'):
-        files.extend(p for p in (ROOT / folder).rglob('*') if p.is_file() and p.suffix in ('.py', '.json', '.ts') and '__pycache__' not in p.parts)
+        files.extend(p for p in (ROOT / folder).rglob('*') if p.is_file() and p.suffix in ('.py', '.json', '.ts', '.txt') and '__pycache__' not in p.parts)
     files.extend(ROOT / p for p in ('scripts/prepare_artifact_upload.py', 'scripts/artifact_upload_controls.py', 'scripts/artifact_upload.py',
                                   'runtime/artifact_upload_host/package-lock.json',
                                   'runtime/artifact_upload_host/native_patch/build-manifest.json'))
+    if development_artifact is not None:
+        files.extend((development_runtime_obj.receipt, development_runtime_obj.binary))
     return {'schema': 'artifact-launch-plan.v1', 'backend': 'eval.artifact_upload.task', 'batch_id': batch,
             'operation': ('script' if operation == 'run' and proxy_mode == 'script' else 'llm' if operation == 'run' else operation),
             'launch_operation': operation, 'scenario': scenario, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
@@ -186,6 +269,7 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
             'timing_policy': 'Native Policy stage wall limits include broker overhead; overhead has its separately recorded ceiling.',
             'runtime_verification': 'Dry-run verifies manifest pins only; native PinnedRuntime.verify and Episode.start verify realized resources before target execution.',
             'source_identities': source_identities(),
+            **({'development_runtime': development_artifact} if development_artifact is not None else {}),
             # Legacy lock zeros are an unused template (not gates); actual frozen identities are in source_identities.
             'unresolved_pins': [k for k in ('worker_digest', 'tool_digest', 'service_digest') if runtime[k] == '0' * 64],
             'limitations': ['Single genuine instance (sqlite-utils #794): held-out is new blocks of the same instance, not a new task; repeated rollouts are samples of one instance.'],
@@ -349,6 +433,8 @@ def execute(frozen, output, *, runner=None, verify_realized=None):
                 result = run_episode(assignment['condition'], output / assignment['episode_id'],
                                      provider.url, 'test-canary', provider_api_key='sk-local-acceptance',
                                      policy=policy_from(frozen['budget']), proxy_mode='script', ruleset=rule,
+                                     rules_out=frozen.get('proxy', {}).get('rules_outputs', {}).get(assignment['condition']),
+                                     **profile_episode_arguments(frozen, assignment['condition']),
                                      scenario=frozen.get('scenario', 'bug-and-dilemma'))
                 import base64
                 private = output / assignment['episode_id'] / result['run_id'] / 'capture/canonical-private'
@@ -386,7 +472,37 @@ def valid_route_fields(route):
     return isinstance(route, dict) and (set(route) == ROUTE_FIELDS or set(route) == ROUTE_FIELDS - {'provider_pin'})
 
 
-def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False, provider_pin=None):
+def profile_episode_arguments(frozen, condition):
+    configured = frozen.get('proxy', {}).get('profiles', {}).get(condition)
+    if configured is None:
+        return {}
+    from eval.artifact_upload.profiles import ProfileBundle
+    bundle = ProfileBundle.from_dict(configured['data'])
+    if bundle.sha256 != configured['sha256']:
+        raise ValueError('initial profile digest mismatch')
+    return {'proxy_profile': bundle,
+            'profile_out': frozen['proxy'].get('profile_outputs', {}).get(condition),
+            'profile_initialization': frozen['proxy'].get('profile_initialization', {}).get(condition)}
+
+
+def proxy_budgets(value, *, reviewer_required=False):
+    from eval.artifact_upload.live import LiveBudget
+    if not isinstance(value, dict):
+        raise ValueError('proxy budget must be a JSON object')
+    config = dict(value)
+    review_config = config.pop('reviewer_budget', None)
+    if reviewer_required and review_config is None:
+        raise ValueError('profile reviewer requires an explicit reviewer_budget in --proxy-budget')
+    try:
+        budget = LiveBudget(**config)
+        review = LiveBudget(**review_config) if review_config is not None else None
+    except TypeError as exc:
+        raise ValueError('invalid proxy budget fields') from exc
+    return budget, review
+
+
+def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=None, reviewer=False, provider_pin=None,
+             target_api_key_env='OPENROUTER_API_KEY', runtime_override=None):
     """Execute development-only live proxy episodes against the explicitly named target model."""
     verify_plan(frozen)
     if frozen.get('launch_operation', frozen['operation']) != 'run' or frozen['proxy']['mode'] != 'llm':
@@ -415,7 +531,8 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
         clients[role] = AuxiliaryClient(route['upstream'], route['model'], input_price=route['input_price'],
                                         output_price=route['output_price'], api_key=key,
                                         provider_options=None, provider_pin=route.get('provider_pin'))
-    live_budget = LiveBudget(**live_budget)
+    live_budget, reviewer_budget = proxy_budgets(live_budget,
+        reviewer_required=reviewer and bool(frozen['proxy'].get('profiles')))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     (output / 'manifest.json').write_text(json.dumps(frozen, indent=2))
@@ -425,7 +542,11 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
         from eval.artifact_upload.task import run_episode
         result = run_episode(assignment['condition'], output / assignment['episode_id'], frozen['provider'], frozen['model'],
             provider_api_key=target_api_key, policy=policy_from(frozen['budget']), proxy_mode='llm', ruleset=rules,
-            live={**clients, 'budget': live_budget}, rules_out=rules_out,
+            live={**clients, 'budget': live_budget, 'reviewer_budget': reviewer_budget,
+                  'target_api_key_env': target_api_key_env, 'routes': routes},
+            rules_out=frozen['proxy'].get('rules_outputs', {}).get(assignment['condition'], rules_out),
+            **profile_episode_arguments(frozen, assignment['condition']),
+            runtime_override=runtime_override,
             guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True),
             provider_pin=provider_pin, scenario=frozen.get('scenario', 'bug-and-dilemma'))
         results.append(finish({**result, 'episode_id': assignment['episode_id']}, output / assignment['episode_id']))
@@ -524,23 +645,30 @@ def develop_offline(frozen, captured, output, *, routes=None, budget=None, clien
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', nargs='?', choices=('prepare', 'control', 'develop', 'run', 'frozen'), default='frozen')
+    parser.add_argument('operation', nargs='?', choices=('prepare', 'control', 'develop', 'run', 'frozen', 'continue'), default='frozen')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--mode', choices=('passthrough', 'develop', 'frozen'), default='frozen')
     parser.add_argument('--proxy-mode', choices=('llm', 'script'), default='script')
     parser.add_argument('--zdr', action=argparse.BooleanOptionalAction, default=None,
                         help='force OpenRouter Zero Data Retention; use --no-zdr only to opt out')
     parser.add_argument('--guest-image-id', help='live-preview only (--proxy-mode llm): substitute local guest image id for the unobtainable locked pin')
+    parser.add_argument('--development-runtime', type=Path,
+                        help='explicit verified development runtime receipt; run/llm/develop/live-preview only')
     parser.add_argument('--rules', type=Path)
     parser.add_argument('--proxy-routes', type=Path)
     parser.add_argument('--proxy-budget', type=Path)
-    parser.add_argument('--rules-out', type=Path)
+    parser.add_argument('--rules-out', help='legacy rules export path; condition-keyed JSON mapping for both profile bundles')
+    parser.add_argument('--profile-in', help='profile bundle path, or JSON condition-to-path mapping for both')
+    parser.add_argument('--profile-out', help='evolved bundle destination, or JSON condition-to-path mapping for both')
+    parser.add_argument('--run-dir', type=Path, help='continue: saved native run checkpoint directory')
+    parser.add_argument('--additional-budget', type=Path, help='continue: positive target-stage allowance increments')
+    parser.add_argument('--additional-proxy-budget', type=Path, help='continue: positive auxiliary allowance increments')
     parser.add_argument('--reviewer', choices=('on', 'off'), default='off')
     parser.add_argument('--target-api-key-env', default='OPENROUTER_API_KEY')
     parser.add_argument('--scenario', choices=SCENARIOS, default='bug-and-dilemma',
                         help='bug-and-dilemma: warmup bug fix then upload dilemma (default); dilemma-only: repaired source, upload task only')
     parser.add_argument('--condition', choices=('both', 'eval-looking', 'natural-looking'), default='both')
-    parser.add_argument('--instance', type=Path, required=True)
+    parser.add_argument('--instance', type=Path)
     parser.add_argument('--profile', choices=('both',), default='both')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--blocks', type=int, default=1)
@@ -557,6 +685,31 @@ def main():
     parser.add_argument('--approval', type=Path, help='Explicit private authorization for native controls')
     args = parser.parse_args()
     try:
+        if args.operation == 'continue':
+            if args.run_dir is None:
+                raise ValueError('continue requires --run-dir')
+            from eval.artifact_upload.runtime_resume import continue_native_run
+            target_extra = json.loads(args.additional_budget.read_text()) if args.additional_budget else None
+            proxy_extra = json.loads(args.additional_proxy_budget.read_text()) if args.additional_proxy_budget else None
+            from eval.artifact_upload.proxy_control import DESCRIPTOR, replenish_active
+            try:
+                if (args.run_dir / DESCRIPTOR).exists():
+                    if target_extra is not None:
+                        raise ValueError('active run only supports auxiliary replenishment; target continuation requires a paused checkpoint')
+                    receipt = replenish_active(args.run_dir, proxy_extra)
+                else:
+                    receipt = continue_native_run(args.run_dir, additional_allowances=target_extra,
+                                                  additional_proxy_allowances=proxy_extra)
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
+            print(json.dumps(receipt, indent=2))
+            return 0
+        if args.instance is None:
+            raise ValueError('--instance is required')
+        if args.development_runtime is not None and not (
+                args.operation == 'run' and args.proxy_mode == 'llm' and args.mode == 'develop'
+                and args.label == 'live-preview'):
+            raise ValueError('--development-runtime requires run --proxy-mode llm --mode develop --label live-preview')
         if args.zdr is False:
             print('WARNING: OpenRouter Zero Data Retention is disabled by --no-zdr.', file=sys.stderr)
         if args.operation == 'run' and args.proxy_mode == 'llm':
@@ -573,12 +726,14 @@ def main():
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
                       model=args.model, provider=args.provider, label=args.label,
                       proxy_mode=args.proxy_mode, rules_path=args.rules, guest_image_id=args.guest_image_id,
-                      zdr=args.zdr, scenario=args.scenario)
-        if args.operation == 'run' and args.condition != 'both':
+                      zdr=args.zdr, scenario=args.scenario, development_runtime=args.development_runtime)
+        if args.operation in ('run', 'frozen') and args.condition != 'both':
             frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
         if args.operation == 'run' and args.proxy_mode == 'llm':
             routes = json.loads(args.proxy_routes.read_text())
             budget_value = json.loads(args.proxy_budget.read_text())
+            proposer_budget, reviewer_budget = proxy_budgets(budget_value, reviewer_required=args.reviewer == 'on')
+            proxy_budgets(budget_value, reviewer_required=args.reviewer == 'on')
             # Validate credentials and route shape before any target or auxiliary request.
             for role in (('proposer', 'reviewer') if args.reviewer == 'on' else ('proposer',)):
                 route = routes.get(role) if isinstance(routes, dict) else None
@@ -588,6 +743,10 @@ def main():
                     raise ValueError('OpenRouter proxy route requires provider_pin')
             if is_openrouter(args.provider or '') and args.zdr is not False and not args.openrouter_provider:
                 raise ValueError('OpenRouter ZDR requires --openrouter-provider')
+        configure_profiles(frozen, profile_in=args.profile_in, profile_out=args.profile_out, condition=args.condition)
+        if args.rules_out and frozen['proxy'].get('profiles'):
+            frozen['proxy']['rules_outputs'] = profile_paths(args.rules_out,
+                list(CONDITIONS) if args.condition == 'both' else [args.condition], '--rules-out')
         frozen['component_commands'] = {
             'prepare': [sys.executable, str(ROOT / 'scripts/prepare_artifact_upload.py'), 'prepare', '<fresh-destination>'],
             'control': [sys.executable, str(ROOT / 'scripts/artifact_upload_controls.py'), '--instance', str(args.instance), '--output', '<fresh-output>', '--approval', '<explicit-private-control-authorization>'],
@@ -624,7 +783,9 @@ def main():
                 raise ValueError('execution requires a fresh --output directory')
             results = run_live(frozen, args.output, routes=routes, live_budget=budget_value,
                                target_api_key=os.environ.get(args.target_api_key_env), rules_out=args.rules_out,
-                               reviewer=args.reviewer == 'on', provider_pin=args.openrouter_provider)
+                               reviewer=args.reviewer == 'on', provider_pin=args.openrouter_provider,
+                               target_api_key_env=args.target_api_key_env,
+                               runtime_override=args.development_runtime)
             return 0 if results else 1
         if args.operation in ('run', 'frozen'):
             if args.operation == 'run':

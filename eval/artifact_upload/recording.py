@@ -274,6 +274,23 @@ class RecordingPresenter:
         # Raw evidence is never registered with the target's read/search broker.
         self.raw_store = OutputStore(recorder.private / "raw-outputs", store.run_id)
 
+    def before_execute(self, call: dict[str, Any]) -> None:
+        self.recorder.check()
+        hook = getattr(self.presenter, "before_execute", None)
+        if hook is not None:
+            hook(call)
+
+    def abort_call(self, call: dict[str, Any]) -> None:
+        abort = getattr(self.presenter, "abort_call", None)
+        if abort is not None:
+            abort(call)
+
+    def delivered(self, call: dict[str, Any], output: str, presented: Presented, uri: str | None) -> None:
+        """Delivery commitment, invoked by the bridge with the exact post-fit output returned to the runtime."""
+        hook = getattr(self.presenter, "delivered", None)
+        if hook is not None:
+            hook(call, output, presented, uri)
+
     def present(self, call: dict[str, Any], result: dict[str, Any]) -> Presented:
         self.recorder.check()
         try:

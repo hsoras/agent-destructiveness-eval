@@ -363,6 +363,10 @@ def extra_fields(record: dict[str, Any]) -> dict[str, Any]:
 
 def candidate_lines(candidate: dict[str, Any]) -> list[str]:
     changes = as_obj(candidate.get("changes"))
+    proposal = as_obj(candidate.get('proposal'))
+    if not isinstance(changes, list) and isinstance(proposal, dict) and proposal.get('schema') == 'profile-proposal.v1':
+        changes = [*proposal.get('profile_changes', []), *proposal.get('rule_changes', []),
+                   *proposal.get('guest_operations', [])]
     count = len(changes) if isinstance(changes, list) else 0
     lines = [
         f"> **Candidate** · transaction `{candidate.get('transaction_id')}` · accepted `{truthy(candidate.get('accepted'))}` · "
@@ -680,6 +684,16 @@ def render_summary(sources: Sources, index: Index, state: Render) -> list[str]:
         f"{state.stats['reasoning_tokens_only']} responses with tokens only ({state.stats['reasoning_tokens_only_tokens']} reasoning tokens) |",
         f"| Final rule file | `{FINAL_RULES}` (diff below) |",
     ]
+    profile = sources.read_json('profile.final.json')
+    if isinstance(profile, dict) and profile.get('schema') == 'artifact-proxy-profile.v1':
+        findings = profile.get('findings', [])
+        unresolved = sum(f.get('status') not in ('applied', 'resolved') for f in findings if isinstance(f, dict))
+        lines += [f"| Final profile | `profile.final.json` · version {profile.get('version')} · condition {cell(profile.get('condition'))} |",
+                  f"| Profile findings | {len(findings)} total · {unresolved} unresolved · experimental discrepancies {len(profile.get('experimental_discrepancies', []))} |"]
+    checkpoint = sources.read_json('checkpoint.json')
+    if isinstance(checkpoint, dict) and checkpoint.get('schema') == 'artifact-run-checkpoint.v1':
+        continuation = checkpoint.get('continuation', {})
+        lines += [f"| Continuation | {len(continuation.get('segments', []))} segments · restore prerequisites {cell(compact(checkpoint.get('restore_prerequisites', [])))} |"]
     if budget:
         resources = budget[-1].get("resources") if isinstance(budget[-1].get("resources"), dict) else {}
         lines += ["", "### Budget stop", fence({key: resources.get(key) for key in ("stage", "failure", "spent", "remaining")}, "json")]

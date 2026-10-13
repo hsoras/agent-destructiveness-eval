@@ -140,6 +140,120 @@ def _text(value, limit, what, allow_empty=False):
     return value
 
 
+OPERATIONS = {"shell": ("stdout", "stderr"), "read": ("text", "error"), "grep": ("results", "error"),
+              "find": ("results", "error"), "glob": ("results", "error")}
+REFS = frozenset({"direct", "output_ref", "any"})
+FACT = re.compile(r"[A-Za-z0-9_.:/-]{1,96}")
+MAX_REQUIRES = 8
+_SCALAR = (str, int, float, bool, type(None))
+
+
+def _requirement(req) -> dict:
+    ops = {"equals", "not_equals", "in", "exists"}
+    if (not isinstance(req, dict) or "fact" not in req or not isinstance(req["fact"], str)
+            or not FACT.fullmatch(req["fact"]) or len(set(req) - {"fact"}) != 1 or not (set(req) - {"fact"}) <= ops):
+        raise RuleError("invalid requires entry")
+    (op,) = set(req) - {"fact"}
+    value = req[op]
+    if op == "in":
+        if not isinstance(value, list) or not 0 < len(value) <= 16 or any(not isinstance(v, _SCALAR) for v in value):
+            raise RuleError("invalid requires entry")
+    elif op == "exists":
+        if type(value) is not bool:
+            raise RuleError("invalid requires entry")
+    elif not isinstance(value, _SCALAR) or (isinstance(value, str) and len(value) > MAX_FIND):
+        raise RuleError("invalid requires entry")
+    return {"fact": req["fact"], op: deepcopy(value)}
+
+
+def _match(match) -> dict:
+    """Legacy shell matches stay byte-identical; read/grep, surface, ref scope and state preconditions are additive."""
+    if not isinstance(match, dict) or match.get("operation") not in OPERATIONS:
+        raise RuleError("match needs operation=shell|read|grep|find|glob")
+    operation = "find" if match["operation"] == "glob" else match["operation"]
+    keys = ("commands", "command_regex") if operation == "shell" else ("paths", "path_regex")
+    if set(match) - {"operation", "surface", "refs", "requires", *keys} or sum(k in match for k in keys) != 1:
+        raise RuleError("match needs operation=shell and exactly one of commands/command_regex"
+                        if operation == "shell" else "match needs exactly one of paths/path_regex")
+    if operation == "shell" and "refs" in match:
+        raise RuleError("refs applies to read/grep matches")
+    out = {"operation": operation}
+    key = next(k for k in keys if k in match)
+    if key in ("commands", "paths"):
+        items = match[key]
+        if not isinstance(items, list) or not 0 < len(items) <= MAX_COMMANDS:
+            raise RuleError("invalid " + key)
+        out[key] = [_text(c, MAX_FIND, key[:-1]) for c in items]
+    else:
+        check_regex(match[key])
+        out[key] = match[key]
+    if "surface" in match:
+        if match["surface"] not in OPERATIONS[operation]:
+            raise RuleError("invalid surface")
+        out["surface"] = match["surface"]
+    if "refs" in match:
+        if match["refs"] not in REFS:
+            raise RuleError("invalid refs")
+        out["refs"] = match["refs"]
+    if "requires" in match:
+        req = match["requires"]
+        if not isinstance(req, list) or len(req) > MAX_REQUIRES:
+            raise RuleError("invalid requires")
+        out["requires"] = [_requirement(r) for r in req]
+    return out
+
+
+def holds(requirement: dict, state) -> bool:
+    """One state precondition against a flat fact mapping; a missing fact only satisfies ``exists: false``."""
+    state = state or {}
+    fact = requirement["fact"]
+    if "exists" in requirement:
+        return (fact in state) == requirement["exists"]
+    if fact not in state:
+        return False
+    value = state[fact]
+    if "equals" in requirement:
+        return value == requirement["equals"]
+    if "not_equals" in requirement:
+        return value != requirement["not_equals"]
+    return value in requirement["in"]
+
+
+def surface_of(match: dict) -> str:
+    return match.get("surface") or OPERATIONS[match["operation"]][0]
+
+
+def call_key(call: dict) -> str | None:
+    """The string a rule's commands/paths/regex matches: command, read file path, or search path."""
+    args = call.get("arguments") or {}
+    op = call.get("operation")
+    value = (args.get("command") if op == "shell" else args.get("filePath") if op == "read"
+             else args.get("path") or "." if op in {"grep", "find", "glob"} else None)
+    return value if isinstance(value, str) else None
+
+
+_ERROR_WORDS = re.compile(r"(?i)no such file|permission denied|not a directory|is a directory|not found|denied|forbidden|"
+                          r"unauthori[sz]ed|conflict|already exists|exists|quota|exceed\w*|invalid|fatal|error|failed|fail|"
+                          r"cannot|refused|timed out|timeout|traceback|exception|warning")
+
+
+def check_error_meaning(raw: str, rendered: str) -> tuple[bool, str]:
+    """Error/stderr renderings keep their error vocabulary (as a multiset) and never become empty."""
+    if bool(raw.strip()) != bool(rendered.strip()):
+        return False, "error-emptiness-changed"
+    if Counter(m.group().lower() for m in _ERROR_WORDS.finditer(raw)) != Counter(m.group().lower() for m in _ERROR_WORDS.finditer(rendered)):
+        return False, "error-meaning-changed"
+    return True, "ok"
+
+
+def check_surface(raw: str, rendered: str, surface: str, protected_tokens=()) -> tuple[bool, str]:
+    """Protected-fact guard for every delivered surface; error surfaces also keep their error meaning."""
+    ok, why = check_rendering(raw, rendered, protected_tokens)
+    if ok and surface in ("stderr", "error"):
+        return check_error_meaning(raw, rendered)
+    return ok, why
+
+
 def _rule(rule) -> dict:
     if not isinstance(rule, dict) or not {"rule_id", "match", "edits"} <= set(rule):
         raise RuleError("rule needs rule_id, match, edits")
@@ -155,19 +269,7 @@ def _rule(rule) -> dict:
     condition = rule.get("condition", "any")
     if condition != "any" and condition not in CONDITIONS:
         raise RuleError("invalid condition")
-    match = rule["match"]
-    if (not isinstance(match, dict) or match.get("operation") != "shell"
-            or set(match) - {"operation", "commands", "command_regex"}
-            or ("commands" in match) == ("command_regex" in match)):
-        raise RuleError("match needs operation=shell and exactly one of commands/command_regex")
-    if "commands" in match:
-        cmds = match["commands"]
-        if not isinstance(cmds, list) or not 0 < len(cmds) <= MAX_COMMANDS:
-            raise RuleError("invalid commands")
-        m = {"operation": "shell", "commands": [_text(c, MAX_FIND, "command") for c in cmds]}
-    else:
-        check_regex(match["command_regex"])
-        m = {"operation": "shell", "command_regex": match["command_regex"]}
+    m = _match(rule["match"])
     edits = rule["edits"]
     if not isinstance(edits, list) or not 0 < len(edits) <= MAX_EDITS:
         raise RuleError("invalid edits")
@@ -332,30 +434,60 @@ class RuleSet:
         return RuleSet.from_dict(data)
 
     # ---- rendering
-    def matching(self, command: str, condition: str | None = None) -> list:
+    @staticmethod
+    def _hit(match: dict, key: str) -> bool:
+        if "commands" in match or "paths" in match:
+            return key in match.get("commands", match.get("paths"))
+        return check_regex(match.get("command_regex", match.get("path_regex"))).fullmatch(key) is not None
+
+    def select(self, operation: str, key: str, surface: str, condition: str | None = None, state=None, via_ref: bool = False) -> list:
+        """Rules for one operation/surface whose condition, target and state preconditions all hold."""
         out = []
         for rule in self._obj["rules"]:
+            m = rule["match"]
+            if m["operation"] != operation or surface_of(m) != surface:
+                continue
             if condition and rule["condition"] not in ("any", condition):
                 continue
-            m = rule["match"]
-            if "commands" in m:
-                hit = command in m["commands"]
-            else:
-                hit = check_regex(m["command_regex"]).fullmatch(command) is not None
-            if hit:
-                out.append(rule)
+            refs = m.get("refs", "direct")
+            if operation != "shell" and ((refs == "direct" and via_ref) or (refs == "output_ref" and not via_ref)):
+                continue
+            if not self._hit(m, key) or any(not holds(r, state) for r in m.get("requires", ())):
+                continue
+            out.append(rule)
         return out
+
+    def matching(self, command: str, condition: str | None = None) -> list:
+        # Legacy view: stateless shell-stdout rules (a rule with state preconditions needs render_surface).
+        return [r for r in self.select("shell", command, "stdout", condition, None) if not r["match"].get("requires")]
 
     def render(self, command: str, stdout: str, condition: str | None = None) -> tuple[str, list]:
         """Apply matching rules in order. Returns (text, [rule_id that changed the text]).
         Raises RuleError on any failure; callers must fall back to raw."""
-        text, applied = stdout, []
-        for rule in self.matching(command, condition):
+        return self._apply(self.matching(command, condition), stdout)
+
+    def render_surface(self, call: dict, surface: str, text: str, condition: str | None = None, state=None,
+                       via_ref: bool = False) -> tuple[str, list]:
+        """Surface-aware render of one delivered text (shell stdout/stderr, read text/error, search results/error)."""
+        key = call_key(call)
+        if key is None or surface not in OPERATIONS.get(call.get("operation"), ()):
+            return text, []
+        operation = "find" if call["operation"] == "glob" else call["operation"]
+        return self._apply(self.select(operation, key, surface, condition, state, via_ref), text)
+
+    @staticmethod
+    def _apply(rules, text):
+        applied = []
+        for rule in rules:
             new = apply_edits(text, rule["edits"])
             if new != text:
                 applied.append(rule["rule_id"])
             text = new
         return text, applied
+
+    def inactive(self, state) -> list:
+        """Rule IDs whose state preconditions no longer hold (callers log them as invalidated)."""
+        return [r["rule_id"] for r in self._obj["rules"] if any(not holds(q, state) for q in r["match"].get("requires", ()))]
 
 
 def default_ruleset(condition: str = "natural-looking") -> RuleSet:

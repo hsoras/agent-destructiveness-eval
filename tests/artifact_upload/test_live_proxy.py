@@ -1,4 +1,5 @@
 """Live/script proxy with mocked aux clients; no paid model calls."""
+import http.server
 import json
 import threading
 
@@ -525,3 +526,95 @@ def test_soft_failure_classification():
     assert _soft_failure(AuxiliaryError('auxiliary reply content empty', cost_usd=0.0))
     assert not _soft_failure(AuxiliaryHTTPError(400)) and not _soft_failure(RuntimeError('boom'))
     assert not _soft_failure(ValueError('auxiliary response lacks usage'))
+
+
+@pytest.mark.parametrize('base_suffix', ['/api', '/api/v1'])
+def test_proposer_base_convention_reaches_openrouter_chat_path(base_suffix):
+    # OpenRouter's chat path is /api/v1/chat/completions. The client must
+    # account for ProviderGuard prepending an upstream base path.
+    from eval.artifact_upload.discovery import AuxiliaryClient
+    seen = []
+    body = json.dumps({'choices': [{'message': {'content': '{"ok": true}'}, 'finish_reason': 'stop'}],
+                       'usage': {'prompt_tokens': 10, 'completion_tokens': 5}}).encode()
+
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.path)
+            self.rfile.read(int(self.headers['Content-Length']))
+            status, payload = ((200, body) if self.path == '/api/v1/chat/completions' else
+                               (404, b'{"error":{"type":"invalid_request_error","code":"bad_path",'
+                                b'"message":"bad route Bearer sk-abcdefghijklmno"}}'))
+            self.send_response(status)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = AuxiliaryClient('http://127.0.0.1:%d%s' % (srv.server_port, base_suffix), 'deepseek/deepseek-v4.1-flash',
+                                 input_price=9e-8, output_price=1.8e-7, api_key='k', provider_pin='decart/fp4')
+        reply = client.complete({'packet_id': 'p'}, seconds=10, max_tokens=4096, max_cost_usd=0.00225)
+        assert reply.output == '{"ok": true}' and reply.cost_usd == pytest.approx(10 * 9e-8 + 5 * 1.8e-7)
+        assert seen == ['/api/v1/chat/completions']
+    finally:
+        srv.shutdown()
+
+
+def test_azure_gpt5_aux_request_uses_advertised_params_and_fake_rejects_unknown_once():
+    """Offline endpoint contract: the real auxiliary body passes, an unsupported field is rejected once."""
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+    from eval.artifact_upload.discovery import AuxiliaryClient
+
+    observed = []
+    supported = {"model", "messages", "max_completion_tokens", "stream", "provider", "response_format"}
+
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            unknown = sorted(set(body) - supported)
+            observed.append({"path": self.path, "keys": sorted(body), "unknown": unknown})
+            if self.path != "/api/v1/chat/completions" or unknown:
+                payload = json.dumps({"error": {"type": "invalid_request_error", "code": "unsupported_parameter",
+                                                   "message": "unsupported parameter: " + (unknown[0] if unknown else "path")}}).encode()
+                self.send_response(400)
+            else:
+                payload = json.dumps({"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                                      "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = AuxiliaryClient(f"http://127.0.0.1:{srv.server_port}/api", "openai/gpt-5-nano",
+                                 input_price=5e-8, output_price=4e-7, provider_pin="azure", zdr=True)
+        reply = client.complete({"packet_id": "p"}, seconds=10, max_tokens=4096, max_cost_usd=0.01,
+                                response_format={"type": "json_schema", "json_schema": {"strict": True,
+                                    "schema": {"type": "object", "properties": {}, "required": [],
+                                               "additionalProperties": False}}})
+        assert reply.output == "{}"
+        accepted = observed[0]
+        assert accepted["path"] == "/api/v1/chat/completions" and accepted["unknown"] == []
+        assert "temperature" not in accepted["keys"] and "max_tokens" not in accepted["keys"]
+        # Exercise the same fake endpoint validator with a deliberately unsupported field.
+        invalid = json.dumps({"model": "openai/gpt-5-nano", "messages": [], "max_completion_tokens": 4096,
+                              "stream": False, "provider": {"zdr": True}, "temperature": 0.2}).encode()
+        try:
+            urlopen(Request(f"http://127.0.0.1:{srv.server_port}/api/v1/chat/completions", data=invalid,
+                            headers={"Content-Type": "application/json"}), timeout=5)
+        except HTTPError as exc:
+            assert exc.code == 400
+        else:
+            raise AssertionError("fake provider accepted unsupported temperature")
+        assert len(observed) == 2 and observed[1]["unknown"] == ["temperature"]
+    finally:
+        srv.shutdown()

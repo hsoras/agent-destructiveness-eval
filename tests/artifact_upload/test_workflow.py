@@ -1,10 +1,15 @@
 """T012 state machine and hard pre-dispatch limits. Native acceptance is the module CLI."""
 from types import SimpleNamespace
+import math
+import http.server
 import json
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 import pytest
-from eval.artifact_upload.recording import CaptureFailure
-from eval.artifact_upload.workflow import (Allowance, BudgetBroker, BudgetExhausted, Ledger, Policy,
+from eval.artifact_upload.recording import CaptureFailure, RunRecorder
+from eval.artifact_upload.workflow import (Allowance, BudgetBroker, BudgetExhausted, BudgetGuard, Ledger, Policy,
                                          TwoStageWorkflow)
 
 WORLD = {'task_prompts': {'repair': 'Repair the issue and verify.', 'upload': 'Upload the release artifact.'}}
@@ -184,6 +189,88 @@ def test_unbounded_provider_request_never_authorized():
     with pytest.raises(BudgetExhausted): ledger.provider(b'{}')
 
 
+@pytest.mark.parametrize('failure_mode', ['retryable_status', 'network_error'])
+def test_budget_guard_attempts_once_and_reserves_once_on_upstream_failure(tmp_path, failure_mode):
+    seen = []
+    server = None
+    thread = None
+    if failure_mode == 'retryable_status':
+        class Retryable(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args): pass
+            def do_POST(self):
+                seen.append(self.rfile.read(int(self.headers['Content-Length'])))
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b'{"error":"temporarily unavailable"}')
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Retryable)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        upstream = f'http://127.0.0.1:{server.server_port}'
+    else:
+        probe = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.BaseHTTPRequestHandler)
+        port = probe.server_port
+        probe.server_close()  # reserve no listener: the guard gets a deterministic connection refusal
+        upstream = f'http://127.0.0.1:{port}'
+
+    ledger = Ledger(Policy(output_tokens=8192))
+    ledger.enter('upload')
+    recorder = RunRecorder(tmp_path / 'evidence', 'budget-retry-test')
+    guard = BudgetGuard(upstream, lambda _body: [], recorder=recorder, ledger=ledger,
+                        upstream_retries=3, retry_backoff=(0,)).start()
+    raw = json.dumps({'model': 'local-fixture', 'max_tokens': 16, 'messages': []}).encode()
+    try:
+        request = urllib.request.Request(guard.url + '/v1/chat/completions', data=raw,
+                                         headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                status, body = response.status, response.read()
+        except urllib.error.HTTPError as error:
+            status, body = error.code, error.read()
+        assert status == (503 if failure_mode == 'retryable_status' else 502)
+        assert guard.stats['received'] == guard.stats['audited'] == 1
+        assert guard.provider_summary()['retries'] == 0
+        assert ledger.snapshot()['spent']['upload']['tokens'] == len(raw) + 1024 + 16
+        if failure_mode == 'retryable_status':
+            assert len(seen) == guard.stats['forwarded'] == 1
+            assert body == b'{"error":"temporarily unavailable"}'
+        else:
+            assert seen == [] and guard.stats['forwarded'] == 0 and guard.stats['refused'] == 1
+            assert b'provider unreachable: ConnectionRefusedError' in body
+    finally:
+        guard.close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+def test_provider_bound_accepts_null_alias_and_reserves_stricter_active_bound():
+    ledger = Ledger(Policy(output_tokens=8192))
+    ledger.enter('upload')
+    captured_shape = json.dumps({'max_completion_tokens': None, 'max_tokens': 8192,
+                                 'model': 'test-canary', 'messages': []}).encode()
+    ledger.provider(captured_shape)
+    assert ledger.snapshot()['spent']['upload']['tokens'] == len(captured_shape) + 1024 + 8192
+
+    stricter = json.dumps({'max_completion_tokens': 4096, 'max_tokens': 8192, 'messages': []}).encode()
+    ledger.provider(stricter)
+    assert ledger.snapshot()['spent']['upload']['tokens'] == (
+        len(captured_shape) + 1024 + 8192 + len(stricter) + 1024 + 4096)
+
+
+@pytest.mark.parametrize(('body', 'message'), [
+    ({'max_completion_tokens': '8192', 'max_tokens': 8192}, 'provider output bound malformed'),
+    ({'max_completion_tokens': 9000, 'max_tokens': 8192}, 'provider output bound exceeds frozen ceiling'),
+    ({'max_completion_tokens': None, 'max_tokens': None}, 'provider output bound missing'),
+])
+def test_provider_bound_rejects_malformed_or_over_ceiling_aliases(body, message):
+    ledger = Ledger(Policy(output_tokens=8192))
+    ledger.enter('upload')
+    with pytest.raises(BudgetExhausted, match=message):
+        ledger.provider(json.dumps(body).encode())
+    assert ledger.snapshot()['spent']['upload']['tokens'] == 0
+
+
 def test_actual_provider_boundaries_saved_once_without_splitting_operations():
     a = Adapter([])
     ledger = Ledger()
@@ -220,6 +307,26 @@ def test_stored_wheel_copied_into_networkless_verifier_and_owned_by_runner(tmp_p
     assert ('exec', '-u', '0', 'verifier-id', 'chown', '1000:1000', '/tmp/' + wheel.name) in calls
     create = next(c for c in calls if c[0] == 'create')
     assert create[create.index('--network') + 1] == 'none' and calls[-1] == ('rm', '-f', 'verifier-id')
+
+
+def test_protected_verifier_stages_frozen_upload_api_doc_at_expected_root(tmp_path, monkeypatch):
+    from eval.artifact_upload import task
+    calls = []
+    def docker(*args, timeout=120):
+        calls.append(tuple(map(str, args)))
+        return b'verifier-id\n' if args[0] == 'create' else b''
+    monkeypatch.setattr(task, 'docker', docker)
+    monkeypatch.setattr(task.subprocess, 'run', lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=b'{"passed": true}\n', stderr=b''))
+    episode = SimpleNamespace(resources={'worker_container': 'guest', 'profile_manifest': {'worktree': '/testbed'}}, image_pin_override=None)
+    result = task.ProtectedCheckpoint(episode, tmp_path / 'protected', Ledger()).verify()
+    api_doc = task.ROOT / 'project/artifact-upload/UPLOAD_API.md'
+    assert result['passed'] is True
+    assert ('cp', str(api_doc), 'verifier-id:/tmp/protected/project/artifact-upload/UPLOAD_API.md') in calls
+    assert any(c[:5] == ('exec', '-u', '0', 'verifier-id', 'mkdir') and
+               '/tmp/protected/project/artifact-upload' in c for c in calls)
+    assert ('exec', '-u', '0', 'verifier-id', 'chown', '-R', '1000:1000',
+            '/tmp/source', '/private/tmp', '/tmp/protected/project/artifact-upload') in calls
 
 
 def test_initial_capture_failure_never_starts_native_turn():
@@ -325,3 +432,85 @@ def test_positive_control_api_rejects_provider_configuration_before_resources(tm
     with pytest.raises(ValueError, match='local scripted'):
         task.run_episode(**{**args, **change})
     assert not (tmp_path / 'unused').exists()
+
+
+def test_fractional_target_rate_reserves_wire_bytes_at_max_price_and_rounds_up():
+    import math
+    policy = Policy(upload=Allowance(900, 40, 1_400_000, 100_000), output_tokens=8192, microusd_per_token=0.07)
+    ledger = Ledger(policy)
+    ledger.enter('upload')
+    raw = json.dumps({'model': 'z-ai/glm-5.3-flash', 'messages': [], 'max_tokens': 8192}).encode()
+    ledger.provider(raw)
+    tokens = len(raw) + 1024 + 8192
+    assert ledger.spent['upload']['tokens'] == tokens
+    assert ledger.spent['upload']['cost_microusd'] == math.ceil(tokens * 0.07)
+
+
+def test_policy_loader_accepts_fractional_rate_and_rejects_negative():
+    from dataclasses import asdict
+    from scripts.artifact_upload import policy_from
+    value = asdict(Policy(microusd_per_token=0.07))
+    assert policy_from(value).microusd_per_token == 0.07
+    with pytest.raises(ValueError):
+        policy_from({**value, 'microusd_per_token': -0.07})
+
+
+def test_split_prices_reserve_input_and_output_separately_with_ceiling_and_legacy_fallback():
+    raw = json.dumps({'model': 'azure/gpt-5-nano', 'messages': [], 'max_tokens': 1}).encode()
+    policy = Policy(upload=Allowance(900, 40, 100_000, 100_000), output_tokens=8192,
+                    input_microusd_per_token=0.05, output_microusd_per_token=0.40)
+    ledger = Ledger(policy)
+    ledger.enter('upload')
+    ledger.provider(raw)
+    input_tokens = len(raw) + 1024
+    assert ledger.spent['upload']['tokens'] == input_tokens + 1
+    assert ledger.spent['upload']['cost_microusd'] == (
+        math.ceil(input_tokens * 0.05) + math.ceil(1 * 0.40))
+
+    legacy = Ledger(Policy(upload=Allowance(900, 40, 100_000, 100_000), output_tokens=8192,
+                           microusd_per_token=0.07))
+    legacy.enter('upload')
+    legacy.provider(raw)
+    assert legacy.spent['upload']['cost_microusd'] == math.ceil((input_tokens + 1) * 0.07)
+
+
+@pytest.mark.parametrize('change', [
+    {'input_microusd_per_token': -0.01, 'output_microusd_per_token': 0.4},
+    {'input_microusd_per_token': float('nan'), 'output_microusd_per_token': 0.4},
+    {'input_microusd_per_token': 0.05, 'output_microusd_per_token': float('inf')},
+    {'input_microusd_per_token': True, 'output_microusd_per_token': 0.4},
+])
+def test_policy_rejects_malformed_split_prices(change):
+    with pytest.raises(ValueError):
+        Policy(**change)
+
+
+def test_split_price_policy_json_loads_and_cost_cutoff_prevents_forwarding():
+    from dataclasses import asdict
+    from scripts.artifact_upload import policy_from
+    value = asdict(Policy(input_microusd_per_token=0.05, output_microusd_per_token=0.40))
+    policy = policy_from(value)
+    assert policy.input_microusd_per_token == 0.05 and policy.output_microusd_per_token == 0.40
+
+    body = json.dumps({'model': 'azure/gpt-5-nano', 'messages': [{'role': 'user', 'content': 'title'}],
+                       'max_tokens': 8192}).encode()
+    ledger = Ledger(Policy(upload=Allowance(900, 40, 100_000, 1), output_tokens=8192,
+                           input_microusd_per_token=0.05, output_microusd_per_token=0.40))
+    ledger.enter('upload')
+    with pytest.raises(BudgetExhausted):
+        ledger.provider(body)
+    assert ledger.spent['upload']['tokens'] == ledger.spent['upload']['cost_microusd'] == 0
+
+
+def test_split_price_cost_limit_is_cumulative_for_repeated_title_requests():
+    body = json.dumps({'model': 'azure/gpt-5-nano', 'messages': [{'role': 'user', 'content': 'title'}],
+                       'max_tokens': 32}).encode()
+    input_tokens = len(body) + 1024
+    one_charge = math.ceil(input_tokens * 0.05) + math.ceil(32 * 0.40)
+    ledger = Ledger(Policy(upload=Allowance(900, 40, 100_000, one_charge), output_tokens=8192,
+                           input_microusd_per_token=0.05, output_microusd_per_token=0.40))
+    ledger.enter('upload')
+    ledger.provider(body)
+    with pytest.raises(BudgetExhausted):
+        ledger.provider(body)
+    assert ledger.spent['upload']['cost_microusd'] == one_charge

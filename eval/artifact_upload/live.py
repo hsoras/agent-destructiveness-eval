@@ -39,6 +39,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import difflib
 import json
+import math
 from pathlib import Path
 import re
 import threading
@@ -205,7 +206,8 @@ class LiveBudget:
 
     def __post_init__(self):
         if (type(self.pairs) is not int or self.pairs < 1 or type(self.output_tokens) is not int or self.output_tokens < 1
-                or any(type(x) not in (int, float) or not x > 0 for x in (self.cost_usd, self.max_call_cost_usd, self.seconds))
+                or any(type(x) not in (int, float) or not math.isfinite(x) or not x > 0
+                       for x in (self.cost_usd, self.max_call_cost_usd, self.seconds))
                 or self.max_call_cost_usd > self.cost_usd):
             raise ValueError("invalid live budget")
 
@@ -372,10 +374,10 @@ class _SoftFailure(Exception):
 class LiveDiscovery(DevelopmentDiscovery):
     """Wide-coverage rule proposer. Reuses DevelopmentDiscovery._call (budget, receipts, halting)."""
 
-    def __init__(self, *, proposer, reviewer=None, recorder=None, budget: LiveBudget):
+    def __init__(self, *, proposer, reviewer=None, recorder=None, budget: LiveBudget, retry_length=True):
         if reviewer is not None and (reviewer is proposer or (reviewer.upstream, reviewer.model) == (proposer.upstream, proposer.model)):
             raise ValueError("reviewer must use a distinct configured model identity")
-        self.proposer = _Unfenced(proposer, retry_length=True)
+        self.proposer = _Unfenced(proposer, retry_length=retry_length)
         self.reviewer = _Unfenced(reviewer) if reviewer is not None else None
         self.recorder, self.budget = recorder or _BufferedRecorder(), budget
         self._calls, self._reserved, self._actual, self._halted, self._unaccounted = 0, 0.0, 0.0, False, 0

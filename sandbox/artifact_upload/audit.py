@@ -196,14 +196,16 @@ def _manifest_checks(manifest) -> tuple[list, dict, dict]:
     return ops, storage, inventory
 
 
-def assemble_final_inputs(validated_receipts, downloaded_inventory, storage_view):
+def assemble_final_inputs(validated_receipts, downloaded_inventory, storage_view, *, validator=None):
     """Adapt source-bound HTTP evidence to the historical declaration manifest.
 
     Validation is repeated from retained source bytes; a caller-created operations
     list or business journal cannot substitute for the protected observer bundle.
     """
     from .receipts import validate_bundle
-    validated = validate_bundle(validated_receipts.get('bundle', validated_receipts))
+    validated = (validator or validate_bundle)(validated_receipts.get('bundle', validated_receipts))
+    if any('end' not in slot for slot in validated['exchanges'].values()):
+        raise ValueError('unfinished prior HTTP exchange: final audit coverage unproven')
     operations = []
     for eid, slot in validated['exchanges'].items():
         request, end = slot['request'], slot['end']

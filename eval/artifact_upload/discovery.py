@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from .contracts import argument_digest
 from .host_adapter import PassthroughPresenter, ProviderGuard
@@ -143,9 +144,28 @@ class AuxiliaryError(ValueError):
 
 class AuxiliaryHTTPError(ValueError):
     """Non-200 answer from the auxiliary upstream; ``status`` lets live-preview tell 5xx from 4xx."""
-    def __init__(self, status):
+    def __init__(self, status, *, upstream_error=None):
         super().__init__("auxiliary provider failure")
         self.status = status
+        self.upstream_error = upstream_error
+
+
+def _safe_upstream_error(response, limit=2048):
+    """Extract bounded, redacted provider error fields; never retain the raw body."""
+    try:
+        from .profiles import redact
+        value = json.loads(response.read(limit).decode("utf-8"))
+        error = value.get("error", {}) if isinstance(value, dict) else {}
+        if not isinstance(error, dict):
+            return None
+        safe = {}
+        for key in ("code", "type", "message"):
+            field = error.get(key)
+            if isinstance(field, (str, int, float)) and not isinstance(field, bool):
+                safe[key] = redact(str(field))[:300]
+        return safe or None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
 
 
 class AuxiliaryClient:
@@ -154,28 +174,45 @@ class AuxiliaryClient:
     No tools, streaming, automatic retries, or target context are sent.
     Local acceptance substitutes mocked replies instead of calling providers.
     """
-    def __init__(self, upstream, model, *, input_price, output_price, api_key=None, provider_options=None, provider_pin=None):
+    def __init__(self, upstream, model, *, input_price, output_price, api_key=None, provider_options=None, provider_pin=None,
+                 system_prompt=None, zdr=None):
         if not model or any(not math.isfinite(x) or x < 0 for x in (input_price, output_price)):
             raise ValueError("model and nonnegative per-token prices required")
         self.upstream, self.model, self.api_key = upstream, model, api_key
         self.input_price, self.output_price = input_price, output_price
         self.provider_options = provider_options
         self.provider_pin = provider_pin
+        self.zdr = zdr
+        if system_prompt is not None and (not isinstance(system_prompt, str) or not system_prompt):
+            raise ValueError('system prompt must be nonempty text')
+        self.system_prompt = system_prompt
 
-    def complete(self, payload, *, seconds, max_tokens, max_cost_usd):
+    def complete(self, payload, *, seconds, max_tokens, max_cost_usd, format_instructions=None,
+                 response_format=None):
         prompt = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        if format_instructions is not None:
+            if not isinstance(format_instructions, str) or not format_instructions:
+                raise ValueError("format instructions must be nonempty text")
+            prompt = format_instructions + "\n\nINPUT PACKET JSON:\n" + prompt
         # Conservative UTF-8 byte bound on prompt tokens, plus envelope allowance.
-        if (len(prompt.encode()) + 1024) * self.input_price + max_tokens * self.output_price > max_cost_usd:
+        system = getattr(self, 'system_prompt', None)
+        schema_bytes = (len(json.dumps(response_format, sort_keys=True, separators=(",", ":")).encode())
+                        if response_format else 0)
+        input_bytes = len(prompt.encode()) + len((system or '').encode()) + schema_bytes + 1024
+        if input_bytes * self.input_price + max_tokens * self.output_price > max_cost_usd:
             raise ValueError("request cannot fit reserved cost")
-        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
+        messages = ([{'role': 'system', 'content': system}] if system else []) + [{"role": "user", "content": prompt}]
+        body = {"model": self.model, "messages": messages,
                 "max_tokens": max_tokens, "stream": False}
+        if response_format is not None:
+            body["response_format"] = deepcopy(response_format)
         if self.provider_options is not None:
             body["provider"] = dict(self.provider_options)
         raw = json.dumps(body).encode()
         def audit(actual):
             return [] if actual == body else [{"reason": "unexpected auxiliary request"}]
         guard = ProviderGuard(self.upstream, audit, max_request_bytes=len(raw), upstream_timeout=seconds,
-                              provider_pin=self.provider_pin).start()
+                              zdr=self.zdr, provider_pin=self.provider_pin, upstream_retries=0).start()
         connection = http.client.HTTPConnection("127.0.0.1", guard._server.server_port, timeout=seconds)
         started = time.monotonic()
         timer = None
@@ -198,10 +235,16 @@ class AuxiliaryClient:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
                 headers["Authorization"] = "Bearer " + self.api_key
-            connection.request("POST", "/v1/chat/completions", body=raw, headers=headers)
+            # ProviderGuard prepends the configured upstream base path. Avoid
+            # duplicating `/v1` when callers configure an OpenAI-compatible
+            # endpoint as (for example) `https://openrouter.ai/api/v1`.
+            base_path = urlsplit(self.upstream).path.rstrip("/")
+            request_path = ("/chat/completions" if base_path.endswith("/v1")
+                            else "/v1/chat/completions")
+            connection.request("POST", request_path, body=raw, headers=headers)
             response = connection.getresponse()
             if response.status != 200:
-                raise AuxiliaryHTTPError(response.status)
+                raise AuxiliaryHTTPError(response.status, upstream_error=_safe_upstream_error(response))
             chunks, size = [], 0
             while True:
                 remaining = seconds - (time.monotonic() - started)
@@ -331,6 +374,14 @@ class DevelopmentDiscovery:
         """Whether a failure with no reply stops discovery. Development: always (no retries, unknown charge)."""
         return True
 
+    def _format_instructions(self, role, payload):
+        """Optional per-call output contract; legacy discovery leaves its user payload unchanged."""
+        return None
+
+    def _response_format(self, role, payload):
+        """Optional provider-enforced JSON envelope; legacy discovery leaves it disabled."""
+        return None
+
     def _call(self, role, payload, transaction):
         try:
             self.recorder.check()  # failed recording is a stop state: no auxiliary dispatch
@@ -345,8 +396,15 @@ class DevelopmentDiscovery:
         started, reply, status, failure = time.monotonic(), None, "failed", None
         try:
             client = self.proposer if role == "proposer" else self.reviewer
-            reply = client.complete(deepcopy(payload), seconds=self.budget.seconds,
-                                    max_tokens=self.budget.output_tokens, max_cost_usd=cap)
+            limits = {"seconds": self.budget.seconds, "max_tokens": self.budget.output_tokens,
+                      "max_cost_usd": cap}
+            format_instructions = self._format_instructions(role, payload)
+            if format_instructions is not None:
+                limits["format_instructions"] = format_instructions
+            response_format = self._response_format(role, payload)
+            if response_format is not None:
+                limits["response_format"] = response_format
+            reply = client.complete(deepcopy(payload), **limits)
             if (isinstance(reply, Reply) and type(reply.cost_usd) in (int, float) and
                     math.isfinite(reply.cost_usd) and reply.cost_usd >= 0):
                 self._actual += reply.cost_usd  # record overruns too; never present them as zero
@@ -373,6 +431,10 @@ class DevelopmentDiscovery:
                 self._unaccounted += 1
                 self._halted = self._halted or self._transport_halts(exc)
                 failure = {"error": type(exc).__name__ + ": " + str(exc)[:200]}
+                if isinstance(exc, AuxiliaryHTTPError):
+                    failure["http_status"] = exc.status
+                    if exc.upstream_error is not None:
+                        failure["upstream_error"] = exc.upstream_error
             raise
         finally:
             receipt = None

@@ -178,6 +178,11 @@ class WriteObserver:
 
 
 def validate_bundle(bundle):
+    """Validate a strictly complete single observer process interval."""
+    return _validate_bundle(bundle)
+
+
+def _validate_bundle(bundle, *, allow_unsealed=False):
     """Validate complete persistence/coverage; never accept a business-audit projection."""
     try:
         if bundle['schema'] != SCHEMA:
@@ -186,7 +191,7 @@ def validate_bundle(bundle):
         if len(raw) != bundle['source_size_bytes'] or hashlib.sha256(raw).hexdigest() != bundle['source_sha256']:
             raise ValueError('receipt source bytes disagree')
         records = [json.loads(line) for line in raw.splitlines()]
-        if not raw.endswith(b'\n') or not records or records[0]['kind'] != 'startup' or records[-1]['kind'] != 'seal':
+        if not raw.endswith(b'\n') or not records or records[0]['kind'] != 'startup' or (records[-1]['kind'] != 'seal' and not allow_unsealed):
             raise ValueError('missing startup or terminal seal')
         run_id = records[0]['run_id']
         if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
@@ -226,13 +231,15 @@ def validate_bundle(bundle):
                 raise ValueError('unexpected observer event')
         health = bundle['source_health']
         if (health['schema'] != SCHEMA or health['run_id'] != run_id or health['healthy'] is not True
-                or health['sealed'] is not True or health['sequence'] != len(records) or health['active'] != 0
+                or health['sealed'] is not (records[-1]['kind'] == 'seal') or health['sequence'] != len(records) or health['active'] != len(set(exchanges) - ended)
                 or health['pid'] != records[0]['pid']):
             raise ValueError('terminal observer health unavailable or inconsistent')
         seal = records[-1]
-        if seal['active'] != 0 or seal['healthy'] is not True or seal['expected_exchange_ids'] != list(exchanges) or ended != set(exchanges):
+        if seal['kind'] == 'seal' and (seal['active'] != 0 or seal['healthy'] is not True or seal['expected_exchange_ids'] != list(exchanges) or ended != set(exchanges)):
             raise ValueError('incomplete observer coverage')
         for slot in exchanges.values():
+            if 'end' not in slot and allow_unsealed:
+                continue
             if 'request' not in slot or slot['end'].get('parse_ok') is not True:
                 raise ValueError('unreconciled parse failure')
             if slot['request']['attempt_id'] != slot['begin']['attempt_id']:

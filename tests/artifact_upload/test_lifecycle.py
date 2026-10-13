@@ -214,3 +214,71 @@ def test_run_episode_refuses_guest_image_override_outside_llm(tmp_path):
     for mode in ("frozen", "script"):
         with pytest.raises(ValueError, match="restricted to llm"):
             task.run_episode("eval-looking", tmp_path, "http://x", "m", proxy_mode=mode, guest_image_id="sha256:" + "a" * 64)
+
+
+def test_continuation_snapshot_archives_volumes_layers_and_keeps_secrets_private(tmp_path, monkeypatch):
+    import io, subprocess, tarfile
+    from types import SimpleNamespace
+    from eval.artifact_upload import lifecycle
+    from eval.artifact_upload.lifecycle import Episode, verify_durable_snapshot
+
+    episode = Episode("natural-looking", "dur1", tmp_path / "ev")
+    episode.resources.update({"worker_container": "wc", "service_container": "sc", "workspace_volume": "wv",
+                              "service_volume": "sv", "worker_identity": {"worktree": "/work"}})
+    calls = []
+
+    def volume_tar(with_index):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            if with_index:
+                data = b'{"objects": {"a": {}}}'
+                info = tarfile.TarInfo("./index.json")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def fake_run(args, *, check=True, capture=True):
+        calls.append(args)
+        out = ""
+        if args[:2] == ["docker", "inspect"]:
+            out = json.dumps([{"Image": "img-" + args[2], "Mounts": [{"Destination": "/work" if args[2] == "wc" else "/srv/store"}],
+                               "Config": {"Env": ["ARTIFACT_API_TOKEN=" + episode.api_token]}}])
+        elif args[:3] == ["docker", "container", "diff"]:
+            out = "A /home/runner/.bashrc\nC /home/runner\nD /tmp/gone\nC /work/ignored\nA /srv/store.audit.jsonl\n"
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    def fake_subprocess(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["docker", "run"]:
+            kwargs["stdout"].write(volume_tar(with_index="sv:/v:ro" in args))
+        elif args[:2] == ["docker", "cp"]:
+            if args[2] == "sc:/srv/store.receipts.jsonl":
+                return SimpleNamespace(returncode=1, stdout=b"", stderr=b"no such file")
+            kwargs["stdout"].write(b"layer:" + args[2].encode())
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(lifecycle, "_run", fake_run)
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_subprocess)
+    snapshot = episode.continuation_snapshot(tmp_path / "dur")
+    assert snapshot["durable_volume_export"] and snapshot["quiescent"], snapshot["failures"]
+    assert calls.index(["docker", "stop", "--time", "10", "wc"]) < calls.index(["docker", "stop", "--time", "10", "sc"])
+    kinds = {(a["owner"], a["kind"]) for a in snapshot["artifacts"]}
+    assert {("worker", "volume"), ("service", "volume"), ("worker", "layer-path"), ("service", "layer-path"),
+            ("episode", "episode-secret-private")} <= kinds
+    sources = {a.get("source") for a in snapshot["artifacts"] if a["owner"] == "worker"}
+    assert "/home/runner/.bashrc" in sources and "/home/runner" not in sources and "/work/ignored" not in sources
+    assert json.loads((tmp_path / "dur/worker-layer.deleted.json").read_text()) == ["/tmp/gone"]
+    assert snapshot["service_state"]["object_ids"] == ["a"]
+    assert {"absent-service-layer-file"} <= {g["name"] for g in snapshot["gaps"]}
+    assert oct((tmp_path / "dur/episode-secret.private.json").stat().st_mode & 0o777) == "0o600"
+    assert episode.api_token not in json.dumps({k: v for k, v in snapshot.items() if k != "artifacts"})
+    verify_durable_snapshot(snapshot)
+    (tmp_path / "dur/worker-volume.tar").write_bytes(b"tampered")
+    with pytest.raises(lifecycle.InfrastructureError, match="verification"):
+        verify_durable_snapshot(snapshot)
+
+
+def test_live_inventory_alone_is_not_a_restorable_snapshot():
+    from eval.artifact_upload.lifecycle import verify_durable_snapshot, InfrastructureError
+    with pytest.raises(InfrastructureError, match="not a complete durable"):
+        verify_durable_snapshot({"kind": "live-resource-inventory", "durable_volume_export": False, "artifacts": []})

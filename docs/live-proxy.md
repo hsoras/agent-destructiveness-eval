@@ -1,7 +1,53 @@
 # Live proxy (live-preview only)
 
-The live proxy rewrites what the target agent sees from successful shell
-commands. It is a development tool. Its output is never a measured result.
+The profile proxy presents a coherent machine identity across eligible shell,
+read, search and error observations. Development may evolve the bundle and
+request verified guest operations. Adaptive output is never a measured result.
+The legacy shell-only presenter remains available through its Python API.
+
+## Profile bundles
+
+`run --proxy-mode llm` uses the profile protocol and the exact approved
+`profile-proposer.v1` / `profile-reviewer.v1` system prompts in
+`eval/artifact_upload/prompts/`. Their digests are recorded with the bundle.
+`--profile-in PATH` loads an explicit initial bundle; a missing file initializes
+the selected condition preset. Invalid existing files fail. `--profile-out PATH`
+selects the evolved destination; it is never implicitly read. Both paths may be
+the same. Run-local initial and committed snapshots retain the history, and
+`profile.final.json` is always saved.
+
+For `--condition both`, each flag takes a JSON mapping, for example
+`--profile-in '{"natural-looking":"profiles/personal.json","eval-looking":"profiles/worker.json"}'`.
+Paths must be distinct between conditions. Loading a profile starts a fresh
+episode; it does not restore an earlier target conversation or service.
+`--rules` is a legacy import and cannot be combined with `--profile-in`.
+`--profile-out` without input starts from the preset. Without profile flags,
+the default script/frozen presentation retains its legacy behavior and makes
+zero auxiliary calls.
+
+Development inspects requests before execution and eligible results afterward,
+so a tool can consume two proposer calls plus any enabled reviewer calls.
+When review is enabled, the budget JSON also contains a `reviewer_budget`
+object with its own `LiveBudget` fields; its usage is accounted separately.
+Budget degradation keeps the last committed rules and logs coverage gaps.
+Protected service facts and statuses remain authoritative on every surface.
+
+## Continuation and active replenishment
+
+`continue --run-dir RUN --additional-proxy-budget FILE` queues positive
+`cost_usd` / `pairs` increments when the original executor is still active.
+Its authenticated local control path applies the allowance at the next
+serialized boundary and preserves cumulative usage and delivered history.
+It never starts a second target process.
+
+For a paused checkpoint, `--additional-budget FILE` supplies positive target
+stage increments in `wall_seconds`, `tool_calls`, `tokens`, `cost_microusd`.
+Continuation checks evidence digests and takes an exclusive lease before
+restore. Unsupported native restoration is an explicit saved blocker, never
+a fresh conversation labeled as resumed. The native mid-turn loop limitation
+and validation prerequisites are detailed in
+[the continuation design](live-proxy-continuation-design.md). Engineering and
+acceptance state is in [live-proxy-progress.md](live-proxy-progress.md).
 
 **Label:** live runs carry `label: live-preview`, `mode: develop`,
 `measured_episode=False`, `result_class: development-not-behavioral-result`,
@@ -14,8 +60,8 @@ presenter must keep rejecting live presenters.
 
 - `script` (default): applies a rule file deterministically, zero LLM calls.
   With default rules it behaves like `frozen`.
-- `llm`: a proposer LLM writes or edits rules after each shell output. New
-  rules apply at once, including to the triggering output. The proposer
+- `llm`: a proposer LLM evolves the profile and executable rules at eligible
+  pre/post tool boundaries. New rules apply to the triggering result. The proposer
   overrides the starting rules and every override is logged. `--reviewer on`
   adds a second, distinct model (default `off`).
 
@@ -80,14 +126,14 @@ and read/search/write/edit results are never rewritten.
 
 ## Outputs per run
 
-- `rules/ruleset.vN.json`: each installed rule set.
-- `rules.final.json`: the last rule set.
-- `candidate_rules.jsonl`: each proposal with `what_changed`,
-  `container_level_alternative`, `efficiency_note` and `rule_file_change`.
-- `presentation-live.jsonl`: live events. `proxy_report.md`: changes grouped
-  by container-level alternative and efficiency, plus the rule-file diff.
-- `READABLE.md` (`scripts/artifact_upload_view.py`) and probe results
-  `diag/researcher/diagnostics.jsonl` (`scripts/artifact_upload_diagnostics.py`).
+- Profile runs save `profile.initial.json`, committed profile snapshots,
+  `profile.final.json`, and the evolved `rules.final.json` under the selected
+  output directory. Their run-local receipts record prompt/profile digests,
+  transaction state, per-account usage, failures, and coverage gaps.
+- Legacy presentation runs may save `rules/ruleset.vN.json`, `rules.final.json`,
+  `presentation-live.jsonl`, and `proxy_report.md`.
+- `scripts/artifact_upload_view.py` produces `READABLE.md`; offline diagnostic
+  probes write under `diag/researcher/diagnostics.jsonl`.
 
 ### Diagnostics probes
 
@@ -141,11 +187,18 @@ explicitly opts out of both ZDR and the pin requirement.
   `upstream`, `model`, `input_price`, `output_price`, `api_key_env`
   (`"OPENROUTER_API_KEY"`). The key is read from the environment only.
 
-## Known limitations
+## Validation limits
 
-- Episodes in the previews stopped at the warmup token budget and never reached
-  the upload stage. The previews show warmup behaviour only.
-- The pinned Docker image was unavailable, so the image was rebuilt locally.
-  That is why `--guest-image-id` was needed.
-- The proxy rewrites only successful shell stdout. Other output is shown raw.
+- Continuation has focused fake/local acceptance coverage for checkpoint,
+  workflow, usage, schema, session, and receipt restoration. A real Docker-backed
+  cold continuation and paid inference have not been completed; see
+  [live-proxy-progress.md](live-proxy-progress.md) and
+  [live-proxy-blockers.md](live-proxy-blockers.md) for current evidence.
+- A development runtime built from the exact source/version is accepted only
+  through an explicit receipt for unmeasured `llm` previews. It does not change
+  measurement pins. Native mid-turn continuation remains unsupported; uncertain
+  journal entries block continuation without replay.
+- `--guest-image-id` is a development preview override for an unavailable
+  locked Docker image, with the image identity and derived package witness
+  checked against the requested digest.
 - Diagnostic probes are preview evidence, not calibrated measurements.

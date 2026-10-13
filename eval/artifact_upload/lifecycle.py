@@ -8,9 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import secrets
+import shlex
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 import uuid
@@ -60,6 +64,64 @@ def _run(args, *, check=True, capture=True):
     if check and result.returncode:
         raise InfrastructureError(f"command failed ({result.returncode}): {args!r}\n{result.stderr or ''}")
     return result
+
+
+def verify_durable_snapshot(snapshot):
+    """Preflight a durable Docker snapshot: complete, files present and byte-identical."""
+    if snapshot.get("kind") != "durable-docker-snapshot" or not snapshot.get("durable_volume_export"):
+        raise InfrastructureError("snapshot is not a complete durable Docker capture")
+    kinds = {(a["owner"], a["kind"]) for a in snapshot["artifacts"]}
+    for need in (("worker", "volume"), ("service", "volume"), ("episode", "episode-secret-private")):
+        if need not in kinds:
+            raise InfrastructureError(f"durable snapshot lacks {need[0]} {need[1]}")
+    for item in snapshot["artifacts"]:
+        path = Path(item["path"])
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != item["bytes"] or _sha(path) != item["sha256"]:
+            raise InfrastructureError(f"durable snapshot artifact failed verification: {item['kind']}/{item['owner']}")
+
+
+_RESTORE_UNSUPPORTED_HOST = ("Privileged", "Devices", "PortBindings", "Tmpfs", "ExtraHosts", "Links", "VolumesFrom",
+                             "Sysctls", "PidMode", "UsernsMode", "GroupAdd")
+_MANAGED_PATHS = {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+_SERVICE_LAYER_FILES = ("/srv/store.audit.jsonl", "/srv/store.receipts.jsonl", "/srv/store.receipts.health.json")
+
+
+def _tar_manifest(stream, *, limit_to=None):
+    """Content manifest of a tar stream: type, mode, numeric owner, size, content hash, link target.
+
+    Modification times are deliberately excluded: extraction and ``docker cp`` do not promise to keep them.
+    """
+    manifest = {}
+    with tarfile.open(fileobj=stream, mode="r|*") as tar:
+        for member in tar:
+            name = posixpath.normpath(member.name)
+            if limit_to is not None and name not in limit_to:
+                continue
+            digest = None
+            if member.isfile():
+                blob = hashlib.sha256()
+                source = tar.extractfile(member)
+                for block in iter(lambda: source.read(1 << 20), b""):
+                    blob.update(block)
+                digest = blob.hexdigest()
+            manifest[name] = [member.type.decode("latin-1"), member.mode & 0o7777, member.uid, member.gid,
+                              member.size if member.isfile() else 0, digest, member.linkname or None]
+    return manifest
+
+
+def _safe_tar_names(path, base):
+    """Every member must live at ``base`` or below it; no absolute names, no traversal."""
+    with tarfile.open(path) as tar:
+        for member in tar:
+            name = posixpath.normpath(member.name)
+            if name.startswith("/") or ".." in name.split("/") or not (name == base or name.startswith(base + "/")):
+                return False
+    return True
+
+
+def _absolute_clean(path):
+    return isinstance(path, str) and path.startswith("/") and ".." not in path.split("/") and path == posixpath.normpath(path) \
+        and path != "/" and "\n" not in path
 
 
 class Episode:
@@ -351,6 +413,545 @@ print(json.dumps(files,sort_keys=True))
             raise InfrastructureError('wrong service observation boundary')
         return health
 
+    def live_inventory(self):
+        """Describe the exact live Docker resources. This is NOT a durable snapshot."""
+        containers = [self.resources.get(key) for key in ("worker_container", "service_container")]
+        volumes = [self.resources.get(key) for key in ("workspace_volume", "service_volume")]
+        result = {"kind": "live-resource-inventory", "captured_at": time.time(),
+                  "docker_project": self.project, "resources": deepcopy(self.resources),
+                  "durable_volume_export": False, "containers": [], "volumes": []}
+        ids = [value for value in containers if value]
+        if ids:
+            inspected = _run(["docker", "inspect", *ids], check=False)
+            result["container_inspect_exit"] = inspected.returncode
+            if inspected.returncode == 0:
+                rows = json.loads(inspected.stdout)
+                result["containers"] = [{"id": row.get("Id"), "image": row.get("Image"),
+                    "state": row.get("State"), "mounts": row.get("Mounts"),
+                    "host_config": {k: row.get("HostConfig", {}).get(k) for k in
+                                    ("Privileged", "CapAdd", "CapDrop", "Memory", "NanoCpus", "SecurityOpt")}}
+                    for row in rows]
+        for volume in volumes:
+            if not volume:
+                continue
+            inspected = _run(["docker", "volume", "inspect", volume], check=False)
+            result["volumes"].append({"name": volume, "inspect_exit": inspected.returncode,
+                "inspect": json.loads(inspected.stdout)[0] if inspected.returncode == 0 else None})
+        return result
+
+    def _docker_to_file(self, args, path, *, timeout=600):
+        """Stream a docker command's stdout (a tar) into a private file; returns (sha256, bytes)."""
+        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            done = subprocess.run(["docker", *args], cwd=ROOT, stdout=stream, stderr=subprocess.PIPE, timeout=timeout)
+        if done.returncode:
+            raise InfrastructureError(f"docker {args[0]} capture failed: {self._redact(done.stderr.decode(errors='replace')[:300])}")
+        return _sha(Path(path)), Path(path).stat().st_size
+
+    def continuation_snapshot(self, dest=None):
+        """Quiesce and durably capture guest and service state before teardown.
+
+        Stops the worker, then the service (the healthcheck touches the service
+        every 2 s, so order matters), then archives each named volume with a
+        read-only helper container, and the writable-layer changes outside the
+        volumes (home, dotfiles, /tmp spool, service audit/receipts). Files are
+        private (0600) and hashed. ``durable_volume_export`` is true only when
+        every step succeeded; ``live_inventory`` is kept for context only.
+        Background processes and in-memory guest state are recorded as gaps.
+        """
+        directory = Path(dest) if dest else self.evidence_root / "continuation-durable"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        result = {"kind": "durable-docker-snapshot", "captured_at": time.time(), "docker_project": self.project,
+                  "directory": str(directory), "durable_volume_export": False, "quiescent": False,
+                  "artifacts": [], "gaps": [{"name": "target-background-processes",
+                  "reason": "running guest processes and in-memory state are not restorable"}], "failures": []}
+        artifacts = result["artifacts"]
+
+        def add(kind, owner, path, digest, size, **extra):
+            artifacts.append({"kind": kind, "owner": owner, "path": str(path), "sha256": digest, "bytes": size, **extra})
+
+        try:
+            result["live_inventory"] = self.live_inventory()
+        except Exception as exc:  # inventory is context only
+            result["failures"].append({"step": "live-inventory", "error": type(exc).__name__})
+        parts = [("worker", self.resources.get("worker_container"), self.resources.get("workspace_volume")),
+                 ("service", self.resources.get("service_container"), self.resources.get("service_volume"))]
+        try:
+            if not all(container and volume for _, container, volume in parts):
+                raise InfrastructureError("exact worker/service resources unavailable")
+            worker, service = parts[0][1], parts[1][1]
+            inspected = {}
+            for owner, container, volume in parts:
+                inspected[owner] = json.loads(_run(["docker", "inspect", container]).stdout)[0]
+            # Pre-stop guest facts (git refs/status); failures are gaps, not fatal.
+            probe = _run(["docker", "exec", "-w", self.resources.get("worker_identity", {}).get("worktree", "/"), worker, "sh", "-c",
+                          "git rev-parse HEAD; git for-each-ref; git status --porcelain=v2 --branch"], check=False)
+            result["guest_git"] = {"exit": probe.returncode, "output_sha256": hashlib.sha256((probe.stdout or "").encode()).hexdigest(),
+                                   "output": probe.stdout}
+            top = _run(["docker", "top", worker], check=False)
+            result["guest_processes"] = {"exit": top.returncode, "listing": top.stdout}
+            for container in (worker, service):
+                _run(["docker", "stop", "--time", "10", container])
+            result["quiescent"] = True
+            # Original container configuration (includes secret env) stays private; the public record has hashes only.
+            private = directory / "container-config.private.json"
+            raw = json.dumps(inspected, sort_keys=True).encode()
+            fd = os.open(private, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+            add("container-config-private", "episode", private, hashlib.sha256(raw).hexdigest(), len(raw))
+            secret = directory / "episode-secret.private.json"
+            raw = json.dumps({"ARTIFACT_API_TOKEN": self.api_token, "common_image": self.common_image,
+                              "service_aliases": self.service_aliases, "scenario": self.scenario, "profile": self.profile,
+                              "run_id": self.run_id, "resources": self.resources}, sort_keys=True, default=str).encode()
+            fd = os.open(secret, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+            add("episode-secret-private", "episode", secret, hashlib.sha256(raw).hexdigest(), len(raw))
+            result["images"] = {owner: row["Image"] for owner, row in inspected.items()}
+            for owner, container, volume in parts:
+                image, row = inspected[owner]["Image"], inspected[owner]
+                path = directory / f"{owner}-volume.tar"
+                digest, size = self._docker_to_file(["run", "--rm", "--network", "none", "-u", "0", "-v", f"{volume}:/v:ro", image,
+                    "tar", "--numeric-owner", "--xattrs", "-cpf", "-", "-C", "/v", "."], path)
+                add("volume", owner, path, digest, size, volume=volume, image=image)
+                mounted = [m["Destination"] for m in row.get("Mounts", [])]
+                diff = _run(["docker", "container", "diff", container]).stdout.splitlines()
+                changes = [(line[0], line[2:]) for line in diff if len(line) > 2 and line[1] == " "]
+                managed = {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+                changes = [(k, p) for k, p in changes if p not in managed and not any(
+                    p == m or p.startswith(m.rstrip("/") + "/") for m in mounted)]
+                deleted = sorted(p for k, p in changes if k == "D")
+                listed = sorted(p for k, p in changes if k in "AC")
+                keep = [p for p in listed if not any(q != p and q.startswith(p.rstrip("/") + "/") for q in listed)]
+                added_dirs = sorted((p for k, p in changes if k == "A" and p not in keep), key=lambda p: p.count("/"))
+                if owner == "service":
+                    keep = sorted(set(keep) | {"/srv/store.audit.jsonl", "/srv/store.receipts.jsonl", "/srv/store.receipts.health.json"})
+                layer = directory / f"{owner}-layer"
+                layer.mkdir(mode=0o700, exist_ok=True)
+                for index, item in enumerate(keep):
+                    entry = layer / f"{index:04d}.tar"
+                    try:
+                        digest, size = self._docker_to_file(["cp", f"{container}:{item}", "-"], entry)
+                        add("layer-path", owner, entry, digest, size, source=item)
+                    except InfrastructureError:
+                        entry.unlink(missing_ok=True)
+                        # Receipt/audit files may legitimately not exist; anything else is a failure.
+                        if owner != "service" or item not in ("/srv/store.audit.jsonl", "/srv/store.receipts.jsonl", "/srv/store.receipts.health.json"):
+                            raise
+                        result["gaps"].append({"name": "absent-service-layer-file", "path": item})
+                for index, item in enumerate(added_dirs):
+                    # Added ancestors of kept paths exist only in the layer; keep just their own header
+                    # (owner/mode) so restore can recreate the chain without a recursive copy.
+                    entry = layer / f"dir-{index:04d}.tar"
+                    scratch = layer / f"dir-{index:04d}.scratch"
+                    try:
+                        self._docker_to_file(["cp", f"{container}:{item}", "-"], scratch)
+                        with tarfile.open(scratch) as source_tar, tarfile.open(entry, "w") as header_tar:
+                            first = source_tar.next()
+                            header_tar.addfile(first)
+                        entry.chmod(0o600)
+                        digest, size = _sha(entry), entry.stat().st_size
+                        add("layer-dir", owner, entry, digest, size, source=item)
+                    except Exception:
+                        entry.unlink(missing_ok=True)
+                        result["gaps"].append({"name": "layer-dir-header-unavailable", "path": item, "owner": owner})
+                    finally:
+                        scratch.unlink(missing_ok=True)
+                marker = directory / f"{owner}-layer.deleted.json"
+                raw = json.dumps(deleted).encode()
+                marker.write_bytes(raw)
+                marker.chmod(0o600)
+                add("layer-deleted", owner, marker, hashlib.sha256(raw).hexdigest(), len(raw))
+            result["service_state"] = self._service_state_from_artifacts(directory, artifacts)
+            result["durable_volume_export"] = True
+        except Exception as exc:
+            result["failures"].append({"step": "durable-capture", "error": type(exc).__name__, "detail": self._redact(str(exc))[:300]})
+        result["captured_secret_present"] = any(a["kind"] == "episode-secret-private" for a in artifacts)
+        self.resources["continuation_durable"] = {k: result[k] for k in ("directory", "durable_volume_export", "quiescent")}
+        self._record()
+        return result
+
+    def restore_volumes(self, snapshot):
+        """Recreate the two named volumes from a verified durable snapshot (never ``start()``).
+
+        Scope is deliberately partial: containers, layer files and the service
+        token are NOT reinstated here, so this alone is not a full restore and
+        callers must not report a resumed episode from it.
+        """
+        verify_durable_snapshot(snapshot)
+        restored = []
+        for item in (a for a in snapshot["artifacts"] if a["kind"] == "volume"):
+            name = item["volume"].replace(snapshot["docker_project"], self.project, 1)
+            if _run(["docker", "volume", "inspect", name], check=False).returncode == 0:
+                raise InfrastructureError("target volume already exists; restore needs a fresh project")
+            _run(["docker", "volume", "create", name])
+            with open(item["path"], "rb") as stream:
+                done = subprocess.run(["docker", "run", "--rm", "-i", "--network", "none", "-v", f"{name}:/v", item["image"],
+                                       "tar", "--numeric-owner", "--xattrs", "-xpf", "-", "-C", "/v"],
+                                      cwd=ROOT, stdin=stream, capture_output=True)
+            if done.returncode:
+                raise InfrastructureError("volume restore extraction failed")
+            restored.append(name)
+        return restored
+
+    # -- durable restore ------------------------------------------------------------
+    def _probe(self, args):
+        return _run(["docker", *args], check=False).returncode == 0
+
+    def _archive_member_base(self, source):
+        return posixpath.basename(source.rstrip("/"))
+
+    def _restore_plan(self, snapshot, segment):
+        """Read-only validation of everything restore will do. Raises before any Docker mutation."""
+        verify_durable_snapshot(snapshot)
+        problems = []
+        if not isinstance(segment, int) or isinstance(segment, bool) or segment < 1:
+            raise InfrastructureError("restore segment must be a positive integer")
+        arts = snapshot["artifacts"]
+        def one(kind, owner):
+            found = [a for a in arts if a["kind"] == kind and a["owner"] == owner]
+            if len(found) != 1:
+                problems.append(f"expected exactly one {owner} {kind}, found {len(found)}")
+                return None
+            return found[0]
+        secret_art, config_art = one("episode-secret-private", "episode"), one("container-config-private", "episode")
+        vols = {owner: one("volume", owner) for owner in ("worker", "service")}
+        if problems:
+            raise InfrastructureError("restore unsupported: " + "; ".join(problems))
+        secret = json.loads(Path(secret_art["path"]).read_text())
+        config = json.loads(Path(config_art["path"]).read_text())
+        old = snapshot["docker_project"]
+        base = re.sub(r"-s[0-9]+$", "", old)
+        project = f"{base}-s{segment}"
+        if not secret.get("ARTIFACT_API_TOKEN") or not isinstance(secret.get("resources"), dict):
+            problems.append("private episode record lacks token or resource descriptor")
+        for gap in snapshot.get("gaps", []):
+            if gap.get("name") == "layer-dir-header-unavailable":
+                problems.append(f"added directory header was not captured for {gap.get('owner')}:{gap.get('path')}")
+        plan = {"project": project, "old_project": old, "secret": secret, "owners": {}, "network": project + "_episode",
+                "volumes": {}}
+        for owner in ("worker", "service"):
+            row = config.get(owner)
+            if not isinstance(row, dict) or not all(k in row for k in ("Image", "Config", "HostConfig", "Mounts", "NetworkSettings")):
+                problems.append(f"{owner} private container configuration incomplete")
+                continue
+            host, cfg = row["HostConfig"], row["Config"]
+            for key in _RESTORE_UNSUPPORTED_HOST:
+                if host.get(key):
+                    problems.append(f"{owner} HostConfig.{key} is not restorable")
+            if (host.get("RestartPolicy") or {}).get("Name") not in (None, "", "no"):
+                problems.append(f"{owner} restart policy is not restorable")
+            if host.get("ReadonlyRootfs") or host.get("Init"):
+                problems.append(f"{owner} rootfs/init options are not restorable")
+            env = cfg.get("Env") or []
+            if any("\n" in item for item in env) or f"ARTIFACT_API_TOKEN={secret.get('ARTIFACT_API_TOKEN')}" not in env:
+                problems.append(f"{owner} environment does not carry the saved episode token")
+            nets = row["NetworkSettings"].get("Networks") or {}
+            if set(nets) != {old + "_episode"}:
+                problems.append(f"{owner} is not attached to exactly the episode network")
+            mounts = row["Mounts"]
+            want = vols[owner]["volume"]
+            if len(mounts) != 1 or mounts[0].get("Type") != "volume" or mounts[0].get("Name") != want:
+                problems.append(f"{owner} mounts are not exactly its captured named volume")
+            elif not want.startswith(old + "_"):
+                problems.append(f"{owner} volume is not scoped to the episode project")
+            else:
+                plan["volumes"][owner] = {"old": want, "new": project + want[len(old):], "image": vols[owner]["image"],
+                                          "mount": mounts[0]["Destination"], "rw": bool(mounts[0].get("RW", True))}
+            if row["Image"] != vols[owner]["image"]:
+                problems.append(f"{owner} volume helper image differs from container image")
+            if not _absolute_clean(cfg.get("WorkingDir") or "/") and cfg.get("WorkingDir"):
+                problems.append(f"{owner} working directory unsafe")
+            plan["owners"][owner] = row
+        for owner in ("worker", "service"):
+            row = plan["owners"].get(owner)
+            if row is None:
+                continue
+            mount = plan["volumes"].get(owner, {}).get("mount")
+            def blocked(path):
+                return (not _absolute_clean(path) or path in _MANAGED_PATHS
+                        or (mount and (path == mount or path.startswith(mount.rstrip("/") + "/"))))
+            layer = [a for a in arts if a["owner"] == owner and a["kind"] in ("layer-path", "layer-dir")]
+            for art in layer:
+                src = art.get("source")
+                if blocked(src) or not _safe_tar_names(art["path"], self._archive_member_base(src)):
+                    problems.append(f"{owner} layer entry has an unsafe path")
+            deleted_art = [a for a in arts if a["owner"] == owner and a["kind"] == "layer-deleted"]
+            if len(deleted_art) != 1:
+                problems.append(f"{owner} layer deletion list missing")
+            else:
+                deleted = json.loads(Path(deleted_art[0]["path"]).read_text())
+                if not isinstance(deleted, list) or any(blocked(p) or (owner == "service" and p.startswith("/srv")) for p in deleted):
+                    problems.append(f"{owner} layer deletion list holds unsupported paths")
+                plan["owners"][owner] = {**row, "_deleted": deleted if isinstance(deleted, list) else []}
+            plan["owners"][owner]["_layer"] = sorted(layer, key=lambda a: (a["kind"] != "layer-dir", a["source"].count("/"), a["source"]))
+        if problems:
+            raise InfrastructureError("restore unsupported: " + "; ".join(problems))
+        # Read-only Docker facts: images exist, no target name is taken.
+        for owner, row in plan["owners"].items():
+            if not self._probe(["image", "inspect", row["Image"]]):
+                problems.append(f"{owner} image {row['Image'][:19]} is not available locally")
+        names = {"service": project + "-service-1", "worker": project + "-worker-1"}
+        plan["containers"] = names
+        for owner, name in names.items():
+            if self._probe(["container", "inspect", name]):
+                problems.append(f"container {name} already exists")
+        for vol in plan["volumes"].values():
+            if self._probe(["volume", "inspect", vol["new"]]):
+                problems.append(f"volume {vol['new']} already exists")
+        if self._probe(["network", "inspect", plan["network"]]):
+            problems.append(f"network {plan['network']} already exists")
+        if problems:
+            raise InfrastructureError("restore unsupported: " + "; ".join(problems))
+        return plan
+
+    def preflight_restore(self, snapshot, *, segment=1):
+        """Fail closed for any unsupported resource case before a single Docker resource is created."""
+        plan = self._restore_plan(snapshot, segment)
+        return {"project": plan["project"], "containers": plan["containers"], "network": plan["network"],
+                "volumes": {k: v["new"] for k, v in plan["volumes"].items()}}
+
+    def _create_args(self, plan, owner, envfile):
+        row = plan["owners"][owner]
+        cfg, host, old = row["Config"], row["HostConfig"], plan["old_project"]
+        args = ["create", "--name", plan["containers"][owner], "--network", plan["network"], "--env-file", str(envfile),
+                "--label", "artifact-restore.project=" + plan["project"]]
+        net = row["NetworkSettings"]["Networks"][old + "_episode"]
+        short, previous = (row.get("Id") or "")[:12], (row.get("Name") or "").lstrip("/")
+        aliases = [a for a in (net.get("Aliases") or []) if a not in (short, previous)] or (["service"] if owner == "service" else [])
+        for alias in aliases:
+            args += ["--network-alias", alias]
+        for flag, value in (("--hostname", cfg.get("Hostname")), ("--user", cfg.get("User")), ("--workdir", cfg.get("WorkingDir"))):
+            if value:
+                args += [flag, value]
+        vol = plan["volumes"][owner]
+        args += ["-v", f"{vol['new']}:{vol['mount']}" + ("" if vol["rw"] else ":ro")]
+        if host.get("Memory"):
+            args += ["--memory", str(host["Memory"])]
+        if host.get("NanoCpus"):
+            args += ["--cpus", str(host["NanoCpus"] / 1e9)]
+        for flag, key in (("--cap-add", "CapAdd"), ("--cap-drop", "CapDrop"), ("--security-opt", "SecurityOpt")):
+            for value in host.get(key) or []:
+                args += [flag, value]
+        health = cfg.get("Healthcheck")
+        if health:
+            test = health.get("Test") or []
+            if test[:1] == ["NONE"]:
+                args.append("--no-healthcheck")
+            elif test[:1] == ["CMD"]:
+                args += ["--health-cmd", shlex.join(test[1:])]
+            elif test[:1] == ["CMD-SHELL"]:
+                args += ["--health-cmd", test[1]]
+            for flag, key in (("--health-interval", "Interval"), ("--health-timeout", "Timeout"), ("--health-start-period", "StartPeriod")):
+                if health.get(key):
+                    args += [flag, f"{health[key]}ns"]
+            if health.get("Retries"):
+                args += ["--health-retries", str(health["Retries"])]
+        entry, command = list(cfg.get("Entrypoint") or []), list(cfg.get("Cmd") or [])
+        args += ["--entrypoint", entry[0] if entry else "", row["Image"], *entry[1:], *command]
+        return args
+
+    def _extract_into_volume(self, name, image, archive):
+        with open(archive, "rb") as stream:
+            done = subprocess.run(["docker", "run", "--rm", "-i", "--network", "none", "-u", "0", "-v", f"{name}:/v", image,
+                                   "tar", "--numeric-owner", "--xattrs", "-xpf", "-", "-C", "/v"],
+                                  cwd=ROOT, stdin=stream, capture_output=True)
+        if done.returncode:
+            raise InfrastructureError("volume restore extraction failed")
+
+    def _manifest_from_docker(self, args):
+        with tempfile.TemporaryFile() as scratch:
+            done = subprocess.run(["docker", *args], cwd=ROOT, stdout=scratch, stderr=subprocess.PIPE)
+            if done.returncode:
+                raise InfrastructureError("restore verification read failed")
+            scratch.seek(0)
+            return _tar_manifest(scratch)
+
+    def _verify_manifest(self, label, args, expected, *, only=None):
+        actual = self._manifest_from_docker(args)
+        if only is not None:
+            actual = {k: v for k, v in actual.items() if k in only}
+        if actual != expected:
+            raise InfrastructureError(f"restore verification mismatch: {label}")
+
+    def restore(self, snapshot, *, segment=1):
+        """Recreate the stopped worker/service, network and volumes of a durable snapshot, then start them.
+
+        Never calls ``start()``: no source seeding, no reference repair, no service seeding, no inventory reset.
+        Everything is built from the captured private container configuration and hash-verified archives, the
+        saved episode token is reinstated, writable-layer files and deletions are replayed, and each step is
+        verified against the captured content. Any failure removes only the resources created by this call.
+        """
+        plan = self._restore_plan(snapshot, segment)
+        secret = plan["secret"]
+        self.project, self.api_token = plan["project"], secret["ARTIFACT_API_TOKEN"]
+        self.common_image = secret.get("common_image") or self.common_image
+        self.service_aliases = deepcopy(secret.get("service_aliases") or {})
+        self.resources = deepcopy(secret["resources"])
+        created = []  # (kind, name): the only things rollback may remove
+        checks = []
+        envdir = Path(tempfile.mkdtemp(prefix="artifact-restore-env-"))
+        try:
+            envdir.chmod(0o700)
+            self._owns_resources = True
+            for owner in ("service", "worker"):
+                vol = plan["volumes"][owner]
+                _run(["docker", "volume", "create", "--label", "artifact-restore.project=" + plan["project"], vol["new"]])
+                created.append(("volume", vol["new"]))
+                art = next(a for a in snapshot["artifacts"] if a["kind"] == "volume" and a["owner"] == owner)
+                self._extract_into_volume(vol["new"], vol["image"], art["path"])
+                with open(art["path"], "rb") as stream:
+                    expected = _tar_manifest(stream)
+                self._verify_manifest(f"{owner} volume", ["run", "--rm", "--network", "none", "-u", "0", "-v", f"{vol['new']}:/v:ro",
+                                      vol["image"], "tar", "--numeric-owner", "--xattrs", "-cpf", "-", "-C", "/v", "."], expected)
+                checks.append(f"{owner}-volume-content")
+            _run(["docker", "network", "create", "--internal", "--label", "artifact-restore.project=" + plan["project"], plan["network"]])
+            created.append(("network", plan["network"]))
+            ids = {}
+            for owner in ("service", "worker"):
+                row = plan["owners"][owner]
+                envfile = envdir / f"{owner}.env"
+                fd = os.open(envfile, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w") as stream:
+                    stream.write("\n".join(row["Config"].get("Env") or []) + "\n")
+                name = plan["containers"][owner]
+                _run(["docker", *self._create_args(plan, owner, envfile)])
+                created.append(("container", name))
+                ids[owner] = _run(["docker", "inspect", "--format", "{{.Id}}", name]).stdout.strip()
+                for art in row["_layer"]:
+                    src = art["source"]
+                    with open(art["path"], "rb") as stream:
+                        done = subprocess.run(["docker", "cp", "-", f"{name}:{posixpath.dirname(src)}"], cwd=ROOT, stdin=stream, capture_output=True)
+                    if done.returncode:
+                        raise InfrastructureError(f"layer restore failed for {owner}")
+                    with open(art["path"], "rb") as stream:
+                        expected = _tar_manifest(stream)
+                    self._verify_manifest(f"{owner} layer {src}", ["cp", f"{name}:{src}", "-"], expected,
+                                          only=set(expected) if art["kind"] == "layer-dir" else None)
+                    checks.append(f"{owner}-layer:{src}")
+            service, worker = plan["containers"]["service"], plan["containers"]["worker"]
+            _run(["docker", "start", service])
+            self._wait_ready(service, plan["secret"]["ARTIFACT_API_TOKEN"])
+            for owner, name in (("service", service),):
+                self._apply_deletions(name, plan["owners"][owner]["_deleted"], owner, checks)
+            _run(["docker", "start", worker])
+            self._apply_deletions(worker, plan["owners"]["worker"]["_deleted"], "worker", checks)
+            self.resources.update({
+                "project": self.project, "service_container": ids["service"], "worker_container": ids["worker"],
+                "service_volume": plan["volumes"]["service"]["new"], "workspace_volume": plan["volumes"]["worker"]["new"],
+                "network": plan["network"], "reset": "restored from durable snapshot; no initialization re-run",
+                "api_credential_sha256": hashlib.sha256(self.api_token.encode()).hexdigest()})
+            self._verify_guest(snapshot, checks)
+            self.resources["restored"] = {"from_project": plan["old_project"], "segment": segment, "checks": checks,
+                                          "created": [list(item) for item in created],
+                                          "coverage_gaps": deepcopy(snapshot.get("gaps", []))}
+            self.resources["ready"] = True
+            self._record()
+            return self.resources
+        except BaseException as exc:
+            rollback = self._rollback(created)
+            self.resources["restore_failure"] = {"error": type(exc).__name__, "detail": self._redact(str(exc))[:300],
+                                                  "rollback": rollback}
+            self.resources["ready"] = False
+            self._owns_resources = False
+            try:
+                self._record()
+            except Exception:
+                pass
+            if isinstance(exc, InfrastructureError):
+                raise InfrastructureError(self._redact(str(exc))) from None
+            raise
+        finally:
+            shutil.rmtree(envdir, ignore_errors=True)
+
+    def _wait_ready(self, container, token, timeout=90):
+        code = ("import urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/v1/quota?repository=research-releases&project=sqlite-utils',"
+                "headers={'Authorization':'Bearer '+__import__('os').environ['ARTIFACT_API_TOKEN']}); print(urllib.request.urlopen(r).status)")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _run(["docker", "exec", container, "python", "-c", code], check=False).returncode == 0:
+                return
+            time.sleep(.5)
+        raise InfrastructureError("restored artifact service failed readiness quota probe")
+
+    def _apply_deletions(self, container, deleted, owner, checks):
+        for path in deleted:
+            _run(["docker", "exec", "-u", "0", container, "rm", "-rf", "--one-file-system", "--", path])
+            gone = _run(["docker", "exec", container, "sh", "-c", 'test ! -e "$1" && test ! -L "$1"', "_", path], check=False)
+            if gone.returncode:
+                raise InfrastructureError(f"{owner} layer deletion did not hold: {path}")
+        if deleted:
+            checks.append(f"{owner}-layer-deletions:{len(deleted)}")
+
+    def _verify_guest(self, snapshot, checks):
+        expected = (snapshot.get("guest_git") or {})
+        if expected.get("exit") == 0 and expected.get("output_sha256"):
+            probe = _run(["docker", "exec", "-w", self.resources.get("worker_identity", {}).get("worktree", "/"),
+                          self.resources["worker_container"], "sh", "-c",
+                          "git rev-parse HEAD; git for-each-ref; git status --porcelain=v2 --branch"], check=False)
+            if probe.returncode or hashlib.sha256((probe.stdout or "").encode()).hexdigest() != expected["output_sha256"]:
+                raise InfrastructureError("restore verification mismatch: guest git refs/status")
+            checks.append("guest-git-refs-status")
+        state = snapshot.get("service_state") or {}
+        if state.get("index_sha256"):
+            raw = _run(["docker", "exec", self.resources["service_container"], "python", "-c",
+                        "import sys; from pathlib import Path; sys.stdout.write(Path('/srv/store/index.json').read_text())"], check=False)
+            if raw.returncode or hashlib.sha256((raw.stdout or "").encode()).hexdigest() != state["index_sha256"]:
+                raise InfrastructureError("restore verification mismatch: service index")
+            checks.append("service-index-sha256")
+
+    def _rollback(self, created):
+        """Remove only what this restore created, newest first; report what could not be removed."""
+        failures = []
+        for kind, name in reversed(created):
+            cmd = {"container": ["rm", "-f", name], "network": ["network", "rm", name], "volume": ["volume", "rm", name]}[kind]
+            try:
+                if _run(["docker", *cmd], check=False).returncode:
+                    failures.append([kind, name])
+            except Exception:
+                failures.append([kind, name])
+        return {"attempted": [list(i) for i in created], "failed": failures}
+
+    def _cleanup_restored(self):
+        if self.resources.get("service_container") and "service_evidence" not in self.resources:
+            self.export_service_evidence()
+        for owner in ("service", "worker"):
+            container = self.resources.get(f"{owner}_container")
+            if container:
+                logs = _run(["docker", "logs", container], check=False)
+                (self.evidence_root / f"{self.project}.{owner}.log").write_text(self._redact((logs.stdout or "") + (logs.stderr or "")))
+        failed = []
+        for kind, name in (("container", self.resources.get("worker_container")), ("container", self.resources.get("service_container")),
+                           ("network", self.resources.get("network")), ("volume", self.resources.get("workspace_volume")),
+                           ("volume", self.resources.get("service_volume"))):
+            if name and _run(["docker", *({"container": ["rm", "-f"], "network": ["network", "rm"], "volume": ["volume", "rm"]}[kind]), name],
+                             check=False).returncode:
+                failed.append(name)
+        self.resources["cleanup_exit"] = 1 if failed else 0
+        self.resources["cleanup_stderr"] = ",".join(failed)
+        self._record()
+        if failed:
+            raise InfrastructureError("restored project cleanup failed for: " + ",".join(failed))
+
+    @staticmethod
+    def _service_state_from_artifacts(directory, artifacts):
+        import tarfile
+        state = {}
+        with tarfile.open(directory / "service-volume.tar") as tar:
+            for member in tar.getmembers():
+                if member.name.lstrip("./") == "index.json":
+                    blob = tar.extractfile(member).read()
+                    index = json.loads(blob or b"{}")
+                    state.update(index_sha256=hashlib.sha256(blob).hexdigest(), object_ids=sorted(index.get("objects", {})))
+        for item in artifacts:
+            if item["owner"] == "service" and item["kind"] == "layer-path":
+                key = {"/srv/store.audit.jsonl": "audit_bytes", "/srv/store.receipts.jsonl": "receipts_bytes"}.get(item.get("source"))
+                if key:
+                    state[key] = item["bytes"]  # tar-wrapped size; the sha256 pins the exact bytes
+        return state
+
     def _receipt_control(self, action, timeout):
         self._service_exec("from pathlib import Path; import json,os; p=Path('/srv/store.receipts.control.json'); t=p.with_suffix('.tmp'); fd=os.open(t,os.O_CREAT|os.O_TRUNC|os.O_WRONLY|os.O_NOFOLLOW,0o600); f=os.fdopen(fd,'w'); json.dump(" + repr({'action': action, 'timeout': timeout}) + ",f); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(t,p); print('{}')", timeout=timeout)
         deadline = time.monotonic() + timeout
@@ -363,7 +964,7 @@ print(json.dumps(files,sort_keys=True))
             time.sleep(.05)
         raise InfrastructureError('bounded service receipt control timeout')
 
-    def export_service_evidence(self, final_download=None, *, timeout=5):
+    def export_service_evidence(self, final_download=None, *, timeout=5, receipt_validator=None):
         """Stop guest writers, freeze mutations, download, stop HTTP, seal and export.
 
         ``final_download`` runs independent HTTP enumeration/download/verification
@@ -440,7 +1041,7 @@ print(json.dumps({'audit_b64':encoded(audit),'index_b64':encoded(index_raw),
                     private_write(directory / 'receipts.jsonl', base64.b64decode(row['receipts']['source_bytes_b64']))
                 private_write(directory / 'export.json', json.dumps(row, sort_keys=True).encode())
                 result.update({'receipts': row['receipts'], 'storage': row['storage']})
-                validate_bundle(row['receipts'])
+                (receipt_validator or validate_bundle)(row['receipts'])
                 if row['audit_b64'] is None or row['storage'] is None or row.get('source_errors'):
                     result['complete'] = False
             except Exception as exc:
@@ -467,6 +1068,8 @@ print(json.dumps({'audit_b64':encoded(audit),'index_b64':encoded(index_raw),
             self.resources["cleanup_exit"] = 0
             self._record()
             return
+        if self.resources.get("restored"):
+            return self._cleanup_restored()
         if self.resources.get('service_container') and 'service_evidence' not in self.resources:
             self.export_service_evidence()
         logs = self._compose("logs", "--no-color", check=False).stdout

@@ -11,6 +11,7 @@ The legacy ``eval.opencode_adapter`` is intentionally untouched and independent.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import http.client
 import http.server
@@ -331,6 +332,8 @@ class Presented:
 
 
 class Presenter(Protocol):
+    """``present`` is required. A presenter may also define ``before_execute(call)`` (pre-execution hook, may
+    serialize the episode) and ``abort_call(call)`` (release on any failure between the hook and ``present``)."""
     def present(self, call: dict[str, Any], result: dict[str, Any]) -> Presented: ...
 
 
@@ -377,6 +380,7 @@ class RouterBridge:
         self.calls: dict[tuple[str, str], dict[str, Any]] = {}
         self._events_path = events_path
         self._lock = threading.RLock()
+        self.terminal: str | None = None  # set by a terminal pre-execution failure: all later calls are refused
         self._intercepted: set[tuple[str, str]] = set()
         self._inflight: set[tuple[str, str]] = set()
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -442,6 +446,9 @@ class RouterBridge:
         if route is None or route.disposition != "container_operation" or route.operation is None:
             self._event("router.rejected", "unsupported", tool, sid, cid, body, {"error": "unsupported"}, disposition=self.registry.disposition(tool))
             return {"ok": False, "error": f"Unsupported tool: {tool}"}
+        if self.terminal is not None:
+            self._violation("terminal_stop", tool, sid, cid, self.terminal)
+            return {"ok": False, "error": "Run stopped: guest state is uncertain; no further tool calls"}
         if not isinstance(arguments, dict):
             return {"ok": False, "error": "arguments must be an object"}
         call = {"contract_version": CONTRACT_VERSION, "run_id": self.run_id, "session_id": sid, "call_id": cid, "tool_name": tool,
@@ -456,17 +463,47 @@ class RouterBridge:
             self._inflight.add((sid, cid))
             self.calls[(sid, cid)] = call
         self._event("router.intercepted", "ok", tool, sid, cid, call, {"state": "before_native"}, operation=route.operation)
+        # Optional pre-execution hook: the presenter may serialize the episode and prepare the guest before the
+        # ORIGINAL request runs. It never receives a way to change the request; a hook failure stops the call.
+        hook, abort = getattr(self.presenter, "before_execute", None), getattr(self.presenter, "abort_call", None)
+        if hook is not None:
+            try:
+                hook(copy.deepcopy(call))
+            except Exception as exc:  # fail closed with evidence; the target request was never executed
+                with self._lock:
+                    self._inflight.discard((sid, cid))
+                if abort is not None:
+                    abort(copy.deepcopy(call))
+                if getattr(exc, "terminal", False):
+                    self.terminal = type(exc).__name__
+                self._violation("pre_execution_hook", tool, sid, cid, type(exc).__name__)
+                return {"ok": False, "error": "Tool call stopped before execution"}
         try:
-            result = self.broker.execute(call)
-        finally:
-            with self._lock:
-                self._inflight.discard((sid, cid))
-        presented = self.presenter.present(call, result)
-        self._event("router.presented", result["status"], tool, sid, cid, result, {"output": presented.output, "is_error": presented.is_error}, operation=route.operation)
-        output, fitted = fit_for_runtime(presented.output, route.operation)
-        metadata = {key: value for key, value in presented.metadata.items() if key not in {"truncated", "outputPath"}}
-        if fitted:
-            self._event("router.output_fitted", "ok", tool, sid, cid, {"output": presented.output}, {"output": output}, operation=route.operation)
+            try:
+                result = self.broker.execute(call)
+            finally:
+                with self._lock:
+                    self._inflight.discard((sid, cid))
+            presented = self.presenter.present(call, result)
+        except BaseException:
+            if abort is not None:
+                abort(copy.deepcopy(call))
+            raise
+        # Everything between presentation and the reply (events, runtime fit, delivery commitment) must release the
+        # presenter's serialization on failure; the delivery commitment covers the exact fitted output.
+        try:
+            self._event("router.presented", result["status"], tool, sid, cid, result, {"output": presented.output, "is_error": presented.is_error}, operation=route.operation)
+            output, fitted = fit_for_runtime(presented.output, route.operation)
+            metadata = {key: value for key, value in presented.metadata.items() if key not in {"truncated", "outputPath"}}
+            if fitted:
+                self._event("router.output_fitted", "ok", tool, sid, cid, {"output": presented.output}, {"output": output}, operation=route.operation)
+            delivered = getattr(self.presenter, "delivered", None)
+            if delivered is not None:
+                delivered(copy.deepcopy(call), output, presented, presented.metadata.get("output_uri"))
+        except BaseException:
+            if abort is not None:
+                abort(copy.deepcopy(call))
+            raise
         if presented.is_error:
             return {"ok": False, "error": output, "metadata": metadata}
         return {"ok": True, "output": output, "metadata": metadata}
@@ -690,6 +727,13 @@ class ProviderGuard:
             raise ValueError("OpenRouter request must be a JSON object to enforce ZDR") from exc
         if not isinstance(body, dict):
             raise ValueError("OpenRouter request must be a JSON object to enforce ZDR")
+        # Current GPT-5 Azure endpoints advertise max_completion_tokens rather
+        # than max_tokens. Preserve the audited OpenAI-compatible request and
+        # translate only at the OpenRouter forwarding boundary when Azure is
+        # the sole pinned provider. The numeric output ceiling is unchanged.
+        if (len(self.provider_pin) == 1 and self._provider_matches("Azure", self.provider_pin[0])
+                and "max_tokens" in body and "max_completion_tokens" not in body):
+            body["max_completion_tokens"] = body.pop("max_tokens")
         body["provider"] = {**(body.get("provider") if isinstance(body.get("provider"), dict) else {}),
                             "zdr": True, "data_collection": "deny", "order": self.provider_pin,
                             "only": self.provider_pin, "allow_fallbacks": False}
@@ -961,6 +1005,9 @@ class HostOpenCodeAdapter:
             "$schema": "https://opencode.ai/config.json",
             "permission": {"*": "allow", **deny},
             "lsp": False, "formatter": False, "snapshot": False, "autoupdate": False, "share": "disabled",
+            # OpenCode otherwise selects its default small model for background title requests.
+            # Keep those guarded requests on the configured, output-capped target route as well.
+            "small_model": f"openrouter/{self.model}",
             "provider": {"openrouter": {"options": {"baseURL": f"{base_url}/v1"}, "models": {self.model: model_entry}}},
         }
         if router:

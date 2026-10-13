@@ -1279,7 +1279,9 @@ def test_provider_qualified_config_and_model_ref(tmp_path, monkeypatch):
     config = tmp_path / "config"
     config.mkdir()
     adapter._write_opencode_config(config, "http://127.0.0.1:4000", router=False)
-    provider = json.loads((config / "opencode.json").read_text())["provider"]["openrouter"]
+    document = json.loads((config / "opencode.json").read_text())
+    assert document["small_model"] == "openrouter/openai/gpt-oss-120b"
+    provider = document["provider"]["openrouter"]
     assert provider["options"]["baseURL"] == "http://127.0.0.1:4000/v1"
     assert provider["models"] == {"openai/gpt-oss-120b": {"name": "openai/gpt-oss-120b"}}
     seen = {}
