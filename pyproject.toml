@@ -35,4 +35,5 @@ packages = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "tests/artifact_upload"]
+addopts = ["--import-mode=importlib"]

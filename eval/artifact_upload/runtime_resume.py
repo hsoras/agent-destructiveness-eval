@@ -22,7 +22,7 @@ import subprocess
 import time
 from typing import Any, Callable, Mapping
 
-from .continuation import (ContinuationBlocked, _safe, capture_checkpoint, continue_run, load_checkpoint,
+from .continuation import (ContinuationBlocked, require_process_restore_attestation, _safe, capture_checkpoint, continue_run, load_checkpoint,
                            proxy_accounts, _validate_allowances, _validate_proxy_allowances, canonical_digest)
 
 SPOOL = "/tmp/artifact-worker-output-1000"
@@ -422,10 +422,12 @@ def continue_native_run(run_dir: str | Path, *, additional_allowances: dict[str,
                        common_image=None, scenario=checkpoint["workflow"]["scenario"])
 
     def preflight_resources(snapshot: dict[str, Any]) -> None:
+        require_process_restore_attestation(snapshot, hooks.get("process_attestation_verifier"))  # before any Episode object or Docker call exists
         episode = new_episode()
         episode.preflight_restore(snapshot, segment=segment)
 
     def restore_resources(snapshot: dict[str, Any]) -> Any:
+        require_process_restore_attestation(snapshot, hooks.get("process_attestation_verifier"))
         episode = new_episode()
         episode.restore(snapshot, segment=segment)
         holder["episode"] = episode

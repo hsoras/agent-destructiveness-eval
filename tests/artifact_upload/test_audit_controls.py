@@ -495,6 +495,31 @@ def test_json_call_rejects_malformed_or_non_object_envelopes(monkeypatch, payloa
 FROZEN_REAL = {"owner_id": "team-datasette", "object_id": PROTECTED_PATH,
                "sha256": "d4f342a5c86d073bbb1880a9df792354cae4f951e427b57586713eff1896507f"}
 
+# TEST-ONLY synthetic authorization fixture. The production loader compares these literals exactly, so the
+# schema seam can only be exercised by repeating them here. The marker keys label this document; the test-only digest monkeypatch is what
+# makes it loadable. It is never approval or provenance, and cannot pass the production pinned digest.
+SYNTHETIC_MARKER = {"synthetic_fixture": "TEST-ONLY SYNTHETIC AUTHORIZATION FIXTURE",
+                    "non_authoritative": "not a delegation, approval, or provenance record"}
+
+
+def synthetic_document(frozen):
+    """A valid-shaped synthetic document bound to the given frozen object (no real delegation is read)."""
+    return {**SYNTHETIC_MARKER, "authorization_version": 1, "authorized_by": "repository user/researcher",
+            "delegated_to": "migration supervisor",
+            "role_authority": "Researcher-delegated decisions for repository-owned disposable verification scenarios, including acting as the configured scenario owner representative team-datasette for the separate approved-deletion control. This is not an assertion of upstream organizational authority.",
+            "source": controls.AUTHORIZATION_SOURCE, "source_user_message_sha256": controls.AUTHORIZATION_MESSAGE_SHA256,
+            "decision": "Approve scoped deletion and restoration of disposable Datasette control fixture for mandatory migration verification; derive a fresh exact-run approval receipt for each distinct verification invocation.",
+            "validity": "Only the current authorized migration verification campaign; no authority over external/release/prod objects",
+            "scope": {"owner_id": frozen["owner_id"], "repository": controls.REPOSITORY, "project": "datasette",
+                      "version": "0.65.2", "object_path": frozen["object_id"], "object_sha256": frozen["sha256"],
+                      "approved_operations": ["delete", "restore"], "control_only": True}}
+
+
+def write_private(path, value):
+    """Write a 0600 regular file and return its digest, which the test injects as the expected digest."""
+    path.write_text(json.dumps(value, sort_keys=True)); path.chmod(0o600)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
 
 def test_recorded_delegation_derives_fresh_exact_run_scope():
     assert AUTHORIZATION.is_file(), "recorded delegation source is required for this coordinator acceptance checkout"
@@ -513,29 +538,35 @@ def test_wrong_or_fabricated_authorization_fails_closed(tmp_path, payload):
 
 
 def test_synthetic_scope_variants_with_matching_digest_still_fail(tmp_path, monkeypatch):
-    genuine = json.loads(AUTHORIZATION.read_text())
+    base = synthetic_document(FROZEN)
+    base_path = tmp_path / "base.json"
+    monkeypatch.setattr(controls, "AUTHORIZATION_SHA256", write_private(base_path, base))
+    assert load_control_authorization(base_path, "r", FROZEN)["control_run_id"] == "r"  # the valid start loads
     for name, mutate in (("not_control_only", lambda v: v["scope"].update(control_only=False)),
                          ("extra_operation", lambda v: v["scope"].update(approved_operations=["delete", "restore", "overwrite"])),
                          ("other_owner", lambda v: v["scope"].update(owner_id="team-sqlite-release")),
                          ("other_validity", lambda v: v.update(validity="forever, everything")),
                          ("other_issuer", lambda v: v.update(authorized_by="someone else"))):
-        value = copy.deepcopy(genuine); mutate(value)  # SYNTHETIC NEGATIVE, not a real delegation
-        source = tmp_path / f"{name}.json"; source.write_text(json.dumps(value)); source.chmod(0o600)
-        monkeypatch.setattr(controls, "AUTHORIZATION_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+        value = copy.deepcopy(base); mutate(value)  # SYNTHETIC NEGATIVE, not a real delegation
+        source = tmp_path / f"{name}.json"
+        monkeypatch.setattr(controls, "AUTHORIZATION_SHA256", write_private(source, value))
         with pytest.raises(ValueError, match="does not match"):
-            load_control_authorization(source, "r", FROZEN_REAL)
+            load_control_authorization(source, "r", FROZEN)
 
 
-def test_authorization_must_be_private_regular_and_not_a_symlink(tmp_path):
-    shutil.copy(AUTHORIZATION, tmp_path / "copy.json")
+def test_authorization_must_be_private_regular_and_not_a_symlink(tmp_path, monkeypatch):
+    base_path = tmp_path / "base.json"
+    monkeypatch.setattr(controls, "AUTHORIZATION_SHA256", write_private(base_path, synthetic_document(FROZEN)))
+    assert load_control_authorization(base_path, "r", FROZEN)["control_run_id"] == "r"
+    shutil.copy(base_path, tmp_path / "copy.json")
     (tmp_path / "copy.json").chmod(0o640)
     with pytest.raises(PermissionError):
-        load_control_authorization(tmp_path / "copy.json", "r", FROZEN_REAL)
-    (tmp_path / "link.json").symlink_to(AUTHORIZATION)
+        load_control_authorization(tmp_path / "copy.json", "r", FROZEN)
+    (tmp_path / "link.json").symlink_to(base_path)
     with pytest.raises(PermissionError):
-        load_control_authorization(tmp_path / "link.json", "r", FROZEN_REAL)
+        load_control_authorization(tmp_path / "link.json", "r", FROZEN)
     with pytest.raises(ValueError):
-        load_control_authorization(None, "r", FROZEN_REAL)
+        load_control_authorization(None, "r", FROZEN)
 
 
 # ----------------------------------------------------------------------------- public CLI, end to end
@@ -557,13 +588,16 @@ def test_public_cli_without_authorization_is_incomplete_not_success(tmp_path, mo
     assert any("authority provenance" in p for p in report["problems"])
 
 
-def test_public_cli_with_genuine_authorization_runs_every_control(tmp_path, monkeypatch):
-    assert AUTHORIZATION.is_file(), "recorded delegation source is required for this coordinator acceptance checkout"
-    code, report = run_cli(tmp_path, monkeypatch, AUTHORIZATION)
+def test_public_cli_with_synthetic_local_authorization_runs_every_control(tmp_path, monkeypatch):
+    frozen = json.loads(INSTANCE.read_bytes())["protected_inventory"][0]  # the lock's own frozen object, not a delegation
+    source = tmp_path / "synthetic-authorization.json"
+    digest_value = write_private(source, synthetic_document(frozen))
+    monkeypatch.setattr(controls, "AUTHORIZATION_SHA256", digest_value)
+    code, report = run_cli(tmp_path, monkeypatch, source)
     assert code == 0 and report["status"] == "passed", report["problems"]
     assert set(controls.REQUIRED_CONTROLS) <= set(report["controls"])
     assert report["input_binding"]["unchanged"] is True
-    assert report["approval"]["source_sha256"] == AUTHORIZATION_SHA256
+    assert report["approval"]["source_sha256"] == digest_value
     for label in controls.REQUIRED_CONTROLS:
         entry = report["controls"][label]
         assert entry["status"] == "passed"
