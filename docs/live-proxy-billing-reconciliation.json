@@ -1,0 +1,18 @@
+{
+  "schema": "live-proxy-billing-reconciliation.v1",
+  "source_ledger_sha256": "c8d3f8eb0567892be0953fec348d8e6ec6f7c68e4f3776939f447836b04d4008",
+  "source_mutated": false,
+  "authorized_total_usd": "1.00",
+  "retained_holds_usd": "0.965",
+  "derived_authorized_minus_holds_usd": "0.035",
+  "source_remaining_authorized_usd": "0.385",
+  "reported_usage_usd": "0.0970218792",
+  "exact_invoice_usd": null,
+  "hold_changes": [],
+  "status": "reconcile_required",
+  "new_inference_authorized": false,
+  "limitations": [
+    "Missing historical requests and account baseline prevent exact invoice reconciliation.",
+    "Prior hold reductions preserved, not independently recertified; no new release."
+  ]
+}

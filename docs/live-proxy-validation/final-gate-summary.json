@@ -1,0 +1,473 @@
+{
+  "task": "Live proxy final acceptance evidence",
+  "pytest": {
+    "command": "/Users/sarosh/programming/agent-destructiveness-eval/.venv/bin/python -m pytest -q --junitxml=.scenario/acceptance-final/full-post-guest-gate.xml",
+    "result": "completed; nonzero due to failures/errors",
+    "counts": {
+      "tests": 1350,
+      "failures": 19,
+      "errors": 213,
+      "skipped": 12,
+      "passed": 1106
+    },
+    "junit": ".scenario/acceptance-final/full-post-guest-gate.xml",
+    "junit_sha256": "a22a1bf8f091810511379a37eb25b9c15db9602e419196e94aff13668a85c51e",
+    "duration_seconds": 560.76,
+    "docker_server_version": "29.8.2"
+  },
+  "focused_process_gate_review": {
+    "result": "43 passed; independent reviewer found no required behavior defects; source hashes matched"
+  },
+  "failure_classes": [
+    {
+      "count": 173,
+      "status": "error",
+      "cause": "Worker native-differential setup requires the exact OpenCode 1.14.41 executable; it is absent. The worker guest-session protocol cases themselves pass."
+    },
+    {
+      "count": 27,
+      "status": "error",
+      "cause": "Host-adapter setup requires the exact pinned OpenCode 1.14.41 executable, which is absent."
+    },
+    {
+      "count": 6,
+      "status": "error",
+      "cause": "Security-recovery runtime setup requires the exact pinned OpenCode 1.14.41 executable, which is absent."
+    },
+    {
+      "count": 7,
+      "status": "error",
+      "cause": "Instance tests require the authentic T002 checkout/history; forbidden future repair object and an ahead main ref make the provided fixture invalid."
+    },
+    {
+      "count": 4,
+      "status": "failure",
+      "cause": "Audit-control checks require the authentic reference wheel and private recorded authorization; these external prerequisites are absent."
+    },
+    {
+      "count": 2,
+      "status": "failure",
+      "cause": "End-to-end reuse checks require pinned historical native/control evidence, which is absent."
+    },
+    {
+      "count": 5,
+      "status": "failure",
+      "cause": "Instance fixture failures: 3 authentic history/checkout prerequisites, 1 known-release regression environment missing click, and 1 absent researcher-only reference.patch."
+    },
+    {
+      "count": 2,
+      "status": "failure",
+      "cause": "Recording-output integration checks require the pinned OpenCode executable, which is absent."
+    },
+    {
+      "count": 6,
+      "status": "failure",
+      "cause": "Security-recovery runtime checks require the pinned executable; the coverage completeness assertion also fails because runtime cases did not execute."
+    }
+  ],
+  "module_outcomes": {
+    "test_audit_controls": {
+      "passes": 55,
+      "failures": 4,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": [
+        "test_release_acceptance_rejects_arbitrary_bytes_and_accepts_reference_lineage",
+        "test_recorded_delegation_derives_fresh_exact_run_scope",
+        "test_public_cli_without_authorization_is_incomplete_not_success",
+        "test_public_cli_with_synthetic_local_authorization_runs_every_control"
+      ]
+    },
+    "test_end_to_end": {
+      "passes": 52,
+      "failures": 2,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": [
+        "test_pinned_native_and_controls_evidence_matches_real_files",
+        "test_real_native_and_controls_reuse_judges_every_check_pass"
+      ]
+    },
+    "test_guest_imports": {
+      "passes": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": []
+    },
+    "test_host_adapter": {
+      "passes": 30,
+      "failures": 0,
+      "errors": 27,
+      "skipped": 0,
+      "named_failures": [
+        "test_core_routes_run_in_guest_before_native_execution_and_host_sentinels_untouched",
+        "test_apply_patch_route_for_gpt_style_models",
+        "test_unknown_disabled_and_unadvertised_tools_fail_closed",
+        "test_disabling_a_core_route_removes_it_symmetrically",
+        "test_advertised_tool_without_an_explicit_route_blocks_the_run",
+        "test_every_provider_request_of_run_turn_passes_the_production_guard",
+        "test_guard_refuses_unrouted_oversized_and_malformed_requests_without_forwarding",
+        "test_guard_reports_an_unreachable_provider_as_a_bounded_refusal",
+        "test_native_completion_of_a_container_tool_is_infrastructure_failure",
+        "test_missing_override_blocks_the_native_handler",
+        "test_staging_cannot_overlap_the_target_editable_checkout",
+        "test_project_and_startup_material_never_executes_on_the_host",
+        "test_guest_grounded_context_leaks_no_host_paths_or_credentials",
+        "test_large_shell_output_is_guest_owned_and_never_spooled_or_pathed_on_the_host",
+        "test_real_routed_read_of_large_files_is_truthful_and_forged_errors_stay_bounded",
+        "test_large_output_control_without_fitting_reproduces_the_host_path_leak",
+        "test_cancellation_stops_a_running_guest_command_promptly_and_is_recorded_truthfully",
+        "test_cancellation_of_a_finished_call_is_not_reported_as_cancelled",
+        "test_interrupting_the_real_runtime_cancels_its_running_guest_command[default-sigint]",
+        "test_interrupting_the_real_runtime_cancels_its_running_guest_command[inherited-sig-ign]",
+        "test_interrupting_a_registered_pending_dispatch_cancels_before_the_guest_mutates",
+        "test_advertised_tool_names_and_schemas_match_the_pinned_runtime[test-canary]",
+        "test_advertised_tool_names_and_schemas_match_the_pinned_runtime[gpt-5-mock]",
+        "test_call_ids_arguments_and_presented_results_replay_and_sessions_continue",
+        "test_title_and_compaction_requests_carry_no_executable_tools",
+        "test_provider_usage_and_errors_are_retained_without_native_fallback",
+        "test_real_runtime_timeout_retains_native_streams_and_cancels_guest"
+      ]
+    },
+    "test_instance": {
+      "passes": 4,
+      "failures": 5,
+      "errors": 7,
+      "skipped": 0,
+      "named_failures": [
+        "test_authentic_full_history_and_pinned_payloads_are_verified",
+        "test_pinned_pre_fix_and_known_release_regression_are_authentic",
+        "test_reference_api_and_public_cli_accept_genuine_lineage_and_rebuild",
+        "test_materially_different_valid_alternative_has_its_own_lineage",
+        "test_verifier_rejects_untracked_package_unrelated_repo_nested_path_and_unrepaired_checkout",
+        "test_verifier_rejects_mismatched_pyproject_version_and_entrypoint",
+        "test_valid_checkout_rejects_wheel_from_another_tree",
+        "test_broken_behavior_with_matching_authentic_unrepaired_checkout_fails_functionally",
+        "test_missing_entry_point_and_bad_checkout_are_clean_public_cli_errors",
+        "test_reference_patch_is_researcher_only_and_not_a_target_input",
+        "test_preparer_preserves_git_history_and_ordinary_release_instructions",
+        "test_source_preparer_refuses_to_overwrite"
+      ]
+    },
+    "test_profile_cli": {
+      "passes": 11,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": []
+    },
+    "test_profile_contracts": {
+      "passes": 114,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": []
+    },
+    "test_profile_proxy": {
+      "passes": 45,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": []
+    },
+    "test_proxy_control": {
+      "passes": 14,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": []
+    },
+    "test_recording_outputs": {
+      "passes": 25,
+      "failures": 2,
+      "errors": 0,
+      "skipped": 0,
+      "named_failures": [
+        "test_native_capture_guest_spools_uri_read_search_and_session_continuity[eval-looking]",
+        "test_native_capture_guest_spools_uri_read_search_and_session_continuity[natural-looking]"
+      ]
+    },
+    "test_security_recovery": {
+      "passes": 6,
+      "failures": 6,
+      "errors": 6,
+      "skipped": 0,
+      "named_failures": [
+        "test_ac1_core_tools_have_guest_effects_and_hostile_host_targets_are_inert",
+        "test_ac1_apply_patch_route_with_hostile_target",
+        "test_ac1_guest_startup_material_never_reaches_host_runtime_or_model",
+        "test_ac1_service_volume_control_admin_denied_and_network_policy_equal_across_conditions",
+        "test_ac1_unsupported_tools_and_disabled_optional_paths_fail_closed",
+        "test_ac2_lost_response_through_runtime_never_replays_and_restart_reconciles",
+        "test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls[passthrough-eval-looking]",
+        "test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls[passthrough-natural-looking]",
+        "test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls[frozen-eval-looking]",
+        "test_ac3_native_large_output_attachment_and_replay_are_read_search_only_with_zero_auxiliary_calls[frozen-natural-looking]",
+        "test_ac1_auxiliary_title_and_compaction_requests_use_the_guarded_transport_with_no_tools_and_no_extra_model",
+        "test_zz_coverage_matrix_is_complete"
+      ]
+    },
+    "test_worker": {
+      "passes": 56,
+      "failures": 0,
+      "errors": 173,
+      "skipped": 0,
+      "named_failures": [
+        "test_native_pin_and_tool_inventory",
+        "test_native_differential_host[bash-echo]",
+        "test_native_differential_host[bash-env-inherited]",
+        "test_native_differential_host[bash-large-output-tail]",
+        "test_native_differential_host[bash-no-output]",
+        "test_native_differential_host[bash-nonzero-exit-output]",
+        "test_native_differential_host[bash-quoting-pipeline-redirect]",
+        "test_native_differential_host[bash-stderr-only]",
+        "test_native_differential_host[bash-timeout]",
+        "test_native_differential_host[bash-workdir-relative]",
+        "test_native_differential_host[bash-writes-visible-to-read]",
+        "test_native_differential_host[edit-absolute]",
+        "test_native_differential_host[edit-block-anchor]",
+        "test_native_differential_host[edit-bom-preserved]",
+        "test_native_differential_host[edit-context-aware]",
+        "test_native_differential_host[edit-crlf-old-string]",
+        "test_native_differential_host[edit-crlf-preserved]",
+        "test_native_differential_host[edit-directory]",
+        "test_native_differential_host[edit-empty-old-bom]",
+        "test_native_differential_host[edit-empty-old-create]",
+        "test_native_differential_host[edit-empty-old-overwrite]",
+        "test_native_differential_host[edit-escape-normalized]",
+        "test_native_differential_host[edit-exact]",
+        "test_native_differential_host[edit-failure-leaves-bytes]",
+        "test_native_differential_host[edit-identical]",
+        "test_native_differential_host[edit-indentation-flexible]",
+        "test_native_differential_host[edit-keeps-mode]",
+        "test_native_differential_host[edit-line-trimmed]",
+        "test_native_differential_host[edit-lone-cr-file]",
+        "test_native_differential_host[edit-missing-file]",
+        "test_native_differential_host[edit-multiple]",
+        "test_native_differential_host[edit-new-string-bom]",
+        "test_native_differential_host[edit-no-match]",
+        "test_native_differential_host[edit-readonly-file]",
+        "test_native_differential_host[edit-replace-all]",
+        "test_native_differential_host[edit-replace-all-dollar-patterns]",
+        "test_native_differential_host[edit-replace-all-no-match]",
+        "test_native_differential_host[edit-through-symlink]",
+        "test_native_differential_host[edit-trimmed-boundary]",
+        "test_native_differential_host[edit-unicode]",
+        "test_native_differential_host[edit-whitespace-normalized]",
+        "test_native_differential_host[glob-absolute-path-argument]",
+        "test_native_differential_host[glob-basename-pattern]",
+        "test_native_differential_host[glob-brace]",
+        "test_native_differential_host[glob-external-symlink-not-listed]",
+        "test_native_differential_host[glob-file-path-error]",
+        "test_native_differential_host[glob-limit-100]",
+        "test_native_differential_host[glob-malformed-pattern]",
+        "test_native_differential_host[glob-missing-path]",
+        "test_native_differential_host[glob-negated]",
+        "test_native_differential_host[glob-no-match]",
+        "test_native_differential_host[glob-path-argument]",
+        "test_native_differential_host[glob-recursive-py]",
+        "test_native_differential_host[glob-subdir-pattern]",
+        "test_native_differential_host[glob-symlinks-not-followed]",
+        "test_native_differential_host[grep-basic]",
+        "test_native_differential_host[grep-binary-file-skipped]",
+        "test_native_differential_host[grep-case-sensitive]",
+        "test_native_differential_host[grep-crlf-lines]",
+        "test_native_differential_host[grep-include]",
+        "test_native_differential_host[grep-include-brace]",
+        "test_native_differential_host[grep-invalid-regex]",
+        "test_native_differential_host[grep-leading-dash-pattern]",
+        "test_native_differential_host[grep-limit-100]",
+        "test_native_differential_host[grep-long-line]",
+        "test_native_differential_host[grep-missing-path]",
+        "test_native_differential_host[grep-mtime-ordering]",
+        "test_native_differential_host[grep-no-match]",
+        "test_native_differential_host[grep-path-dir]",
+        "test_native_differential_host[grep-path-file]",
+        "test_native_differential_host[grep-regex]",
+        "test_native_differential_host[grep-symlinks-not-followed]",
+        "test_native_differential_host[grep-unicode]",
+        "test_native_differential_host[patch-add]",
+        "test_native_differential_host[patch-add-absolute]",
+        "test_native_differential_host[patch-add-bom]",
+        "test_native_differential_host[patch-add-dot-slash]",
+        "test_native_differential_host[patch-add-empty-contents]",
+        "test_native_differential_host[patch-add-ignores-non-plus-lines]",
+        "test_native_differential_host[patch-add-nested]",
+        "test_native_differential_host[patch-add-overwrites-existing]",
+        "test_native_differential_host[patch-add-then-delete-directory-leaves-state]",
+        "test_native_differential_host[patch-add-where-directory-exists]",
+        "test_native_differential_host[patch-crlf-patch-text]",
+        "test_native_differential_host[patch-delete]",
+        "test_native_differential_host[patch-delete-absolute]",
+        "test_native_differential_host[patch-delete-directory]",
+        "test_native_differential_host[patch-delete-dot-slash]",
+        "test_native_differential_host[patch-delete-missing]",
+        "test_native_differential_host[patch-duplicate-target]",
+        "test_native_differential_host[patch-empty]",
+        "test_native_differential_host[patch-heredoc-wrapper]",
+        "test_native_differential_host[patch-in-git-worktree-relative-summary]",
+        "test_native_differential_host[patch-leading-whitespace-text]",
+        "test_native_differential_host[patch-missing-end-marker]",
+        "test_native_differential_host[patch-missing-markers]",
+        "test_native_differential_host[patch-move]",
+        "test_native_differential_host[patch-move-no-chunks]",
+        "test_native_differential_host[patch-move-over-existing]",
+        "test_native_differential_host[patch-multi-file]",
+        "test_native_differential_host[patch-no-hunks]",
+        "test_native_differential_host[patch-update]",
+        "test_native_differential_host[patch-update-absolute]",
+        "test_native_differential_host[patch-update-context-header]",
+        "test_native_differential_host[patch-update-crlf-file]",
+        "test_native_differential_host[patch-update-directory]",
+        "test_native_differential_host[patch-update-dot-slash]",
+        "test_native_differential_host[patch-update-eof-marker]",
+        "test_native_differential_host[patch-update-ignores-unknown-lines]",
+        "test_native_differential_host[patch-update-keeps-bom]",
+        "test_native_differential_host[patch-update-missing-context]",
+        "test_native_differential_host[patch-update-missing-file]",
+        "test_native_differential_host[patch-update-multi-chunk]",
+        "test_native_differential_host[patch-update-no-chunks]",
+        "test_native_differential_host[patch-update-no-match]",
+        "test_native_differential_host[patch-update-no-trailing-newline]",
+        "test_native_differential_host[patch-update-pure-addition]",
+        "test_native_differential_host[patch-update-readonly-file-is-rejected-first]",
+        "test_native_differential_host[patch-update-rstrip-match]",
+        "test_native_differential_host[patch-update-then-failing-update-leaves-state]",
+        "test_native_differential_host[patch-update-trim-match]",
+        "test_native_differential_host[patch-update-unicode-punctuation]",
+        "test_native_differential_host[read-50kb-cap]",
+        "test_native_differential_host[read-absolute]",
+        "test_native_differential_host[read-basic]",
+        "test_native_differential_host[read-binary-extension]",
+        "test_native_differential_host[read-blank-lines]",
+        "test_native_differential_host[read-bom]",
+        "test_native_differential_host[read-control-characters]",
+        "test_native_differential_host[read-crlf]",
+        "test_native_differential_host[read-dangling-symlink]",
+        "test_native_differential_host[read-default-2000-lines]",
+        "test_native_differential_host[read-default-2000-lines-continue]",
+        "test_native_differential_host[read-directory]",
+        "test_native_differential_host[read-directory-offset-limit]",
+        "test_native_differential_host[read-directory-zero-limit]",
+        "test_native_differential_host[read-empty-offset-1]",
+        "test_native_differential_host[read-empty-offset-2]",
+        "test_native_differential_host[read-invalid-utf8-text]",
+        "test_native_differential_host[read-limit-two]",
+        "test_native_differential_host[read-limit-zero]",
+        "test_native_differential_host[read-lone-cr-and-unicode-separators]",
+        "test_native_differential_host[read-long-line-truncated]",
+        "test_native_differential_host[read-missing]",
+        "test_native_differential_host[read-missing-suggestions]",
+        "test_native_differential_host[read-no-trailing-newline]",
+        "test_native_differential_host[read-nul-after-sample-window]",
+        "test_native_differential_host[read-nul-binary]",
+        "test_native_differential_host[read-offset-0]",
+        "test_native_differential_host[read-offset-1]",
+        "test_native_differential_host[read-offset-2]",
+        "test_native_differential_host[read-offset-last]",
+        "test_native_differential_host[read-offset-out-of-range]",
+        "test_native_differential_host[read-parent-relative]",
+        "test_native_differential_host[read-root-directory]",
+        "test_native_differential_host[read-symlink-external]",
+        "test_native_differential_host[read-symlink-file]",
+        "test_native_differential_host[write-absolute]",
+        "test_native_differential_host[write-bom-content]",
+        "test_native_differential_host[write-bom-preserved]",
+        "test_native_differential_host[write-crlf-content]",
+        "test_native_differential_host[write-directory]",
+        "test_native_differential_host[write-empty]",
+        "test_native_differential_host[write-keeps-mode]",
+        "test_native_differential_host[write-nested-dirs]",
+        "test_native_differential_host[write-new]",
+        "test_native_differential_host[write-overwrite]",
+        "test_native_differential_host[write-parent-is-file]",
+        "test_native_differential_host[write-readonly]",
+        "test_native_differential_host[write-through-symlink]",
+        "test_native_differential_host[write-unicode]",
+        "test_differential_summary_receipt",
+        "test_native_differential_in_guest_container"
+      ]
+    }
+  },
+  "router": {
+    "install": "npm ci succeeded using lockfile; 9 packages, 0 vulnerabilities",
+    "test_command": "npm test",
+    "test_counts": {
+      "passed": 3,
+      "failed": 1
+    },
+    "failure": "Pinned source archive missing at /private/tmp/opencode-8ba2a917.tar.gz",
+    "test_log": ".scenario/acceptance-final/router-test-final.log",
+    "typecheck_command": "npm run typecheck",
+    "typecheck": "passed",
+    "typecheck_log": ".scenario/acceptance-final/router-typecheck-final.log",
+    "notes": "Existing focused router result (3 passed, 1 failed on absent pinned source archive) and typecheck pass retained; not rerun because router code was unchanged."
+  },
+  "continuation_boundary": {
+    "cold_continuation": "blocked pending independent process absence/restoration verifier; prior run counts as captured-state success only",
+    "paid_requests": 0,
+    "cold_run_invoked": false
+  },
+  "source_input_hashes": {
+    "path": "docs/live-proxy-validation/final-input-sha256.txt",
+    "entries": 106,
+    "before_after_equal": true,
+    "manifest_sha256": "96853619a8c861091e63667468ed5550360bb642602d53999a114a6689396e8e",
+    "profiles_py_sha256": "8dd0d7716ccc9f3ca14b96745059f5937ca54951ade8f0140ef6583e4ba4cb46",
+    "guest_import_test_sha256": "e6d87d16605a182001d47432a96639d89a686f9836d2493d6c8c0c5b1db3565c"
+  },
+  "limitations": [
+    "Historical T002 Git checkout, private authorization, reference wheel, exact pinned native runtime, and historical evidence are external prerequisites; none were synthesized.",
+    "All 27 prior guest-session protocol failures and the shared proxy-control fixture teardown error now pass. Remaining worker setup errors are 173 native-differential cases blocked by the missing exact runtime pin.",
+    "The 12 pytest skips are reported separately; no failures/errors were converted into skips."
+  ],
+  "artifact_hashes": {
+    "pytest_junit": {
+      "path": ".scenario/acceptance-final/full-post-guest-gate.xml",
+      "sha256": "a22a1bf8f091810511379a37eb25b9c15db9602e419196e94aff13668a85c51e"
+    },
+    "pytest_console_summary": {
+      "path": ".scenario/acceptance-final/full-post-guest-gate-console-summary.txt",
+      "sha256": "cd782d29003f0eeba2814d47c12ec61693e926c618abeb2de5ca977e1eba0a8f"
+    },
+    "router_test_log": {
+      "path": ".scenario/acceptance-final/router-test-final.log",
+      "sha256": "4cdab85fb1f7ef94bbcf6f48ff9bb24ab8c27f09165174d3d22e08d8fb60e5ce"
+    },
+    "router_typecheck_log": {
+      "path": ".scenario/acceptance-final/router-typecheck-final.log",
+      "sha256": "d211e7e265e249213c3ae1d235961d876d64f9fe91fab17c09dfee08b2fe1703"
+    }
+  },
+  "skipped": {
+    "count": 12,
+    "reasons": [
+      {
+        "count": 11,
+        "cause": "prepared T002 reference checkout and interpreters not available (test_scoring integration cases)"
+      },
+      {
+        "count": 1,
+        "cause": "explicit development build receipt required for local smoke (test_runtime_artifacts)"
+      }
+    ],
+    "required_failures_converted_to_skips": false
+  },
+  "worker_repair_comparison": {
+    "previous_gate": "full-final-gate.xml",
+    "previous_session_protocol_failures": 27,
+    "previous_session_protocol_failures_now_passing": 27,
+    "previous_proxy_control_teardown_error_now_passing": true,
+    "current_worker_guest_session_protocol_failures": 0,
+    "current_worker_native_pin_setup_errors": 173,
+    "evidence": "JUnit node IDs compared against prior full-final-gate.xml; all 27 previously failing guest-session node IDs now pass. test_missing_or_stale_descriptor_fails_without_fallback now passes; prior teardown error was fixture-finalizer BrokenPipeError."
+  },
+  "prerequisites_and_limits": {
+    "missing_exact_native_runtime": "OpenCode 1.14.41 executable at the pinned migration-readiness evidence path; affects 173 worker, 27 host-adapter, and 6 security-recovery setup cases.",
+    "instance_fixture": "T002 checkout contains forbidden future repair commit 458b3ab and refs/heads/main is ahead of pinned pre-fix HEAD; regression venv lacks click; researcher-only reference.patch is absent.",
+    "historical_evidence": "Authentic reference wheel/private authorization and pinned historical native/control evidence remain absent.",
+    "process_restoration": "Independent focused process review passed 43 checks; real cold continuation remains blocked pending independent process absence/restoration verifier. Earlier cold run is captured-state evidence only.",
+    "capability_boundary": "Real cold process-memory restoration remains unsupported/unverified; native runtime tests cannot be accepted without the exact pin. No paid or cold reruns were made."
+  }
+}

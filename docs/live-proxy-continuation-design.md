@@ -1,15 +1,23 @@
 # Durable continuation design (spec §8, acceptance 10–11)
 
-Status: design advice, 2026-10-12. Evidence is from the pinned OpenCode source
-checkout `/private/tmp/opencode-8ba2a917-source` (package version 1.14.41) and
-from this repository. The pinned binary and plugin seed are **absent** at the
-`PinnedRuntime.locate()` defaults in this checkout. That blocks native
-validation. It does not block implementation.
+Status: historical design basis (2026-10-12), with current capability findings
+added 2026-10-14. Sections describing implementation steps preserve the original
+design; current behavior is in [usage](live-proxy.md),
+[the fidelity gate](live-proxy-process-restoration.md), and
+[the runtime baseline proposal](live-proxy-runtime-baseline.md).
+
+The exact measurement binary remains absent; its matching plugin seed was
+recovered. The verified development runtime completed a real cold T capture-state
+restoration. All real cold snapshots now block because required guest process
+state is not independently attested restorable or absent. P/M loop re-entry is
+unsupported; the ignored-message candidate in §5 was rejected from exact source
+and AI SDK conversion behavior. No measurement pin or approved spec changed.
 
 ## 1. Facts that change the current "blocked" claim
 
-`continuation.py` treats a missing `export_session`/`restore_session` method as
-proof that session storage cannot be restored. That reasoning is wrong:
+At the time of this design, a missing `export_session`/`restore_session` method
+had been treated as proof that session storage could not be restored. The design
+corrected that inference; native storage capture/restore is now implemented:
 
 * The session store is SQLite: `Global.Path.data/opencode.db`, or
   `opencode-<channel>.db` for non-prod channels (`storage/db.ts`
@@ -42,7 +50,7 @@ proof that session storage cannot be restored. That reasoning is wrong:
 | Boundary | How reached | Restorable? |
 | --- | --- | --- |
 | **T: turn boundary** | Budget stop between workflow turns, or a stop held at the *first* provider request of a turn with zero tool dispatches since that turn's user message | **Yes, faithful.** Restore the DB as it was before the turn's user message (or as it was at turn end), then `run --session sid <same workflow prompt>`. |
-| **P: mid-turn provider boundary** | Guard holds request R_k (k≥1). All of the step's tool calls are delivered, and none are pending or held | **State is exact; resume is BLOCKED** (`native-loop-resume-entrypoint`). One candidate is listed in §5. |
+| **P: mid-turn provider boundary** | Guard holds request R_k (k≥1). All of the step's tool calls are delivered, and none are pending or held | **State is exact; resume is BLOCKED** (`native-loop-resume-entrypoint`). The historical candidate in §5 was rejected. |
 | **M: mid-step** | A call was held unexecuted while sibling calls of the same model response completed, or a tool part was still running when killed | **Blocked.** A faithful cold restore is impossible without forging the runtime's tool-part output. Use live retention (SIGSTOP plus resources kept) or fail closed. |
 | Killed mid-stream (wall timeout) | No dispatch since the last P snapshot | Fall back to the last P/T snapshot and apply the same classification. If a dispatch happened after that snapshot, treat it as M and block. |
 
@@ -175,7 +183,7 @@ service.
   its own, and the boundary byte offset must equal the checkpointed receipts
   byte count. This is a required change, or the final scoring fails.
 
-## 5. Mid-turn resume candidate (unverified; needs the pinned binary)
+## 5. Historical mid-turn candidate (rejected by source analysis)
 
 The candidate: after restoring the P snapshot, start `opencode serve` and call
 `session.prompt` with an empty or `ignored` text part. `toModelMessages` drops
@@ -185,6 +193,14 @@ request would be identical to R_k, and the faithfulness gate in §4 would prove
 it. If the request differs, P stays blocked. Patching the runtime is not
 allowed, because the binary digest is pinned. Do not ship this candidate
 without the probe.
+
+**Result (2026-10-14, source-derived, not executed):** this candidate fails.
+An all-`ignored` user message is kept by `toModelMessages` (it skips only
+zero-part messages, `message-v2.ts:792`) and AI SDK 6.0.168 emits it as a user
+message with empty content (`ai/dist/index.mjs:8342`). The next request differs
+from R_k and the DB gains an extra user message. The loop is otherwise reached
+only by `prompt` and `summarize`, which both add content. P stays blocked; see
+[the runtime baseline](live-proxy-runtime-baseline.md) §3 for options.
 
 ## 6. Replay and reconciliation rules (acceptance 10)
 
@@ -219,18 +235,20 @@ without the probe.
 
 ## 8. What blocks acceptance 10–11
 
-* **Implementable now**: everything for T boundaries, plus §6 and §7 and the
-  receipt-interval import. Test these with fakes: a fake `NativeSessionStore`
-  over a real sqlite file, fake docker runners, and the existing local
-  provider.
-* **Native validation blocked**: the pinned binary and plugin seed are missing
-  at the defaults (`OPENCODE_PINNED_BINARY` / `OPENCODE_CANARY_PLUGIN_SEED`).
-  The Homebrew copy is 1.18.3 and is not admissible. Needs the user to supply
-  the artifacts.
+* **Implemented captured-state path:** T session/filesystem/service restoration,
+  reconciliation/lease handling and receipt intervals have focused coverage and
+  historical real development evidence. Full T fidelity is blocked by the
+  guest process-state gap below; fake eligible snapshots are not production
+  restoration capability.
+* **Native measurement validation blocked:** the exact pinned binary is absent.
+  The matching plugin seed is recovered. A development binary is explicitly
+  unmeasured; recovery or an approved versioned rebaseline is required.
 * **Native capability blocked**:
-  * P boundary: no loop re-entry API (§5 candidate pending a probe).
+  * P boundary: no unchanged-history loop re-entry API (§5 candidate rejected).
   * M boundary: by design.
   * These must fail closed with a saved checkpoint, and the test should assert
     the refusal.
 * **Uncovered state**: target background processes and in-memory guest
-  processes. Report them as coverage gaps.
+  processes. These are blocking, not informational: restore is refused before
+  any resource effect unless process state is attested restorable or absent
+  ([details](live-proxy-process-restoration.md)).

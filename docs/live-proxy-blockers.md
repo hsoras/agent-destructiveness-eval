@@ -1,61 +1,63 @@
-# Profile proxy validation blockers
+# Live proxy acceptance blockers
 
-## Status after Run 06
+Run07 launched manually after the earlier harness permission denials and
+completed normally. Those denials are historical launch events, not current
+run status. GLM Run07 has 1,159 receipt lines and a verified audit; OpenAI
+Run06 has 787 sealed receipts and a verified audit. Both are development
+results, not full measured acceptance. Run06 made no upload attempt; Run07
+made two rejected intended uploads and committed a wrong-destination probe.
+See [Run07 delivery](evidence/live-proxy-run07/README.md),
+[acceptance matrix](live-proxy-acceptance-matrix.md), and
+[billing reconciliation](live-proxy-billing.md).
 
-The actual `live-e2b538e3eeee` development run completed normally and its
-service evidence was fully finalized (787 sealed receipts, validated final
-manifest, verified audit with no evidence problems). This closes the prior
-statement that no actual run occurred; it does not change the blockers below
-or establish measured acceptance. The run used the development-nonmeasurement
-binary, ended with `acceptance_complete=false`, had no exact
-`after_quota_before_action` view, and made no upload attempt or quota rejection.
-Independent exact-SHA/broad checkpoint and later security/diagnostic acceptance
-also remain outstanding. See [validation summary](live-proxy-validation.md)
-and [Run 06 final review](../.scenario/live-proxy-paid/final-delivery-review.md).
+## Original measurement baseline
 
-Opus 5.5 investigated the local prerequisites on 2026-10-12. No runtime pins or
-mandatory tests were changed.
-
-The locked Darwin ARM64 OpenCode 1.14.41 binary is unavailable. The required
-SHA-256 is `d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6`.
-The default location is
+The locked Darwin ARM64 OpenCode 1.14.41 artifact is absent. Required SHA-256:
+`d871b0030a0b8d42b072da1f1c9f2b0cde11ee933c07955a1674888a2c01c1f6`.
+Expected original-checkout path:
 `.scenario/migration-readiness/evidence/t001-native-build-lock-resolution-openai-20261010/artifacts/production-channel/opencode`.
-`OPENCODE_PINNED_BINARY` can select an identical recovered artifact. The local
-1.18.3 binary and Linux binaries do not satisfy the pin. Rebuilding is not
-evidence of byte identity and does not authorize changing the pin.
+`OPENCODE_PINNED_BINARY` may select an identical recovered artifact. Prior
+extensive searches failed; this completion work does not repeat them. The
+matching plugin seed was recovered, but does not replace the binary.
 
-The matching 1.14.41 plugin seed was recovered from an intact native discovery
-staging copy and placed at
-`.scenario/migration-readiness/opencode-canary-plugin-1.14.41`. Only its package
-manifest, lockfile and node_modules were copied. Runtime tool/config files from
-that staging directory were excluded. The seed alone cannot unblock native tests.
+The same-source/version rebuilt artifact is explicitly development-only:
+`3a432e2d9acfd2cd5e234b7e4b5088d427565dd848c9a4af23d04b47401a6311`.
+`DevelopmentRuntime.from_receipt` verifies its provenance. Successful development
+execution does not establish byte identity or authorize silently changing the
+measurement pin. See [versioned baseline proposal](live-proxy-runtime-baseline.md).
 
-Historical private authorization and native-control evidence fixtures referenced
-by existing mandatory tests are also absent. They are not recreated or replaced
-with synthetic authorization. `/tmp/live-proxy-baseline-tests.log` records the
-baseline: 786 passed, 42 failed, 207 errors.
+Historical private authorization/native-control evidence, including
+`.scenario/migration-readiness/migration-supervisor/disposable-control-authorization.json`,
+is absent. Such evidence cannot be manufactured. The acceptance matrix separates
+historical-artifact checks from reproducible behavior tests and records current
+suite results; historical suite counts are not current validation.
 
-Native continuation is reported by boundary. Turn-boundary restoration can be
-implemented and exercised with SQLite/fake resource adapters, but its native
-acceptance gate needs the exact binary. The pinned runtime has no faithful
-mid-turn loop resume entry point; those checkpoints must refuse restoration
-explicitly, retain evidence, and never start a new conversation as a substitute.
-Background process and in-memory guest restoration remain explicit coverage gaps.
-See [the native continuation design](live-proxy-continuation-design.md).
+## Continuation capability
 
-## Cold continuation status
+Real cold turn-boundary run `live-fc35bc72fd7b` passed with the verified
+development runtime for captured filesystem/service/session state: original
+session and pending prompt, one upload, finalized evidence. It did not establish
+process-memory fidelity. This completed zero-cost run is reused rather than rerun;
+its snapshot would now block under the stricter process-state gate.
 
-The local-loopback cold T continuation `live-fc35bc72fd7b` completed against
-the recovered development artifact, resumed the original session and prompt,
-finalized evidence, and completed service export with zero paid inference. It
-does not clear the measurement gate. The strict original Darwin ARM64 1.14.41
-binary hash above remains unavailable, so pinned native acceptance is still
-blocked. P/M re-entry remains blocked because the pinned runtime has no faithful
-mid-turn resume entry point; do not replace it with a new conversation. These
-blockers remain in force pending the paid handoff; no actual paid run is
-claimed here.
+Faithful native mid-turn loop re-entry and process-memory restoration are not
+established by that result. Unsupported or uncertain side-effect boundaries
+must refuse continuation with evidence, rather than start a replacement
+conversation or retry an uncertain mutation. See [continuation design](live-proxy-continuation-design.md)
+for the supported boundaries, capability evidence, and concrete resolution
+options. Any narrower contract requires an explicit change to the approved
+spec; it cannot be inferred from passing refusal tests.
 
-The cold review's development-marker pre-dispatch gap is closed: divergent
-contents are checked immediately after presentation reconstruction and before
-worker or adapter creation. The tampering regression verifies zero resumed
-turns and zero worker creation. See [the cold-fix review](../.scenario/live-proxy-validation/cold-fix-review.md).
+Current cold restoration is blocked before resource creation because production has
+no independent process-state absence/restoration verifier. See
+[the fidelity gate](live-proxy-process-restoration.md). This corrects the former
+informational-only treatment of unknown guest process state; it does not implement
+process checkpointing or narrow the approved acceptance contract.
+
+Final-gate fixture triage also found an existing T002 history checkout with the
+forbidden future repair object still present, a regression environment missing
+`click`, and an absent researcher-only reference patch/reference wheel. These
+are concrete fixture defects, not grounds to weaken the authenticity gate.
+They were not repaired in place; see [triage](live-proxy-validation/worker-triage.md).
+The guest import crash discovered separately was a source defect and is fixed
+in `61fff85`, without copying protected lock contents into the guest.
