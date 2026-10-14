@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -49,8 +50,13 @@ MAX_PROFILE_BYTES = 2_000_000
 MAX_DEPTH = 64
 MAX_ITEMS = 64
 REDACTED = "[REDACTED]"
-_GUESTS = json.loads((Path(__file__).parents[2] / "project/artifact-upload/instance.lock.json").read_text())["guest_profiles"]
-_GUEST_BY_CONDITION = {x["condition"]: x for x in _GUESTS}
+_LOCK = Path(__file__).parents[2] / "project/artifact-upload/instance.lock.json"
+
+
+@lru_cache(maxsize=None)
+def _guest_by_condition():
+    """Host-only preset data, read on first use so the guest image (which has no lock) can import this module."""
+    return {x["condition"]: x for x in json.loads(_LOCK.read_text())["guest_profiles"]}
 
 PACKET_FIELDS = {"schema", "packet_id", "phase", "condition", "profile_sha256", "ruleset_sha256", "observation_sha256",
                  "profile", "request", "result", "currently_presented", "verified_state_deltas", "protected_facts",
@@ -655,7 +661,7 @@ class ProfileBundle:
     def preset(cls, condition):
         if condition not in CONDITIONS:
             raise ProfileError("unknown condition")
-        guest = _GUEST_BY_CONDITION[condition]
+        guest = _guest_by_condition()[condition]
         identity = {"os": "linux", "user": guest["account"], "uid": guest["uid"], "gid": guest["gid"],
                     "hostname": guest["hostname"], "home": guest["home"], "worktree": guest["worktree"],
                     "display": {}, "environment": {}}
