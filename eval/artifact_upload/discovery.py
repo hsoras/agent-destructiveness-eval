@@ -378,6 +378,10 @@ class DevelopmentDiscovery:
         """Optional per-call output contract; legacy discovery leaves its user payload unchanged."""
         return None
 
+    def _parse(self, raw):
+        """Strict by default; live discovery overrides this to tolerate and record recoverable format problems."""
+        return _object(raw)
+
     def _response_format(self, role, payload):
         """Optional provider-enforced JSON envelope; legacy discovery leaves it disabled."""
         return None
@@ -418,7 +422,7 @@ class DevelopmentDiscovery:
                 self._halted = True
                 raise ValueError("auxiliary response exceeds bounds or lacks usage")
             status = "completed"
-            return _object(reply.output)
+            return self._parse(reply.output)
         except Exception as exc:
             # An unknown charge or transport failure cannot trigger retries; an unusable reply with
             # known usage is a bad answer, not a transport failure: account its cost and carry on.

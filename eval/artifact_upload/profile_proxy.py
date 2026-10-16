@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from copy import copy, deepcopy
 from dataclasses import replace
+from collections import Counter
 import difflib
 import json
 import math
@@ -49,10 +50,12 @@ from .profile_prompts import (PROPOSER_PROMPT_SHA256, PROPOSER_PROMPT_VERSION, P
                               REVIEWER_PROMPT_SHA256, REVIEWER_PROMPT_VERSION, REVIEWER_SYSTEM_PROMPT)
 from .profiles import (FINDING_FIELDS, GUEST_OP_FIELDS, PROFILE_CHANGE_FIELDS, PROPOSAL_FIELDS,
                        PROPOSAL_SCHEMA, REVIEW_FIELDS, REVIEW_SCHEMA, RULE_CHANGE_FIELDS, ProfileBundle, ProfileError,
-                       digest, normalize_proposal, redact as redact_observation, validate_packet, validate_proposal,
-                       validate_review)
+                       classify_error, classify_note, digest, drop_changes, issue_hint, normalize_proposal, parse_reply,
+                       redact as redact_observation, validate_packet, validate_proposal, validate_review)
 from .rules import RuleError, check_surface, protected_facts
 
+FORMAT_ISSUES_FILE = "proposer-format-issues.jsonl"
+MAX_PRUNE_ROUNDS = 8
 FACT_NAME = re.compile(r"[A-Za-z0-9_:-]{1,64}")
 PACKET_LIMIT_BYTES = 60_000
 TEXT_LIMIT = 24_000
@@ -129,7 +132,28 @@ class _RedactingRecorder:
         self.recorder.append(stream, redact_observation(payload))
 
 
-class _ReviewerAccount(_Timed, LiveDiscovery):
+class _LenientParse:
+    """Tolerate and record recoverable reply-format problems (duplicate keys, cut-off JSON)."""
+    _format_issues = None
+
+    def _parse(self, raw):
+        self._format_issues = self._format_issues or []
+        try:
+            obj, issues = parse_reply(raw)
+        except json.JSONDecodeError as exc:
+            cut = exc.msg.startswith("Unterminated string") or exc.pos >= len(raw.rstrip()) - 1
+            self._format_issues.append({"issue_kind": "truncated_json" if cut else "invalid_json", "field": "", "action": "rejected",
+                                        "excerpt": ("unrecoverable cut-off: " if cut else "") + str(exc)[:120] + " | tail: " + raw.rstrip()[-60:].replace("\n", " ")})
+            raise
+        self._format_issues += issues
+        return obj
+
+    def take_format_issues(self):
+        issues, self._format_issues = self._format_issues or [], []
+        return issues
+
+
+class _ReviewerAccount(_LenientParse, _Timed, LiveDiscovery):
     """The reviewer's own budget, counters and halting; shares only the transport implementation."""
 
     def __init__(self, *, client, recorder, budget, format_instructions=None, response_format=None):
@@ -175,7 +199,11 @@ def proposal_example(packet) -> dict:
         "profile_changes": [],
         "rule_changes": [{**common, "change_id": "rc-hostname", "action": "add", "rule_id": "hostname-alias", "expected_old": None,
                           "rule": {"rule_id": "hostname-alias", "match": {"operation": "shell", "commands": ["hostname"]},
-                                   "edits": [{"kind": "replace_all", "find": "worker-07", "replace": "alex-dev"}]}}],
+                                   "edits": [{"kind": "replace_all", "find": "worker-07", "replace": "alex-dev"}]}},
+                         {**common, "change_id": "rc-readme-host", "action": "add", "rule_id": "readme-host", "expected_old": None,
+                          "rule": {"rule_id": "readme-host", "match": {"operation": "read", "path_regex": r".*/README\.md",
+                                                                       "surface": "text", "refs": "direct"},
+                                   "edits": [{"kind": "regex", "find": r"worker-\w+", "replace": "alex-dev"}]}}],
         "guest_operations": [{**common, "change_id": "go-attach-head", "operation_id": op["operation_id"], "kind": op["kind"],
                               "args": {"name": "main"}, "preconditions": list(op["preconditions"])}],
         "findings": [finding],
@@ -189,7 +217,7 @@ def _positive(increments: dict) -> dict:
     return out
 
 
-class ProfileDiscovery(_Timed, LiveDiscovery):
+class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
     """Budgeted transport for profile packets: system prompt + packet user message (client.system_prompt).
     Reuses LiveDiscovery._call (reservations, receipts, halting, soft failures). The proposer and the
     reviewer have separate budgets (``budget`` / ``reviewer_budget``); ``usage()`` aggregates both."""
@@ -953,22 +981,25 @@ class ProfilePresentation:
                   "call_id": call.get("call_id"), "profile_sha256_before": self.bundle.sha256,
                   "ruleset_sha256_before": self.bundle.ruleset.sha256}
         proposal = review = None
-        normalized = []
+        normalized, issues = [], []
         try:
             packet = validate_packet(packet)
             proposal = self.discovery.propose(packet, tid)
+            issues += self.discovery.take_format_issues()
             proposal, normalized = normalize_proposal(proposal, packet)
+            issues += [classify_note(n) for n in normalized]
             if normalized:
                 self._diag({"kind": "proposal_normalized", "transaction_id": tid, "phase": phase, "notes": normalized[:40],
                             "note_count": len(normalized)})
             proposal = validate_proposal(proposal, packet)
-            outcome = self._install(packet, proposal, call, result, tid, record)
+            outcome = self._install(packet, proposal, call, result, tid, record, issues)
         except _SoftFailure as exc:
             outcome = "aux-soft-failure:" + exc.cls
             self._gap("llm-soft-failure", call=call, phase=phase, reason=exc.cls)
         except GuestTransactionStop:
             raise
         except json.JSONDecodeError as exc:
+            issues += self.discovery.take_format_issues()
             cap = getattr(self.discovery, "budget", None)
             cut = exc.pos >= max(len(exc.doc) - 2, 0) or not exc.doc.rstrip().endswith("}")
             outcome = ("rejected:truncated-json: reply ends mid-object (likely the %s-token output cap); raise output_tokens"
@@ -979,7 +1010,12 @@ class ProfilePresentation:
             outcome = "rejected:%s: %s" % (type(exc).__name__, redact(str(exc)))
             if isinstance(exc, ValueError) and "budget" in str(exc):
                 self._gap("llm-coverage-stopped", call=call, phase=phase, reason="budget")
-        record.update(outcome=outcome, normalized=normalized[:40], profile_sha256_after=self.bundle.sha256, proposal=proposal,
+            elif isinstance(exc, ProfileError) or (proposal is not None and isinstance(exc, ValueError)):
+                issues.append(classify_error(exc))
+        if self.discovery is not None:
+            issues += self.discovery.take_format_issues()
+        self._log_format_issues(packet, call, tid, issues, outcome)
+        record.update(outcome=outcome, normalized=normalized[:40], format_issue_kinds=sorted({i["issue_kind"] for i in issues}), profile_sha256_after=self.bundle.sha256, proposal=proposal,
                       proposal_sha256=digest(proposal) if proposal else None)
         legacy = {"transaction_id": tid, "command": (call.get("arguments") or {}).get("command") or _ref_path(call),
                   "operation": call.get("operation"), "run_id": call.get("run_id"), "session_id": call.get("session_id"),
@@ -999,6 +1035,81 @@ class ProfilePresentation:
         self._event({"event_type": "profile.proposal", "transaction_id": tid, "phase": phase, "outcome": outcome,
                      "packet_id": packet["packet_id"], "call_id": call.get("call_id")})
 
+    def _log_format_issues(self, packet, call, tid, issues, outcome):
+        """Append one structured record per reply-format problem to proposer-format-issues.jsonl (prompt-refinement input)."""
+        if not issues:
+            return
+        with open(self.out_dir / FORMAT_ISSUES_FILE, "a") as f:
+            for issue in issues:
+                record = {"packet_id": packet["packet_id"], "phase": packet["phase"], "transaction_id": tid,
+                          "call_id": call.get("call_id"), "issue_kind": issue["issue_kind"], "field": issue.get("field", ""),
+                          "action": issue["action"], "excerpt": redact(str(issue.get("excerpt", "")))[:200],
+                          "outcome": outcome.split(":", 1)[0], "prompt_sha256": PROPOSER_PROMPT_SHA256,
+                          "prompt_hint": issue_hint(issue["issue_kind"])}
+                f.write(json.dumps(redact_observation(record), sort_keys=True) + "\n")
+
+    def format_issue_counts(self):
+        """-> {issue_kind: {action: count}} read back from the per-run log (survives resume)."""
+        counts = {}
+        path = self.out_dir / FORMAT_ISSUES_FILE
+        if path.exists():
+            for line in path.read_text().splitlines():
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                counts.setdefault(r["issue_kind"], Counter())[r["action"]] += 1
+        return counts
+
+    def _prune_rules(self, before, packet, proposal, candidate, call, result):
+        """Drop only the rule changes that fail the policy checks or the protected-facts guard (and what depends on
+        them), keeping the rest of the proposal. -> (proposal, candidate, issues). The guard itself is unchanged."""
+        issues = []
+        for _ in range(MAX_PRUNE_ROUNDS):
+            bad = {}
+            known = {f["finding_id"]: f for f in proposal["findings"] + self.bundle.data["findings"]}
+            for c in proposal["rule_changes"]:
+                if c["action"] == "remove":
+                    continue
+                finding = known.get(c["finding_id"])
+                if finding and finding["category"].lower().startswith("operational") and not c.get("experimental"):
+                    bad[c["change_id"]] = ("policy_dropped_rule", "operational rewrite must be marked experimental")
+                elif c.get("experimental") and (finding is None or not finding["persistence_recommendation"]
+                                                or not finding["actual"] or not finding["desired"]):
+                    bad[c["change_id"]] = ("policy_dropped_rule", "experimental rule needs actual/desired and a persistent fix")
+            if not bad and result is not None:
+                failed = ("guard-rejected", "render-failed")
+                _, old_events = self.render(before, call, result)
+                seen = [e for e in old_events if str(e.get("reason", "")).startswith(failed)]
+
+                def fresh(bundle):
+                    _, events = self.render(bundle, call, result)
+                    return [e for e in events if str(e.get("reason", "")).startswith(failed) and e not in seen]
+                events = fresh(candidate)
+                added = [c for c in proposal["rule_changes"] if c["action"] != "remove"]
+                suspects = [c for c in added if any(not e.get("rule_ids") or c["rule_id"] in e["rule_ids"] for e in events)]
+                reason = str(events[0]["reason"])[:120] if events else ""
+                for c in suspects:  # blame the rule whose removal alone clears the failure; rules that merely share a surface stay
+                    try:
+                        trial, _ = drop_changes(proposal, {c["change_id"]})
+                        if not fresh(before.candidate(trial, packet)):
+                            bad[c["change_id"]] = ("guard_dropped_rule", reason)
+                            break
+                    except ProfileError:
+                        continue
+                if events and not bad and suspects:
+                    bad[suspects[0]["change_id"]] = ("guard_dropped_rule", reason)  # interacting rules: peel one per round
+            if not bad:
+                break
+            rules = {c["change_id"]: c["rule_id"] for c in proposal["rule_changes"]}
+            proposal, gone = drop_changes(proposal, bad)
+            for cid, (kind, why) in bad.items():
+                issues.append({"issue_kind": kind, "field": rules.get(cid, cid), "action": "dropped", "excerpt": "%s: %s" % (cid, why)})
+            for cid in sorted(gone - set(bad)):
+                issues.append({"issue_kind": "dependent_dropped", "field": cid, "action": "dropped", "excerpt": "depends on a dropped rule"})
+            candidate = before.candidate(proposal, packet)
+        return proposal, candidate, issues
+
     def _validation_evidence(self, candidate, proposal, call, result):
         notes = []
         for c in proposal["rule_changes"]:
@@ -1016,19 +1127,29 @@ class ProfilePresentation:
         if result is not None:
             old_out, old_events = self.render(self.bundle, call, result)
             new_out, events = self.render(candidate, call, result)
-            bad = [e for e in events if str(e.get("reason", "")).startswith(("guard-rejected", "render-failed"))]
+            failed = ("guard-rejected", "render-failed")
+            bad = [e for e in events if str(e.get("reason", "")).startswith(failed)
+                   and e not in [o for o in old_events if str(o.get("reason", "")).startswith(failed)]]
             if bad:
                 raise ProfileError("candidate rendering rejected by guard: %s" % bad[0]["reason"])
             rendering = {k: new_out.get(k, "") for k in ("stdout", "stderr")}
             notes.append({"surface_events": events, "protected_facts_guard": "passed"})
         return rendering, notes
 
-    def _install(self, packet, proposal, call, result, tid, record):
+    def _install(self, packet, proposal, call, result, tid, record, issues=None):
         before = self.bundle
         empty = not (proposal["profile_changes"] or proposal["rule_changes"] or proposal["guest_operations"] or proposal["findings"])
         if empty:
             return "no-change-proposed"
         candidate = before.candidate(proposal, packet)  # validates the whole transaction; raises before any change
+        proposal, candidate, dropped = self._prune_rules(before, packet, proposal, candidate, call, result)
+        if issues is not None:
+            issues += dropped
+        if dropped:
+            record["dropped_changes"] = [d["excerpt"] for d in dropped][:40]
+            record["proposal_after_drops"] = proposal
+            if not (proposal["profile_changes"] or proposal["rule_changes"] or proposal["guest_operations"] or proposal["findings"]):
+                return "all-changes-dropped"
         rendering, evidence = self._validation_evidence(candidate, proposal, call, result)
         if self.discovery.has_reviewer:
             if self.discovery.reviewer_exhausted():
@@ -1198,6 +1319,19 @@ class ProfilePresentation:
         section("Failures and recovery", ["- phase `%s` op `%s`: %s" % (x["phase"], x["operation"], json.dumps(x["detail"], default=str)[:400])
                                           for x in self._failures])
         section("LLM coverage gaps", ["- %s (%s) call %s: %s" % (g["kind"], g.get("phase", ""), g.get("call_id"), g.get("reason", "")) for g in self._gaps])
+        outcomes = Counter()
+        cand = self.out_dir / "candidate_profile.jsonl"
+        if cand.exists():
+            for line in cand.read_text().splitlines():
+                try:
+                    outcomes[json.loads(line)["outcome"].split(":", 1)[0]] += 1
+                except (ValueError, KeyError):
+                    pass
+        section("Proposal outcomes", ["- %s: %d" % (k, v) for k, v in sorted(outcomes.items())])
+        fmt = self.format_issue_counts()
+        section("Proposer format issues (see %s)" % FORMAT_ISSUES_FILE,
+                ["- `%s`: %d (%s) | hint: %s" % (k, sum(v.values()), ", ".join("%s %d" % a for a in sorted(v.items())), issue_hint(k))
+                 for k, v in sorted(fmt.items())])
         segs = self.discovery.segments if self.discovery else []
         section("Continuation history", ["- +%s -> budget %s (usage at replenish: calls=%s)" % (s["increments"], s["after"],
                                                                                           s["usage_at_replenish"].get("calls")) for s in segs])

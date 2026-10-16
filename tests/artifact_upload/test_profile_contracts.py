@@ -776,7 +776,10 @@ def test_change_schemas_and_size_limits_stay_strict():
     q = proposal(p, findings=[finding()], rule_changes=[{**change("rc"), "action": "add", "rule_id": "r", "expected_old": None,
                                                           "rule": rule("r"), "extra": 1}])
     with pytest.raises(ProfileError, match="rule change fields"):
-        validate_proposal(normalize_proposal(q, p)[0], p)
+        validate_proposal(q, p)  # strict validator unchanged
+    out, notes = normalize_proposal(q, p)  # normalization drops just the malformed rule, visibly
+    assert out["rule_changes"] == [] and any("invalid rule_changes rc dropped" in n for n in notes)
+    validate_proposal(out, p)
     q = proposal(p, findings=[finding(fid=f"f{i}") for i in range(65)])
     with pytest.raises(ProfileError, match="short array"):
         validate_proposal(normalize_proposal(q, p)[0], p)
@@ -822,3 +825,28 @@ def test_new_catalog_operations_validate_through_proposals():
     for g in bad:
         with pytest.raises(ProfileError):
             validate_proposal(proposal(p, findings=[finding()], guest_operations=[g]), p)
+
+
+# ---------------------------------------------------------------- reply parsing (duplicate keys, cut-off JSON)
+def test_parse_reply_tolerates_duplicates_and_closes_only_safe_truncation():
+    from eval.artifact_upload.profiles import parse_reply
+    obj, issues = parse_reply('{"schema":"profile-proposal.v1","packet_id":"p","a":1,"a":2}')
+    assert obj["a"] == 2 and [(i["issue_kind"], i["field"]) for i in issues] == [("duplicate_key", "a")]
+    obj, issues = parse_reply('{"schema":"profile-proposal.v1","packet_id":"p","checked":["x","y"],"findings":[{"finding_id":"f","actual":"cu')
+    assert obj["checked"] == ["x", "y"] and "findings" not in obj and issues[-1]["issue_kind"] == "truncated_json"
+    for bad in ('{"schema":"profile-proposal.v1","packet_id":"p","x":[1,2,]}',   # syntax error mid-document
+                '{"schema":"profile-proposal.v1","summ',                         # nothing past the header
+                '{"foo":1,"bar":"ab'):                                            # not a profile reply
+        with pytest.raises(ValueError):
+            parse_reply(bad)
+
+
+def test_normalize_fills_missing_fields_and_classifies_every_note():
+    from eval.artifact_upload.profiles import classify_note, issue_hint
+    p = packet(preset())
+    q = {"schema": "profile-proposal.v1", "title": "x"}
+    out, notes = normalize_proposal(q, p)
+    validate_proposal(out, p)
+    kinds = {classify_note(n)["issue_kind"] for n in notes}
+    assert {"unknown_top_level_key", "missing_field"} <= kinds and "other" not in kinds
+    assert all(issue_hint(k) for k in kinds)

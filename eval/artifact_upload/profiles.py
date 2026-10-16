@@ -153,6 +153,93 @@ def loads_strict(text):
         raise ProfileError("invalid JSON") from exc
 
 
+def _closeable_prefix(text):
+    """Cut a truncated JSON object back to its last complete top-level member (or complete element of a
+    top-level array member) and close it. Returns the closed text, or None when no safe cut exists.
+    Nothing partial is ever kept: a half-written nested object is dropped whole, never closed."""
+    stack, i, n = [], 0, len(text)
+    cut = None  # (index, closers)
+    last = ""   # last significant structural char: one of { [ , : or "" (value)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            i += 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                break  # unterminated string: the tail is dropped
+            is_key = bool(stack) and stack[-1] == "{" and last in ("{", ",")
+            i, last = j + 1, ("key" if is_key else "value")
+            if last == "value" and (len(stack) == 1 or (len(stack) == 2 and stack[0] == "{" and stack[1] == "[")):
+                cut = (i, list(reversed(stack)))
+        elif ch in "{[":
+            stack.append(ch)
+            last, i = ch, i + 1
+        elif ch in "}]":
+            if not stack or {"{": "}", "[": "]"}[stack[-1]] != ch:
+                return None
+            stack.pop()
+            last, i = "value", i + 1
+            if len(stack) == 1 or (len(stack) == 2 and stack[0] == "{" and stack[1] == "["):
+                cut = (i, list(reversed(stack)))
+        elif ch in ",:":
+            last, i = ch, i + 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\r\n,:]}':
+                j += 1
+            if j >= n:
+                break  # a number/literal at EOF may itself be cut short
+            last, i = "value", j
+            if len(stack) == 1 or (len(stack) == 2 and stack[0] == "{" and stack[1] == "["):
+                cut = (i, list(reversed(stack)))
+    if cut is None or not stack or stack[0] != "{":
+        return None
+    index, closers = cut
+    return text[:index] + "".join("}" if c == "{" else "]" for c in closers)
+
+
+def parse_reply(text):
+    """Parse a model reply -> (object, issues). Tolerates what cannot change meaning safely: duplicate keys
+    (last wins, recorded) and a reply cut off mid-object (only if it can be cut back to a complete member and
+    closed, and still declares a profile schema; the dropped tail is recorded). Everything else raises."""
+    issues = []
+
+    def pairs(items):
+        out = {}
+        for key, value in items:
+            if key in out:
+                issues.append({"issue_kind": "duplicate_key", "field": str(key)[:60], "action": "normalized",
+                               "excerpt": "last value kept"})
+            out[key] = value
+        return out
+
+    def constant(name):
+        raise ProfileError(f"non-finite JSON number {name}")
+
+    try:
+        return json.loads(text, object_pairs_hook=pairs, parse_constant=constant), issues
+    except json.JSONDecodeError as exc:
+        body = text.rstrip()
+        if not (exc.msg.startswith("Unterminated string") or exc.pos >= len(body)):
+            raise
+        fixed = _closeable_prefix(body)
+        if fixed is None:
+            raise
+        try:
+            obj = json.loads(fixed, object_pairs_hook=pairs, parse_constant=constant)
+        except ValueError:
+            raise exc from None
+        if (type(obj) is not dict or type(obj.get("schema")) is not str or not obj["schema"].startswith("profile-")
+                or "packet_id" not in obj):  # the reply must at least have got past its header
+            raise
+        issues.append({"issue_kind": "truncated_json", "field": "", "action": "normalized",
+                       "excerpt": "reply cut off; kept %d of %d chars, tail dropped: %s" % (len(fixed), len(body), body[-60:].replace("\n", " "))})
+        return obj, issues
+
+
 def _secret_key(key: str) -> bool:
     words = re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key).lower())
     return any(w in _SECRET_WORDS for w in words) or any(p in _SECRET_PAIRS for p in zip(words, words[1:]))
@@ -1010,8 +1097,23 @@ def normalize_proposal(p, packet):
                 out[clean] = value
         else:
             notes.append("dropped stray top-level key %r" % (str(key)[:40],))
-    if type(out.get("findings")) is not list:
-        return out, notes
+    for key in ("schema", "packet_id", "phase", "profile_sha256", "ruleset_sha256", "observation_sha256"):
+        if key not in out and key in packet:  # an omitted echo is filled from the harness's own packet; a wrong one stays stale
+            out[key] = packet[key]
+            notes.append("missing field %s filled from packet" % key)
+    if "summary" not in out or type(out["summary"]) is not str:
+        notes.append(("bad type: summary coerced to text" if "summary" in out else "missing field summary defaulted"))
+        out["summary"] = _loose_text(out.get("summary"), 2000) or "(no summary given)"
+    if "checked" not in out or type(out["checked"]) is not list:
+        notes.append(("bad type: checked coerced to a list" if "checked" in out else "missing field checked defaulted"))
+        out["checked"] = _loose_list(out.get("checked"), 200, 200)
+    for key in (*CHANGE_LISTS, "findings"):
+        if key not in out:
+            out[key] = []
+            notes.append("missing field %s defaulted to []" % key)
+        elif type(out[key]) is not list:
+            out[key] = []
+            notes.append("bad type: %s is not an array, dropped" % key)
     kept, seen, dropped = [], set(), 0
     for raw in out["findings"]:
         item, why = normalize_finding(raw)
@@ -1044,8 +1146,9 @@ def normalize_proposal(p, packet):
                     continue
                 notes += ["profile change finding %s: %s" % (item["finding_id"], w) for w in why]
                 c["value"] = item
-            if type(c) is dict and dropped and c.get("finding_id") not in known:
-                notes.append("dropped %s %s: its finding was malformed" % (key, c.get("change_id")))
+            if type(c) is dict and c.get("finding_id") not in known:
+                notes.append("dropped %s %s: unknown finding_id (its finding was %s)"
+                             % (key, c.get("change_id"), "malformed" if dropped else "never declared"))
                 gone.add(c.get("change_id"))
                 continue
             keep.append(c)
@@ -1062,7 +1165,125 @@ def normalize_proposal(p, packet):
                     keep.append(c)
             out[key] = keep
         gone = more
+    _drop_invalid_changes(out, packet, notes)
     return out, notes
+
+
+def _drop_invalid_changes(out, packet, notes):
+    """Validate each rule change on its own; one malformed rule (and what depends on it) is dropped, not the whole
+    proposal. Profile changes and guest operations stay strict: identity edits and executable operations are never
+    partially accepted."""
+    check = {"rule_changes": lambda c: _validate_rule_change(c, packet.get("condition"))}
+    gone = set()
+    for key, fn in check.items():
+        keep = []
+        for c in out[key]:
+            try:
+                if type(c) is not dict:
+                    raise ProfileError("change is not an object")
+                fn(c)
+                _plain(c)
+            except Exception as exc:  # noqa: BLE001 - any malformation drops this one change
+                label = c.get("change_id") if type(c) is dict else None
+                notes.append("invalid %s %s dropped: %s" % (key, label, str(exc)[:160]))
+                gone.add(label)
+                continue
+            keep.append(c)
+        out[key] = keep
+    while gone:
+        more = set()
+        for key in CHANGE_LISTS:
+            keep = []
+            for c in out[key]:
+                if gone & set(c.get("depends_on", ())):
+                    notes.append("dropped %s %s: depends on a dropped change" % (key, c.get("change_id")))
+                    more.add(c.get("change_id"))
+                else:
+                    keep.append(c)
+            out[key] = keep
+        gone = more
+
+
+def drop_changes(proposal, change_ids):
+    """-> (proposal without those changes, set of all dropped change ids). Also drops dependents and any
+    presented-fact commitment whose rule was dropped. Does not mutate its input."""
+    out = deepcopy(proposal)
+    gone = set(change_ids)
+    rules = {c["rule_id"] for c in out["rule_changes"] if c["change_id"] in gone}
+    while True:
+        before = len(gone)
+        for key in CHANGE_LISTS:
+            for c in out[key]:
+                if c["change_id"] in gone:
+                    continue
+                refs = (c.get("value") or {}).get("rule_id") if key == "profile_changes" and c.get("path", "").startswith("presented_facts.") and type(c.get("value")) is dict else None
+                if set(c["depends_on"]) & gone or (refs and refs in rules):
+                    gone.add(c["change_id"])
+        if len(gone) == before:
+            break
+    for key in CHANGE_LISTS:
+        out[key] = [c for c in out[key] if c["change_id"] not in gone]
+    return out, gone
+
+
+ISSUE_HINTS = {
+    "duplicate_key": "State that every JSON key may appear once; do not repeat a key to revise a value.",
+    "truncated_json": "Shorten the reply: fewer findings/checked entries, terse text; put the JSON first and keep reasoning minimal.",
+    "invalid_json": "Require a single strict JSON object with no prose, comments or trailing text.",
+    "unknown_top_level_key": "List the exact allowed top-level keys; say extra keys such as title are ignored.",
+    "unknown_key": "Repeat the exact finding field names; show them in the example finding.",
+    "aliased_field": "Use only the canonical field name (see the example); aliases are silently renamed.",
+    "trimmed_key": "Keys must have no surrounding whitespace.",
+    "missing_field": "Say every top-level field is required (use [] or \"\" when empty).",
+    "bad_type": "State the JSON type of each field (arrays for lists, strings for text).",
+    "malformed_finding": "Every finding needs a finding_id matching [A-Za-z0-9_:-]{1,64}.",
+    "status_rewritten": "Allowed finding status is only proposed|unresolved|blocked; the harness sets applied.",
+    "duplicate_finding": "Each finding_id must be unique within the proposal.",
+    "unknown_finding_ref": "Every change finding_id must name a finding in this proposal or the profile.",
+    "invalid_change": "Check the rule/operation grammar and examples; each change must validate on its own.",
+    "dependent_dropped": "Avoid depends_on chains unless needed; a dropped change drops its dependents.",
+    "guard_dropped_rule": "Restate that digits, URLs, hosts, ids and sizes in output are protected and must be unchanged by a rule.",
+    "policy_dropped_rule": "Operational rewrites need experimental:true plus finding actual/desired/persistence_recommendation.",
+    "validation_rejected": "Re-read the RESPONSE CONTRACT; echo packet_id/phase/hashes exactly.",
+    "stale_echo": "Echo packet_id, phase and the three sha256 values exactly as given in the packet.",
+}
+_CLASSIFY = (
+    (r"^trimmed (top-level )?key", "trimmed_key", "normalized"),
+    (r"^dropped stray top-level key", "unknown_top_level_key", "dropped"),
+    (r"^alias ", "aliased_field", "normalized"),
+    (r"^dropped unknown finding keys", "unknown_key", "dropped"),
+    (r"^dropped finding without|^finding is not an object", "malformed_finding", "dropped"),
+    (r"^dropped duplicate finding", "duplicate_finding", "dropped"),
+    (r"^status ", "status_rewritten", "normalized"),
+    (r"^missing field", "missing_field", "normalized"),
+    (r"^bad type", "bad_type", "normalized"),
+    (r"^dropped profile change .*malformed finding", "malformed_finding", "dropped"),
+    (r"^dropped \w+ \S+: unknown finding_id", "unknown_finding_ref", "dropped"),
+    (r"^dropped \w+ \S+: depends on", "dependent_dropped", "dropped"),
+    (r"^invalid \w+ \S+ dropped", "invalid_change", "dropped"),
+)
+
+
+def classify_note(note):
+    """normalize_proposal note -> structured format-issue fields."""
+    text = re.sub(r"^(profile change )?finding \S+: ", "", note)
+    for pattern, kind, action in _CLASSIFY:
+        if re.search(pattern, text):
+            m = re.search(r"(?:%s) (\S+?)[: ]" % "|".join(CHANGE_LISTS), text) or re.search(r"alias (\S+) ->", text)
+            return {"issue_kind": kind, "field": (m.group(1) if m else "")[:80], "action": action, "excerpt": note[:200]}
+    return {"issue_kind": "other", "field": "", "action": "normalized", "excerpt": note[:200]}
+
+
+def issue_hint(kind):
+    return ISSUE_HINTS.get(kind, "Review the proposer prompt for this field.")
+
+
+def classify_error(exc):
+    """A validation error that rejects the whole proposal -> structured format-issue fields."""
+    msg = str(exc)
+    kind = ("stale_echo" if msg.startswith("stale/mismatched") or "stale" in msg else
+            "bad_type" if "must be" in msg or "invalid" in msg else "validation_rejected")
+    return {"issue_kind": kind, "field": "", "action": "rejected", "excerpt": msg[:200]}
 
 
 def validate_review(review, packet, proposal):
