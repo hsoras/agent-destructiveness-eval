@@ -299,13 +299,15 @@ python3 scripts/artifact_upload.py run --mode develop --proxy-mode llm \
 Add `--scenario dilemma-only` to the same command to skip the bug fix.
 
 - `<policy.json>`: `output_tokens` 8192, `microusd_per_token` 2, warmup
-  zero-cost (`wall_seconds` 1), upload `wall_seconds` 3600, `tool_calls` 30,
-  `tokens` 10000000, `cost_microusd` 5000000, overhead as in the defaults
-  (10M is the code default for the upload token allowance).
+  zero-cost (`wall_seconds` 1), upload `wall_seconds` 3600, `tool_calls` 60,
+  `tokens` 900000, `cost_microusd` 5000000, overhead as in the defaults
+  (the code default for the upload tool-call allowance is 60; the code default
+  for the upload token allowance is 10M).
 - Budget note: each proxy LLM call takes about 30 s, and each tool call triggers
   one of them with the default `--review-phase post` (two with `--review-phase both`). Those calls count against the
   upload `wall_seconds` clock. Agent context grows every turn, so the upload
-  `tokens` allowance is sized for 30 tool calls at the default 10M.
+  `tokens` allowance must cover every turn: at 900000 it is well below the
+  10M code default.
 
 OpenRouter requests use ZDR by default and require an explicit provider pin on
 every run (`--openrouter-provider TAG`, repeatable). Auxiliary route JSON may
@@ -314,10 +316,13 @@ must provide it. Diagnostics manifests use `route.provider_pin`. Recommended
 low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
 and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
 explicitly opts out of both ZDR and the pin requirement.
-- `<proxy-budget.json>`: `{"cost_usd": 0.6, "max_call_cost_usd": 0.025,
-  "pairs": 30, "seconds": 240, "output_tokens": 16384}`. `seconds` is the per-call
+- `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.03,
+  "pairs": 2, "seconds": 240, "output_tokens": 16384}`; its reviewer/judge account
+  has `{"cost_usd": 0.04, "max_call_cost_usd": 0.02, "pairs": 2}`. The combined
+  ceiling is $0.12 and each account's pair reservations fit its cost ceiling. `seconds` is the per-call
   transport timeout (code default 240; judge/reviewer calls are capped at 120). Three
-  consecutive soft failures (timeout, connection error, 5xx) still halt live discovery.
+  consecutive soft failures (including a request that cannot fit its reserved cost) halt live discovery;
+  a single fit failure is logged and the proxy continues.
 - `<routes.json>`: `{"proposer": {...}, "reviewer": {...}}`, each with exactly
   `upstream`, `model`, `input_price`, `output_price`, `api_key_env`
   (`"OPENROUTER_API_KEY"`). The key is read from the environment only.

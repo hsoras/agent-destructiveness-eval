@@ -199,7 +199,7 @@ class LiveBudget:
     """Same attribute names DevelopmentDiscovery._call reads; no 5-pair/10-second caps.
     ``pairs`` = max proposer(+reviewer) pairs, i.e. at most 2*pairs auxiliary calls."""
     cost_usd: float
-    max_call_cost_usd: float
+    max_call_cost_usd: float = 0.03
     pairs: int = 30
     seconds: float = 240.0  # per proposer call; reasoning models on slow routes (e.g. deepinfra/fp8) time out near 90 s
     output_tokens: int = 16384  # headroom for hidden reasoning tokens before the JSON
@@ -361,7 +361,8 @@ def _soft_failure(exc) -> bool:
         return True
     if isinstance(exc, AuxiliaryHTTPError):
         return exc.status >= 500
-    return isinstance(exc, (TimeoutError, ConnectionError))
+    return (isinstance(exc, (TimeoutError, ConnectionError)) or
+            (isinstance(exc, ValueError) and str(exc) == "request cannot fit reserved cost"))
 
 
 class _SoftFailure(Exception):

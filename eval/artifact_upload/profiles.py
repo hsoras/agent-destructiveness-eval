@@ -1057,6 +1057,16 @@ def _loose_list(value, limit, maxlen):
     return [x for x in out if x][:limit]
 
 
+def _contains_redaction_marker(value):
+    if isinstance(value, str):
+        return "[redacted]" in value
+    if isinstance(value, dict):
+        return any(_contains_redaction_marker(k) or _contains_redaction_marker(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_redaction_marker(item) for item in value)
+    return False
+
+
 def normalize_finding(f):
     """-> (finding or None, notes). Findings are advisory records, so a sloppy one is repaired, not rejected:
     keys are trimmed, aliases mapped, unknown keys dropped, optional fields defaulted, lists/strings coerced
@@ -1064,6 +1074,8 @@ def normalize_finding(f):
     no usable finding_id is dropped. The result always satisfies ``_finding(proposal=True)``."""
     if type(f) is not dict:
         return None, ["finding is not an object"]
+    if _contains_redaction_marker(f):
+        return None, ["redaction marker echoed: dropped finding"]
     notes, raw = [], {}
     for key, value in f.items():
         clean = key.strip() if type(key) is str else key
@@ -1169,6 +1181,10 @@ def normalize_proposal(p, packet):
     for key in lists:
         keep = []
         for c in out[key]:
+            if type(c) is dict and _contains_redaction_marker(c):
+                notes.append("redaction marker echoed: dropped %s %s" % (key, c.get("change_id", "?")))
+                gone.add(c.get("change_id"))
+                continue
             if (key == "profile_changes" and type(c) is dict and c.get("action") == "set" and type(c.get("path")) is str
                     and c["path"].startswith("findings.") and type(c.get("value")) is dict):
                 item, why = normalize_finding(c["value"])
@@ -1280,6 +1296,7 @@ ISSUE_HINTS = {
     "stale_echo": "Echo packet_id, phase and the three sha256 values exactly as given in the packet.",
 }
 _CLASSIFY = (
+    (r"^redaction marker echoed: dropped", "redaction-marker-echoed", "dropped"),
     (r"^trimmed (top-level )?key", "trimmed_key", "normalized"),
     (r"^dropped stray top-level key", "unknown_top_level_key", "dropped"),
     (r"^alias ", "aliased_field", "normalized"),

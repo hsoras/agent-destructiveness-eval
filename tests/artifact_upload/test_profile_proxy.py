@@ -178,6 +178,23 @@ class Scripted:
         return Reply(json.dumps(fn(payload)), 10, 10, 0.001)
 
 
+def test_fit_failure_is_soft_and_halts_only_after_three_consecutive_failures():
+    class FitFailureClient:
+        upstream, model = "http://x", "m1"
+        system_prompt = None
+        def complete(self, payload, **limits):
+            raise ValueError("request cannot fit reserved cost")
+
+    discovery = ProfileDiscovery(proposer=FitFailureClient(), budget=BUDGET)
+    for expected in (1, 2, 3):
+        with pytest.raises(Exception, match="request cannot fit reserved cost"):
+            discovery._call("proposer", {"phase": "before_execution", "packet_id": "p",
+                                           "profile_sha256": "a", "ruleset_sha256": "b",
+                                           "observation_sha256": None, "supported_operations": []}, "fit-failure")
+        assert discovery.consecutive_failures == expected
+        assert discovery._halted is (expected == 3)
+
+
 def empty(p, **parts):
     return {"schema": "profile-proposal.v1", "packet_id": p["packet_id"], "phase": p["phase"],
             "profile_sha256": p["profile_sha256"], "ruleset_sha256": p["ruleset_sha256"],
@@ -1073,6 +1090,19 @@ def test_duplicate_key_and_unknown_top_level_key_are_tolerated_and_logged(tmp_pa
     assert last["outcome"] == "no-change-proposed"
     kinds = {json.loads(x)["issue_kind"] for x in (tmp_path / "out" / "proposer-format-issues.jsonl").read_text().splitlines()}
     assert {"duplicate_key", "unknown_top_level_key"} <= kinds
+
+
+def test_redaction_marker_echo_is_dropped_and_logged_with_valid_siblings_kept(tmp_path):
+    clean = rule("host", ["hostname"], "worker-07", "alex-dev")
+    echoed = rule("echo", ["hostname"], "worker-07", "[redacted]")
+    reply = lambda p: empty(p, findings=[finding(), finding("f2", actual="[redacted]")],
+                            rule_changes=[add_rule("rc-clean", clean), add_rule("rc-echo", echoed)])
+    pres = develop(tmp_path, [lambda p: empty(p), reply])
+    run(pres, call(command="hostname"), result("worker-07\n"))
+    assert pres.bundle.ruleset.get("host") is not None
+    assert pres.bundle.ruleset.get("echo") is None
+    issues = [json.loads(x) for x in (tmp_path / "out" / "proposer-format-issues.jsonl").read_text().splitlines()]
+    assert sum(i["issue_kind"] == "redaction-marker-echoed" and i["action"] == "dropped" for i in issues) == 2
 
 
 def test_guard_failing_rule_is_dropped_alone_and_other_changes_install(tmp_path):

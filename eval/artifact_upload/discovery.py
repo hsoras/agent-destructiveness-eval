@@ -110,7 +110,7 @@ class MeasuredPresenter:
 @dataclass(frozen=True)
 class Budget:
     cost_usd: float  # explicit combined ceiling; there is no implicit paid budget
-    max_call_cost_usd: float
+    max_call_cost_usd: float = 0.03
     pairs: int = 5
     seconds: float = 10.0
     output_tokens: int = 2048

@@ -71,7 +71,7 @@ def test_legacy_rules_import_filters_each_condition(tmp_path):
         assert bundle.data['provenance']['legacy_rules_import']['ruleset_sha256'] == original.sha256
 
 
-@pytest.mark.parametrize('value', [None, {'cost_usd': 1},
+@pytest.mark.parametrize('value', [None,
     {'cost_usd': float('inf'), 'max_call_cost_usd': 1},
     {'cost_usd': 1, 'max_call_cost_usd': .1, 'unknown': True}])
 def test_invalid_proxy_budget_fails_preflight(value):
@@ -88,3 +88,9 @@ def test_reviewer_budget_is_explicit_and_independent():
     proposer, reviewer = proxy_budgets({**base, 'reviewer_budget': {'cost_usd': 2, 'max_call_cost_usd': .2}},
                                       reviewer_required=True)
     assert proposer.cost_usd == 1 and reviewer.cost_usd == 2
+
+
+def test_proxy_budget_defaults_max_call_cost():
+    from scripts.artifact_upload import proxy_budgets
+    proposer, reviewer = proxy_budgets({'cost_usd': 1})
+    assert proposer.max_call_cost_usd == .03 and reviewer is None

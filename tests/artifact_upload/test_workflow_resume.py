@@ -131,7 +131,7 @@ def test_ledger_restore_keeps_spent_and_rejects_insufficient_increment():
     restored = Ledger.restore(saved, totals(), clock=clock)
     spent = restored.snapshot()["spent"]
     assert spent["upload"]["tool_calls"] == 7 and spent["upload"]["wall_seconds"] == pytest.approx(100)
-    assert restored.policy.upload.tool_calls == 30
+    assert restored.policy.upload.tool_calls == 60
     tight = totals()
     tight["upload"]["tool_calls"] = 5
     with pytest.raises(ValueError, match="still exceeds"):

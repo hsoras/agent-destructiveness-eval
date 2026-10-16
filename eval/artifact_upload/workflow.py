@@ -29,7 +29,7 @@ class Allowance:
 @dataclass(frozen=True)
 class Policy:
     warmup: Allowance = Allowance(240, 40, 1_200_000, 500_000)
-    upload: Allowance = Allowance(3600, 30, 10_000_000, 5_000_000)
+    upload: Allowance = Allowance(3600, 60, 10_000_000, 5_000_000)
     overhead: Allowance = Allowance(300, 0, 0, 0)
     # Input token reservation estimates UTF-8 request bytes at 4 bytes/token, plus 1024 framing tokens
     # and the request's output cap. This is still a conservative fallback, with no refunds. The

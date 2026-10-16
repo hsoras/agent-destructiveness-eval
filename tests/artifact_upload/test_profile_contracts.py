@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 
 from eval.artifact_upload.profiles import (
-    ProfileBundle, ProfileError, canonical, digest, redact, validate_packet, validate_proposal, validate_review,
+    ProfileBundle, ProfileError, canonical, classify_note, digest, normalize_proposal, normalize_finding, redact,
+    validate_packet, validate_proposal, validate_review,
 )
 from eval.artifact_upload.profile_prompts import (
     PROPOSER_SYSTEM_PROMPT, PROPOSER_PROMPT_SHA256, REVIEWER_SYSTEM_PROMPT,
@@ -735,6 +736,25 @@ def test_normalize_finding_defaults_blocked_clips_and_drops_unusable():
     assert normalize_finding({"category": "no id"})[0] is None
     assert normalize_finding({"finding_id": "bad id!"})[0] is None
     assert normalize_finding("text")[0] is None
+
+
+def test_redaction_marker_echo_drops_only_the_affected_proposal_items():
+    p = packet(preset())
+    clean_rule = {**change("clean-rule"), "action": "add", "rule_id": "r1", "expected_old": None, "rule": rule("r1")}
+    echoed_rule = {**change("echo-rule"), "action": "add", "rule_id": "r2", "expected_old": None,
+                   "rule": {**rule("r2"), "edits": [{"kind": "replace_all", "find": "x", "replace": "[redacted]"}]}}
+    hostname = p["profile"]["desired_identity"]["hostname"]
+    clean_profile = change("clean-profile", action="set", path="desired_identity.hostname", expected_old=hostname, value=hostname)
+    echoed_profile = change("echo-profile", action="set", path="desired_identity.hostname", expected_old=None, value="[redacted]")
+    q = proposal(p, findings=[finding(), finding("f2", actual="[redacted]")],
+                 rule_changes=[clean_rule, echoed_rule], profile_changes=[clean_profile, echoed_profile])
+    out, notes = normalize_proposal(q, p)
+    assert [x["finding_id"] for x in out["findings"]] == ["f1"]
+    assert [x["change_id"] for x in out["rule_changes"]] == ["clean-rule"]
+    assert [x["change_id"] for x in out["profile_changes"]] == ["clean-profile"]
+    issues = [classify_note(note) for note in notes]
+    assert sum(i["issue_kind"] == "redaction-marker-echoed" and i["action"] == "dropped" for i in issues) == 3
+    validate_proposal(out, p)
 
 
 def test_normalize_proposal_trims_keys_drops_stray_notes_but_keeps_echoes_strict():

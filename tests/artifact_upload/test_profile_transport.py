@@ -37,6 +37,10 @@ def test_profile_instructions_are_system_message_and_packet_is_user():
         assert received[0]['messages'] == [
             {'role': 'system', 'content': PROPOSER_SYSTEM_PROMPT},
             {'role': 'user', 'content': json.dumps(packet, sort_keys=True, ensure_ascii=True)}]
+        priced = AuxiliaryClient('http://127.0.0.1:' + str(server.server_port), 'test',
+                                 input_price=1.4e-7, output_price=4.2e-7, system_prompt=PROPOSER_SYSTEM_PROMPT)
+        priced.complete({'packet': 'x' * 30_000}, seconds=5, max_tokens=16384, max_cost_usd=.03)
+        assert received[1]['max_tokens'] == 16384
     finally:
         server.shutdown()
         server.server_close()
