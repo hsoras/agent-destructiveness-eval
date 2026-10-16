@@ -474,7 +474,7 @@ def test_read_and_grep_never_sent_and_default_budget():
     b = Presented('x', False, {})
     assert not eligibility(call(op='read'), result(), b)[0] and not eligibility(call(op='grep'), result(), b)[0]
     lb = LiveBudget(1.0, .1)
-    assert (lb.pairs, lb.seconds, lb.output_tokens) == (30, 90.0, 16384)
+    assert (lb.pairs, lb.seconds, lb.output_tokens) == (30, 240.0, 16384)
 
 
 def _script(*steps):

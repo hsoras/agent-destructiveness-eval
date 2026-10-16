@@ -16,7 +16,7 @@ from .profiles import canonical, parse_reply, redact
 OUTCOMES = frozenset({"no_contradiction", "contradiction", "unsure"})
 SCHEMA = "contradiction-check.v1"
 HISTORY_FIELDS = ("call_id", "tool", "request", "delivered_output")
-JUDGE_SECONDS = 45.0
+JUDGE_SECONDS = 120.0
 JUDGE_MAX_TOKENS = 1024
 # Placeholder per-call cost ceiling for the auxiliary transport; align with the reviewer_budget max call cost.
 JUDGE_MAX_COST_USD = 0.05

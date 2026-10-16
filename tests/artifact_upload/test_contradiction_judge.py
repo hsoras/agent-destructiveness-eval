@@ -129,7 +129,7 @@ def test_history_is_sent_newest_first():
     ids = [e["call_id"] for e in payload["delivered_history_newest_first"]]
     assert ids == ["call-3", "call-2", "call-1"]
     assert payload["history_truncation"] == {"truncated": False, "dropped_count": 0, "dropped_call_ids": []}
-    assert limits["seconds"] == cj.JUDGE_SECONDS == 45.0
+    assert limits["seconds"] == cj.JUDGE_SECONDS == 120.0
 
 
 def test_oldest_calls_are_dropped_first_and_judge_is_told():

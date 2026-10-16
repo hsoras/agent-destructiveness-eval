@@ -30,7 +30,7 @@ request inspection can also stage a proposal before execution; its decision and
 installation wait until after the original call executes. Every proposal that
 passes deterministic checks receives a contradiction check. The judge uses the
 proposer model by default; `--reviewer on` selects the explicitly configured
-reviewer route. Its `reviewer_budget` is accounted separately, with a 45-second
+reviewer route. Its `reviewer_budget` is accounted separately, with a 120-second
 per-call cap. Without an explicit reviewer route/budget, the judge receives a
 separate allowance with the proposer's configured limits. Positive reviewer
 replenishment credits only that allowance.
@@ -312,7 +312,9 @@ low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
 and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
 explicitly opts out of both ZDR and the pin requirement.
 - `<proxy-budget.json>`: `{"cost_usd": 0.6, "max_call_cost_usd": 0.025,
-  "pairs": 30, "seconds": 90, "output_tokens": 16384}`.
+  "pairs": 30, "seconds": 240, "output_tokens": 16384}`. `seconds` is the per-call
+  transport timeout (code default 240; judge/reviewer calls are capped at 120). Three
+  consecutive soft failures (timeout, connection error, 5xx) still halt live discovery.
 - `<routes.json>`: `{"proposer": {...}, "reviewer": {...}}`, each with exactly
   `upstream`, `model`, `input_price`, `output_price`, `api_key_env`
   (`"OPENROUTER_API_KEY"`). The key is read from the environment only.

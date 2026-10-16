@@ -12,7 +12,7 @@ Public API (the run wiring depends on exactly this)::
     presenter.final_rules() -> RuleSet ; presenter.events -> list[dict]
 
     # live mode: proposer LLM edits rules while the episode runs
-    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=30, seconds=90.0, output_tokens=16384)
+    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=30, seconds=240.0, output_tokens=16384)
     live = LivePresentation.create(out_dir, proposer=client, reviewer=client_or_None, budget=budget,
                                    ruleset=RuleSet|None, condition=None, degraded_output="raw")
     live.attach_recorder(recorder)    # RunRecorder; diagnostics stream; call before first present
@@ -201,7 +201,7 @@ class LiveBudget:
     cost_usd: float
     max_call_cost_usd: float
     pairs: int = 30
-    seconds: float = 90.0  # reasoning models routinely need 10-60 s
+    seconds: float = 240.0  # per proposer call; reasoning models on slow routes (e.g. deepinfra/fp8) time out near 90 s
     output_tokens: int = 16384  # headroom for hidden reasoning tokens before the JSON
 
     def __post_init__(self):

@@ -318,10 +318,10 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
         if self.account is None:
             judge_client = with_system(proposer, REVIEWER_SYSTEM_PROMPT)
             self.account = _ReviewerAccount(client=judge_client, recorder=self.recorder,
-                                            budget=replace(reviewer_budget or budget, seconds=min(45, (reviewer_budget or budget).seconds)),
+                                            budget=replace(reviewer_budget or budget, seconds=min(120, (reviewer_budget or budget).seconds)),
                                             format_instructions=self._format_instructions,
                                             response_format=self._response_format)
-        self.account.budget = replace(self.account.budget, seconds=min(45, self.account.budget.seconds))
+        self.account.budget = replace(self.account.budget, seconds=min(120, self.account.budget.seconds))
         self.original_budget, self.original_reviewer_budget = budget, self.account.budget
         self.segments = []
 

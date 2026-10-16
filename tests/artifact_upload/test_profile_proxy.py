@@ -808,7 +808,7 @@ def test_reviewer_needs_its_own_budget_and_accounts_separately(tmp_path):
         ProfilePresentation(tmp_path / "a", bundle_with([]), proposer=Scripted([]), reviewer=Scripted([], model="m2"), budget=BUDGET)
     default_judge = ProfilePresentation(tmp_path / "b", bundle_with([]), proposer=Scripted([]), budget=BUDGET, reviewer_budget=BUDGET)
     assert default_judge.discovery.account.budget.cost_usd == BUDGET.cost_usd
-    assert default_judge.discovery.account.budget.seconds == 45
+    assert default_judge.discovery.account.budget.seconds == 120
     r = rule("h", ["hostname"], "worker-07", "alex-dev")
 
     def approve(payload):
