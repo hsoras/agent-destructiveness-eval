@@ -991,3 +991,22 @@ def test_native_differential_in_guest_container(docker_env, native_results, arti
             problems += [f"{c['id']}: {x}" for x in fr.compare(c, n, w, (native["root"], native["out"]), (data["root"], data["out"]))]
         save(artifact_dir, f"differential-guest-{variant}.json", data)
         assert not problems, "\n".join(problems[:10])
+
+
+def test_managed_env_files_reach_later_shell_calls_without_being_executed(guest, tmp_path, monkeypatch):
+    from eval.artifact_upload import guest_operations as go
+    worker, root, _ = guest
+    home = tmp_path / "home"; managed = home / ".config/workspace-profile"; managed.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home)); monkeypatch.setenv("CI_RUNNER", "yes")
+    sh = lambda c: worker.execute(call("shell", "bash", {"command": c}))["stdout"]
+    show = 'printf "%s|%s|%s|%s" "${EDITOR_HINT-unset}" "${CI_RUNNER-unset}" "${TERM}" "${ARTIFACT_X-unset}"'
+    assert sh(show).startswith("unset|yes|")
+    (managed / "env-vars.sh").write_bytes(go._vars_render({"set": {"EDITOR_HINT": "vim"}, "unset": ["CI_RUNNER"]}))
+    (managed / "env.sh").write_bytes(go._env_render({"TERM": "xterm"}))
+    assert sh(show) == "vim|unset|xterm|unset"
+    # Parsed, never executed; hand-edited denied names are ignored.
+    (managed / "env-vars.sh").write_text("touch %s/pwned\nexport ARTIFACT_X='1'\nexport LD_PRELOAD='x'\nexport PATH='/nope'\nexport EDITOR_HINT='$(id)'\n" % root)
+    assert sh(show) == "unset|yes|xterm|unset"
+    assert not (root / "pwned").exists() and sh('echo "$PATH"').strip() != "/nope" and sh('echo "${LD_PRELOAD-unset}"').strip() == "unset"
+    (managed / "env-vars.sh").write_text("export EDITOR_HINT='vim'\n")
+    assert sh(show).startswith("vim|yes|")

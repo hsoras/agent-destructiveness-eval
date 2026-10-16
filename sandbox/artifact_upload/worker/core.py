@@ -13,7 +13,9 @@ import ctypes
 import hashlib
 import json
 import os
+import pwd
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -139,6 +141,33 @@ def select_shell() -> str:
     if env_shell and os.path.exists(env_shell) and os.path.basename(env_shell) not in ("fish", "nu"):
         return env_shell
     return shutil.which("bash") or "/bin/sh"
+
+
+_MANAGED_ENV_FILES = (".config/workspace-profile/env.sh", ".config/workspace-profile/env-vars.sh")
+_MANAGED_EXPORT = re.compile(r"export ([A-Z][A-Z0-9_]{0,63})='([A-Za-z0-9_.:/+@=,-]{0,200})'")
+_MANAGED_UNSET = re.compile(r"unset ([A-Z][A-Z0-9_]{0,63})")
+# The files live in the agent-writable home, so the worker re-checks names itself (mirrors the host-side deny list).
+_MANAGED_DENY = re.compile(r"^(ARTIFACT|UPLOAD|SERVICE|QUOTA|BEARER|LD_|DYLD_|PYTHON|GIT_|SSL_|CURL_|HTTP|NO_PROXY|ALL_PROXY)"
+                           r"|TOKEN|SECRET|PASSW|CRED|AUTH|API_?KEY|PRIVATE|(^|_)(URL|URI|HOST|HOSTNAME|ENDPOINT|PORT|PROXY|PATH|HOME|USER|"
+                           r"LOGNAME|SHELL|PWD|OLDPWD|IFS|PS4|PROMPT_COMMAND|BASH_ENV|ENV)(_|$)")
+
+
+def _apply_managed_env(env: dict[str, str]) -> None:
+    """Apply the harness-managed env files to a shell environment by parsing, never by executing them."""
+    home = env.get("HOME", "")
+    if tools.privileged():
+        try: home = pwd.getpwuid(tools.AGENT_UID).pw_dir
+        except KeyError: pass
+    if not home: return
+    for rel in _MANAGED_ENV_FILES:
+        path = os.path.join(home, rel)
+        try:
+            if os.path.islink(path) or not os.path.isfile(path): continue
+            with open(path, "rb") as fh: text = fh.read(65536).decode("utf-8", "replace")
+        except OSError: continue
+        for line in text.splitlines():
+            if (m := _MANAGED_EXPORT.fullmatch(line)) and not _MANAGED_DENY.search(m.group(1)): env[m.group(1)] = m.group(2)
+            elif (m := _MANAGED_UNSET.fullmatch(line)) and not _MANAGED_DENY.search(m.group(1)): env.pop(m.group(1), None)
 
 
 class _Stream:
@@ -482,6 +511,7 @@ class GuestWorker:
             # The agent's shell must not see the harness: drop the worker's own import path and run identity.
             for k in ("PYTHONPATH", "PYTHONSAFEPATH", "ARTIFACT_RUN_ID", "ARTIFACT_GUEST_ROOT", "ARTIFACT_WORKER_ID", "ARTIFACT_PROTECTED_PATHS", "ARTIFACT_AGENT_UID", "ARTIFACT_AGENT_GID"):
                 env.pop(k, None)
+        _apply_managed_env(env)
         env.update(a.get("env", {}))
         with self._lock:
             if key in self._execs or key in self._finished or self.ledger.identity(key) is not None:
