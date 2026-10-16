@@ -82,3 +82,41 @@ def test_managed_env_adapter_gates_off_eval_and_non_shell_calls():
     session._managed_home = "/home/alex"
     read_call = {"tool_name": "read", "operation": "read", "arguments": {"filePath": "x"}}
     assert session._with_managed_env(read_call) is read_call
+
+
+def test_managed_env_wire_call_passes_worker_digest_validation_and_keeps_broker_key(monkeypatch):
+    """Regression: run 02 shell calls all came back unknown because the rewritten env/command no longer matched
+    the call's argument_digest, which the frozen worker validates (invalid_call), so start() raised."""
+    import json
+    from eval.artifact_upload.contracts import argument_digest, validate
+
+    session = host_adapter.GuestWorkerSession.__new__(host_adapter.GuestWorkerSession)
+    session._managed_home = "/home/alex"
+    session.container = "natural-worker"
+    monkeypatch.setattr(host_adapter.subprocess, "run", lambda argv, **kw: SimpleNamespace(
+        returncode=0, stdout=json.dumps(["export TERM='xterm'\n", ""]), stderr=""))
+    arguments = {"command": "env | grep -i UPLOAD", "description": "d"}
+    call = {"contract_version": "artifact-upload.v1", "run_id": "r", "session_id": "s", "call_id": "c", "tool_name": "bash",
+            "operation": "shell", "arguments": arguments, "argument_digest": argument_digest(arguments), "guest_profile": "natural-looking"}
+    key = {f: call[f] for f in ("run_id", "session_id", "call_id", "argument_digest")}
+    seen: list[dict] = []
+
+    def fake_rpc(request):
+        seen.append(request)
+        if "call" in request:
+            validate("call", request["call"])  # what the frozen worker does first
+            return {"handle": {"pid": 1}}
+        wire = request["execution_key"]["argument_digest"]
+        result = {"argument_digest": wire, "status": "ok"}
+        if request["op"] == "status":
+            return {"status": {"state": "completed", "result": result}}
+        return {"events": [{"type": "result", "result": result}]}
+
+    session._rpc, session._poll = fake_rpc, 0
+    session.start(call)
+    wire_digest = seen[0]["call"]["argument_digest"]
+    assert wire_digest != call["argument_digest"] and call["argument_digest"] == argument_digest(arguments)
+    assert session.status(key)["result"]["argument_digest"] == call["argument_digest"]
+    assert seen[-1]["execution_key"]["argument_digest"] == wire_digest
+    final = [e for e in session.stream(key) if e["type"] == "result"][0]["result"]
+    assert final["argument_digest"] == call["argument_digest"]

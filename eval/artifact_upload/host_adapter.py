@@ -879,9 +879,38 @@ class GuestWorkerSession:
         return reply
 
     def execute(self, call: dict[str, Any]) -> dict[str, Any]:
-        return self._rpc({"op": "execute", "call": self._with_managed_env(call)})["result"]
+        wire = self._with_managed_env(call)
+        return self._from_wire(self._rpc({"op": "execute", "call": wire})["result"], call)
+
+    # The frozen worker rejects a call whose argument_digest differs from its canonical arguments, and keys
+    # executions by that digest. Managed env rewrites the arguments, so the wire call carries its own digest
+    # while the broker keeps the original key; this table translates between the two.
+    def _wire_digests(self) -> dict[tuple[str, str, str, str], str]:
+        if not hasattr(self, "_wire"):
+            self._wire: dict[tuple[str, str, str, str], str] = {}
+        return self._wire
+
+    @staticmethod
+    def _key_tuple(key: Mapping[str, str]) -> tuple[str, str, str, str]:
+        return key["run_id"], key["session_id"], key["call_id"], key["argument_digest"]
+
+    def _wire_key(self, key: Mapping[str, str]) -> dict[str, str]:
+        digest = self._wire_digests().get(self._key_tuple(key))
+        return {**key, "argument_digest": digest} if digest else dict(key)
+
+    def _from_wire(self, result: dict[str, Any], original: Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(result, dict) and result.get("argument_digest") != original.get("argument_digest") and "argument_digest" in result:
+            return {**result, "argument_digest": original["argument_digest"]}
+        return result
 
     def _with_managed_env(self, call: dict[str, Any]) -> dict[str, Any]:
+        wire = self._managed_env_call(call)
+        if wire is not call and "argument_digest" in call and wire["arguments"] != call["arguments"]:
+            wire["argument_digest"] = argument_digest(wire["arguments"])
+            self._wire_digests()[(call["run_id"], call["session_id"], call["call_id"], call["argument_digest"])] = wire["argument_digest"]
+        return wire
+
+    def _managed_env_call(self, call: dict[str, Any]) -> dict[str, Any]:
         """Passively parse trusted-profile env files on the host; never evaluate guest shell text."""
         if not self._managed_home or call.get("tool_name") != "bash" or call.get("operation") != "shell":
             return call
@@ -933,13 +962,19 @@ class GuestWorkerSession:
     def stream(self, key: dict[str, str]) -> Iterator[dict[str, Any]]:
         while self.status(key)["state"] != "completed":
             time.sleep(self._poll)
-        yield from self._rpc({"op": "collect", "execution_key": key})["events"]
+        for event in self._rpc({"op": "collect", "execution_key": self._wire_key(key)})["events"]:
+            if event.get("type") == "result":
+                event = {**event, "result": self._from_wire(event["result"], key)}
+            yield event
 
     def status(self, key: dict[str, str]) -> dict[str, Any]:
-        return self._rpc({"op": "status", "execution_key": key})["status"]
+        status = self._rpc({"op": "status", "execution_key": self._wire_key(key)})["status"]
+        if isinstance(status, dict) and isinstance(status.get("result"), dict):
+            status = {**status, "result": self._from_wire(status["result"], key)}
+        return status
 
     def cancel(self, key: dict[str, str], *, how: str = "terminate") -> bool:
-        return self._rpc({"op": "cancel", "execution_key": key, "how": how})["cancelled"]
+        return self._rpc({"op": "cancel", "execution_key": self._wire_key(key), "how": how})["cancelled"]
 
     def process_handle(self, call: dict[str, Any]) -> None:
         return None  # not queryable through the session protocol; the broker falls back to status by stable key
