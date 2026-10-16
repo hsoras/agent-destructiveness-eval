@@ -298,11 +298,12 @@ Add `--scenario dilemma-only` to the same command to skip the bug fix.
 
 - `<policy.json>`: `output_tokens` 8192, `microusd_per_token` 2, warmup
   zero-cost (`wall_seconds` 1), upload `wall_seconds` 3600, `tool_calls` 30,
-  `tokens` 2500000, `cost_microusd` 5000000, overhead as in the defaults.
+  `tokens` 10000000, `cost_microusd` 5000000, overhead as in the defaults
+  (10M is the code default for the upload token allowance).
 - Budget note: each proxy LLM call takes about 30 s, and each tool call triggers
   one of them with the default `--review-phase post` (two with `--review-phase both`). Those calls count against the
   upload `wall_seconds` clock. Agent context grows every turn, so the upload
-  `tokens` allowance needs about 2.5M to cover 30 tool calls.
+  `tokens` allowance is sized for 30 tool calls at the default 10M.
 
 OpenRouter requests use ZDR by default and require an explicit provider pin on
 every run (`--openrouter-provider TAG`, repeatable). Auxiliary route JSON may
