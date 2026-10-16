@@ -8,7 +8,7 @@ import pytest
 from eval.artifact_upload.contradiction_judge import Verdict
 from eval.artifact_upload.discovery import Reply
 from eval.artifact_upload.guest_operations import Catalog, LocalGuest
-from eval.artifact_upload.host_adapter import fit_for_runtime
+from eval.artifact_upload.host_adapter import OperationRegistry, RouterBridge, fit_for_runtime
 from eval.artifact_upload.live import LiveBudget
 from eval.artifact_upload.pending import add_pending
 from eval.artifact_upload.profile_proxy import EARLY_STATUS, EarlyContradictionStop, ProfilePresentation, RunStopped
@@ -196,6 +196,59 @@ def test_rule_changing_runtime_visible_text_still_pockets(tmp_path):
     assert current.output == "/workspace"
     assert pres.bundle.ruleset.get("host") is None
     assert pres._deferrals[-1]["decision"] == "pocket"
+
+
+@pytest.mark.parametrize(
+    "candidate,decision,applied",
+    [("hidden-prefix", "apply", True), ("vtail", "pocket", False)],
+)
+def test_router_bridge_records_actual_fitted_delivery_for_profile_deferral(
+    tmp_path, contract_examples, candidate, decision, applied, monkeypatch
+):
+    from eval.artifact_upload import host_adapter
+
+    class UnboundServer:
+        server_port = 0
+        def serve_forever(self): pass
+        def server_close(self): pass
+
+    monkeypatch.setattr(host_adapter.http.server, "ThreadingHTTPServer",
+                        lambda *_args, **_kwargs: UnboundServer())
+    pres, client = presentation(tmp_path, await_delivery=True)
+    raw = "hidden-prefix\n" + "\n".join(f"v{i}" for i in range(1, 2000)) + "\nvtail"
+
+    class Broker:
+        def execute(self, call):
+            text = raw if call["arguments"]["command"] == "hostname" else "/workspace"
+            return result(text)
+
+    bridge = RouterBridge(
+        run_id="test", broker=Broker(), registry=OperationRegistry(),
+        guest_profile=contract_examples["profile_manifest"], presenter=pres,
+    )
+
+    def dispatch(call_id, command):
+        return bridge.call({
+            "tool": "bash", "session_id": "s", "call_id": call_id,
+            "arguments": {"command": command},
+        })
+
+    first = dispatch("c1", "hostname")
+    assert first["ok"]
+    delivered = first["output"]
+    assert pres._exposures[0]["delivered_output"] == delivered
+    assert "hidden-prefix" not in delivered and "vtail" in delivered
+
+    client.propose = lambda packet: proposal(
+        packet, rules=[rule(find=candidate, replace="changed")]
+    )
+    if candidate == "vtail":
+        pres._call_count = 8
+    second = dispatch("c2", "pwd")
+    assert second["ok"] and second["output"] == "/workspace"
+    assert pres._deferrals[-1]["decision"] == decision
+    assert bool(pres.bundle.ruleset.get("host")) is applied
+    bridge._server.server_close()
 
 
 @pytest.mark.parametrize("prior_calls,service,stops", [(0, False, True), (7, False, True), (8, False, False), (0, True, False)])
