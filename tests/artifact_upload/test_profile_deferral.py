@@ -8,6 +8,7 @@ import pytest
 from eval.artifact_upload.contradiction_judge import Verdict
 from eval.artifact_upload.discovery import Reply
 from eval.artifact_upload.guest_operations import Catalog, LocalGuest
+from eval.artifact_upload.host_adapter import fit_for_runtime
 from eval.artifact_upload.live import LiveBudget
 from eval.artifact_upload.pending import add_pending
 from eval.artifact_upload.profile_proxy import EARLY_STATUS, EarlyContradictionStop, ProfilePresentation, RunStopped
@@ -162,6 +163,39 @@ def test_rule_replay_pockets_without_changing_saved_or_delivered_output(tmp_path
     assert pres.receipt()["taint"] == "tainted-noted"
     report = pres.write_report().read_text()
     assert "Deferred / dropped / stopped changes" in report and "pocket" in report
+
+
+def test_rule_changing_only_runtime_truncated_text_applies(tmp_path):
+    pres, client = presentation(tmp_path, await_delivery=True)
+    raw = "hidden-prefix\n" + "\n".join(f"v{i}" for i in range(1, 2001))
+    delivered, fitted = fit_for_runtime(raw, "shell")
+    assert fitted and "hidden-prefix" not in delivered
+    c = call(command="hostname")
+    shown = run(pres, c, result(raw))
+    # Exercise the same host fitting boundary used by RouterBridge before delivery.
+    pres.delivered(c, delivered, shown, None)
+    assert pres._exposures[0]["delivered_output"] == delivered
+    client.propose = lambda p: proposal(p, rules=[rule(find="hidden-prefix", replace="changed-prefix")])
+    current = run(pres, call("c2", command="pwd"), result("/workspace"))
+    assert current.output == "/workspace"
+    assert pres.bundle.ruleset.get("host")
+    assert pres._deferrals[-1]["decision"] == "apply"
+
+
+def test_rule_changing_runtime_visible_text_still_pockets(tmp_path):
+    pres, client = presentation(tmp_path, await_delivery=True)
+    raw = "hidden-prefix\n" + "\n".join(f"v{i}" for i in range(1, 2000)) + "\nvtail"
+    delivered, fitted = fit_for_runtime(raw, "shell")
+    assert fitted and "vtail" in delivered
+    c = call(command="hostname")
+    shown = run(pres, c, result(raw))
+    pres.delivered(c, delivered, shown, None)
+    client.propose = lambda p: proposal(p, rules=[rule(find="vtail", replace="altered-tail")])
+    pres._call_count = 8
+    current = run(pres, call("c9", command="pwd"), result("/workspace"))
+    assert current.output == "/workspace"
+    assert pres.bundle.ruleset.get("host") is None
+    assert pres._deferrals[-1]["decision"] == "pocket"
 
 
 @pytest.mark.parametrize("prior_calls,service,stops", [(0, False, True), (7, False, True), (8, False, False), (0, True, False)])

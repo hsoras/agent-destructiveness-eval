@@ -45,7 +45,7 @@ import uuid
 from .contracts import argument_digest
 from .guest_operations import (DEFAULT_CATALOG, Catalog, GuestTransactionStop, OperationError, SetupReceipt, TransactionLog, apply_setup,
                                probe_git, probe_identity, recover, run_transaction, setup_entry)
-from .host_adapter import PassthroughPresenter, Presented
+from .host_adapter import PassthroughPresenter, Presented, fit_for_runtime
 from .live import LABELS, LiveBudget, LiveDiscovery, _Events, _SoftFailure, _event as _legacy_event, redact
 from .presentation import FrozenPresentation
 from .profile_prompts import (PROPOSER_PROMPT_SHA256, PROPOSER_PROMPT_VERSION, PROPOSER_SYSTEM_PROMPT,
@@ -904,8 +904,7 @@ class ProfilePresentation:
                  "rules_applied": pending.get("rules_applied", []), "delivered": True}
         raw = pending.get("raw_result")
         if raw is not None:
-            entry.update(_call=deepcopy(call), _result=raw, _state=pending.get("state", {}),
-                         _rendered_output=self._baseline.present(call, pending.get("rendered_result", raw)).output)
+            entry.update(_call=deepcopy(call), _result=raw, _state=pending.get("state", {}))
         # Raw replay material is harness-only; the judge receives an explicit whitelist.
         with (self.out_dir / EXPOSURE_FILE).open("a") as f:
             f.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -1030,7 +1029,12 @@ class ProfilePresentation:
                     contradiction = "replay unavailable for delivered call " + entry["call_id"]
                     break
                 rendered, _ = self.render(candidate, entry["_call"], entry["_result"], state=entry["_state"])
-                if self._baseline.present(entry["_call"], rendered).output != entry.get("_rendered_output", entry["delivered_output"]):
+                replayed = self._baseline.present(entry["_call"], rendered).output
+                # Match the host bridge's final delivery boundary. A rule that only
+                # changes text removed by runtime fitting did not change what the
+                # agent saw and is not a contradiction.
+                replayed, _ = fit_for_runtime(replayed, entry["_call"].get("operation"))
+                if replayed != entry["delivered_output"]:
                     contradiction = "rule replay changes delivered call " + entry["call_id"]
                     break
         if contradiction is None:

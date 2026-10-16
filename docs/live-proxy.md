@@ -54,8 +54,11 @@ After potentially mutating calls, the harness diffs git HEAD and ref tips, file
 hashes/mode/mtime, and guest environment state. Changes made by the real agent,
 including deletions and unsets, take precedence. A proposal conflicting with
 those changes is dropped and never pocketed. Otherwise, candidate rules replay
-over every previous raw result using that call's rendering state. A change to a
-past delivered rendering is a contradiction. Guest operations first undergo a
+over every previous raw result using that call's rendering state, then pass
+through the host runtime's output fitting step. Replay compares this final text
+with the exact delivered output, so changes confined to runtime-truncated text
+do not count as contradictions. A change to a past delivered rendering is a
+contradiction. Guest operations first undergo a
 write-footprint check against presented paths, refs and variables. Incomplete
 state probes yield unsure rather than authorizing an unverified guest change.
 The probe is bounded to 200 files per boundary.
