@@ -16,10 +16,6 @@ from .profiles import canonical, parse_reply, redact
 OUTCOMES = frozenset({"no_contradiction", "contradiction", "unsure"})
 SCHEMA = "contradiction-check.v1"
 HISTORY_FIELDS = ("call_id", "tool", "request", "delivered_output")
-# Proposal keys that carry prose, not references to observed paths/variables/refs.
-PROSE_KEYS = frozenset({"reason", "summary", "note", "actual", "desired", "blocked_reason", "persistence_recommendation",
-                        "verification_steps", "efficiency_note", "container_level_alternative", "checked"})
-MIN_REF_LEN = 3
 JUDGE_SECONDS = 45.0
 JUDGE_MAX_TOKENS = 1024
 # Placeholder per-call cost ceiling for the auxiliary transport; align with the reviewer_budget max call cost.
@@ -40,20 +36,6 @@ class Verdict:
 
 def _unsure(reason, truncated=False):
     return Verdict("unsure", reason[:MAX_REASON_CHARS], bool(truncated))
-
-
-def _refs(value, out):
-    """Collect string leaves of the proposal that could name a path, variable, or ref (prose keys skipped)."""
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key not in PROSE_KEYS:
-                _refs(item, out)
-    elif isinstance(value, list):
-        for item in value:
-            _refs(item, out)
-    elif isinstance(value, str) and len(value) >= MIN_REF_LEN:
-        out.add(value)
-    return out
 
 
 def _history_entries(delivered_history):
@@ -87,8 +69,8 @@ def judge_contradiction(client, *, proposal, profile, protected_facts, delivered
 
     delivered_history: chronological list of dicts with call_id, tool, request, delivered_output.
     cap_bytes: maximum canonical-JSON size of the newest-first history sent to the judge. Oldest calls are
-    dropped first and the judge is told which ones. If a dropped call might contain a string the proposal
-    refers to, the verdict is 'unsure' without calling the judge.
+    dropped first and the judge is told which ones. Any dropped history makes the verdict 'unsure'
+    without calling the judge because string matching cannot establish semantic irrelevance.
     """
     truncated = False
     try:
@@ -110,12 +92,8 @@ def judge_contradiction(client, *, proposal, profile, protected_facts, delivered
         dropped_ids = [entry["call_id"] for entry in dropped]
 
         if dropped:
-            dropped_text = "\n".join(canonical(entry) for entry in dropped)
-            refs = _refs(proposal, set())
-            hits = sorted(ref for ref in refs if ref in dropped_text)
-            if hits:
-                return _unsure("history truncated; dropped calls %s may contain proposal refs %s"
-                               % (dropped_ids, hits[:5]), truncated=True)
+            return _unsure("history truncated; dropped calls %s may contain relevant context" % dropped_ids,
+                           truncated=True)
 
         payload = {
             "schema": SCHEMA,

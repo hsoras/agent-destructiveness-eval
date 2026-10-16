@@ -137,20 +137,17 @@ def test_oldest_calls_are_dropped_first_and_judge_is_told():
     one = len(cj.canonical(cj.redact(entry(6, output="x" * 400))).encode())
     client = FakeClient(reply("no_contradiction"))
     v = run(client, history, cap=one * 3 + 10)  # room for the three newest entries only
-    payload, _ = client.calls[0]
-    kept = [e["call_id"] for e in payload["delivered_history_newest_first"]]
-    assert kept == ["call-6", "call-5", "call-4"]
-    assert payload["history_truncation"] == {"truncated": True, "dropped_count": 3,
-                                             "dropped_call_ids": ["call-3", "call-2", "call-1"]}
-    assert v.truncated is True and v.outcome == "no_contradiction"
+    assert v.truncated is True and v.outcome == "unsure"
+    assert client.calls == []
 
 
-def test_truncation_with_no_overlap_still_asks_judge():
+def test_truncation_with_no_string_overlap_is_unsure_without_call():
     history = [entry(1, output="z" * 2000), entry(2, output="alpha")]
     client = FakeClient(reply("no_contradiction"))
     v = run(client, history, cap=600)
-    assert v == Verdict("no_contradiction", "because call-2", True)
-    assert client.calls[0][0]["history_truncation"]["dropped_call_ids"] == ["call-1"]
+    assert v.outcome == "unsure" and v.truncated is True
+    assert "call-1" in v.reason
+    assert client.calls == []
 
 
 def test_truncation_touching_proposal_ref_is_unsure_without_call():
@@ -163,21 +160,20 @@ def test_truncation_touching_proposal_ref_is_unsure_without_call():
     assert client.calls == []
 
 
-def test_truncation_of_unrelated_calls_does_not_force_unsure():
+def test_truncation_with_proposal_ref_is_unsure_without_call():
     proposal = {"changes": [{"change_id": "c1", "path": "/work/only-here.txt"}]}
     history = [entry(1, output="unrelated text " + "z" * 2000), entry(2, output="alpha")]
     client = FakeClient(reply("contradiction", "call-2 shows it"))
     v = run(client, history, cap=600, proposal=proposal)
-    assert v == Verdict("contradiction", "call-2 shows it", True)
-    assert len(client.calls) == 1
+    assert v.outcome == "unsure" and v.truncated is True
+    assert client.calls == []
 
 
 def test_oversized_newest_call_drops_everything():
     client = FakeClient(reply("no_contradiction"))
     v = run(client, [entry(1, output="w" * 5000)], cap=100, proposal={"changes": []})
     assert v.truncated is True
-    assert client.calls[0][0]["delivered_history_newest_first"] == []
-    assert client.calls[0][0]["history_truncation"]["dropped_call_ids"] == ["call-1"]
+    assert client.calls == []
 
 
 def test_raw_output_never_reaches_the_request():

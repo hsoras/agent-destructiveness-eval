@@ -55,6 +55,23 @@ def test_managed_env_is_host_parsed_and_applies_to_later_natural_shell_calls(mon
     assert empty["arguments"]["env"]["BASH_ENV"] == "/dev/null"
     assert empty["arguments"]["env"]["TERM"] == "explicit"
 
+    # Sequential assignment semantics apply across files and within each file.
+    for ordered_files, expected_value in [
+        (["unset FOO\n", "export FOO='bar'\n"], "bar"),
+        (["export FOO='bar'\n", "unset FOO\n"], None),
+        (["unset FOO\nexport FOO='bar'\n", ""], "bar"),
+        (["export FOO='bar'\nunset FOO\n", ""], None),
+    ]:
+        files = ordered_files
+        ordered = session._with_managed_env({"tool_name": "bash", "operation": "shell",
+            "arguments": {"command": "printf '%s' \"${FOO-unset}\"", "env": {}}})
+        assert ordered["arguments"]["env"].get("FOO") == expected_value
+        if expected_value is None:
+            assert "-u FOO" in ordered["arguments"]["command"]
+        else:
+            assert "-u FOO" not in ordered["arguments"]["command"]
+            assert ordered["arguments"]["env"]["FOO"] == expected_value
+
 
 def test_managed_env_adapter_gates_off_eval_and_non_shell_calls():
     session = host_adapter.GuestWorkerSession.__new__(host_adapter.GuestWorkerSession)

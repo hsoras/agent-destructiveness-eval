@@ -910,8 +910,10 @@ class GuestWorkerSession:
             for line in text.splitlines():
                 if (m := _MANAGED_EXPORT.fullmatch(line)) and not _MANAGED_ENV_DENY.search(m.group(1)):
                     managed_env[m.group(1)] = m.group(2)
+                    unset.discard(m.group(1))
                 elif (m := _MANAGED_UNSET.fullmatch(line)) and not _MANAGED_ENV_DENY.search(m.group(1)):
-                    managed_env.pop(m.group(1), None); unset.add(m.group(1))
+                    managed_env.pop(m.group(1), None)
+                    unset.add(m.group(1))
         # Preserve normal shell-call precedence: explicit call env is applied after managed values.
         env.update(managed_env)
         env.update({k: v for k, v in explicit_env.items() if k != "BASH_ENV"})
