@@ -572,6 +572,11 @@ class TwoStageWorkflow:
             self.result['failure_message'] = redact(str(exc), limit=500)
             self.result['failure_traceback_tail'] = [redact(line, limit=500) for line in
                                                      traceback.format_exc().splitlines()[-15:]]
+        if getattr(rec, 'proxy_stop_status', None):
+            self.result['termination_reason'] = rec.proxy_stop_status
+            self.result['status'] = rec.proxy_stop_status
+            for key in ('failure_class', 'failure_message', 'failure_traceback_tail'):
+                self.result.pop(key, None)
         self.result['resources'] = self.ledger.snapshot()
         if not rec.failure:
             try:

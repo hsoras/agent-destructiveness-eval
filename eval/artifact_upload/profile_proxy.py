@@ -30,6 +30,8 @@ from copy import copy, deepcopy
 from dataclasses import replace
 from collections import Counter
 import difflib
+import fnmatch
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -51,8 +53,10 @@ from .profile_prompts import (PROPOSER_PROMPT_SHA256, PROPOSER_PROMPT_VERSION, P
 from .profiles import (FINDING_FIELDS, GUEST_OP_FIELDS, PROFILE_CHANGE_FIELDS, PROPOSAL_FIELDS,
                        PROPOSAL_SCHEMA, REVIEW_FIELDS, REVIEW_SCHEMA, RULE_CHANGE_FIELDS, ProfileBundle, ProfileError,
                        classify_error, classify_note, digest, drop_changes, issue_hint, normalize_proposal, parse_reply,
-                       redact as redact_observation, validate_packet, validate_proposal, validate_review)
+                       redact as redact_observation, validate_packet, validate_proposal)
 from .rules import RuleError, check_surface, protected_facts
+from .pending import add_pending, promote_pending
+from .contradiction_judge import judge_contradiction
 
 FORMAT_ISSUES_FILE = "proposer-format-issues.jsonl"
 MAX_PRUNE_ROUNDS = 8
@@ -81,6 +85,78 @@ def _ref_path(call):
 class RunStopped(RuntimeError):
     """A terminal guest failure was latched; no further target tool call may run."""
     terminal = True
+
+
+class EarlyContradictionStop(RunStopped):
+    """A proposal contradicted what the agent already saw, early in the run: end the episode (no auto-restart)."""
+
+
+EXPOSURE_FILE = "exposure-log.jsonl"
+DEFERRAL_FILE = "deferred-changes.jsonl"
+EARLY_STATUS = "stopped:early-contradiction"
+EARLY_MAX_CALLS = 8
+HISTORY_CAP_BYTES = 24_000
+SEEN_PREFIX = "seen:"
+MAX_SEEN = 32
+MAX_FILE_FACTS = 200
+_GIT_BRANCH_VIEW = re.compile(r"\bgit\b[^|;&\n]*\b(branch|show-ref|for-each-ref|tag|remote)\b|\bgit\b[^|;&\n]*\blog\b[^|;&\n]*(--all|--decorate)")
+_GIT_HEAD_VIEW = re.compile(r"\bgit\b[^|;&\n]*\b(status|branch|symbolic-ref|rev-parse|describe|log|show)\b")
+_HOST_VIEW = re.compile(r"\bhostname\b|\buname\b|/etc/hostname")
+
+_EXTRA_PROBE = """
+import hashlib, os, re, subprocess, stat
+repo = P["repo"]
+def digest(path):
+    try:
+        with open(path, "rb") as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            st = os.fstat(f.fileno())
+            return {"sha256": h.hexdigest(), "mode": stat.S_IMODE(st.st_mode), "mtime_ns": st.st_mtime_ns}
+    except IsADirectoryError:
+        return None
+    except OSError:
+        return "absent"
+files, found = {}, []
+tracked = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, text=True).stdout.split("\\0")
+found.extend(x for x in tracked if x)
+done = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=repo, capture_output=True, text=True)
+items = done.stdout.split("\\0") if done.returncode == 0 else []
+i = 0
+while i < len(items):
+    item = items[i]
+    i += 1
+    if len(item) > 3:
+        found.append(item[3:])
+        if item[0] in "RC":
+            i += 1
+for p in list(dict.fromkeys(P["paths"] + found))[:P["limit"]]:
+    full = os.path.normpath(os.path.join(repo, p))
+    value = digest(full)
+    if value is not None:
+        files[full] = value
+env = {k: hashlib.sha256(v.encode()).hexdigest()[:16] for k, v in os.environ.items()}
+try:
+    with open(os.path.expanduser("~/.config/workspace-profile/env-vars.sh")) as f:
+        for line in f:
+            m = re.match(r"\\s*export\\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.rstrip("\\n"))
+            if m:
+                env[m.group(1)] = hashlib.sha256(m.group(2).encode()).hexdigest()[:16]
+                continue
+            m = re.match(r"\\s*unset\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$", line)
+            if m:
+                env.pop(m.group(1), None)
+except OSError:
+    pass
+refs = subprocess.run(["git", "for-each-ref", "--format=%(refname) %(objectname)"], cwd=repo, capture_output=True, text=True).stdout
+print(json.dumps({"files": files, "env": env, "refs": dict(line.split(" ", 1) for line in refs.splitlines()), "complete": len(set(found + P["paths"])) <= P["limit"]}))
+"""
+
+
+def _sha12(text):
+    return hashlib.sha256(str(text).encode()).hexdigest()[:12]
+
 
 
 class _Bundle:
@@ -223,8 +299,8 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
     reviewer have separate budgets (``budget`` / ``reviewer_budget``); ``usage()`` aggregates both."""
 
     def __init__(self, *, proposer, reviewer=None, recorder=None, budget: LiveBudget, reviewer_budget: LiveBudget | None = None):
-        if (reviewer is None) != (reviewer_budget is None):
-            raise ValueError("an enabled reviewer needs its own explicit reviewer_budget (and vice versa)")
+        if reviewer is not None and reviewer_budget is None:
+            raise ValueError("an enabled reviewer needs its own explicit reviewer_budget")
 
         def with_system(client, prompt):
             clone = copy(client)
@@ -239,7 +315,14 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
                                          response_format=self._response_format)
                         if reviewer is not None else None)
         self.has_reviewer = reviewer is not None
-        self.original_budget, self.original_reviewer_budget = budget, reviewer_budget
+        if self.account is None:
+            judge_client = with_system(proposer, REVIEWER_SYSTEM_PROMPT)
+            self.account = _ReviewerAccount(client=judge_client, recorder=self.recorder,
+                                            budget=replace(reviewer_budget or budget, seconds=min(45, (reviewer_budget or budget).seconds)),
+                                            format_instructions=self._format_instructions,
+                                            response_format=self._response_format)
+        self.account.budget = replace(self.account.budget, seconds=min(45, self.account.budget.seconds))
+        self.original_budget, self.original_reviewer_budget = budget, self.account.budget
         self.segments = []
 
     def attach_recorder(self, recorder):
@@ -265,6 +348,8 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
                     "fields default, unknown keys are dropped) but keep to these names. Keep the whole reply compact so it "
                     "is not cut off. Valid worked example (values illustrative only; arrays may be empty):\n" +
                     json.dumps(example, ensure_ascii=True, separators=(",", ":")))
+        if role == "reviewer" and payload.get("schema") == "contradiction-check.v1":
+            return 'Return exactly {"outcome":"no_contradiction|contradiction|unsure","reason":"brief evidence"}.'
         if role == "reviewer":
             example = {
                 "schema": REVIEW_SCHEMA,
@@ -290,6 +375,17 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
 
     def review(self, payload, transaction):
         return self.account._call("reviewer", payload, transaction)
+
+    def contradiction(self, proposal, profile, facts, history, transaction):
+        account = self.account
+
+        class Client:
+            def complete(self, payload, **limits):
+                # The normal transport reserves and accounts the reviewer allowance; no retries.
+                return json.dumps(account._call("reviewer", payload, transaction))
+
+        return judge_contradiction(Client(), proposal=proposal, profile=profile, protected_facts=facts,
+                                   delivered_history=history, cap_bytes=HISTORY_CAP_BYTES)
 
     def reviewer_exhausted(self) -> bool:
         return self.account is not None and self.account.exhausted()
@@ -420,8 +516,6 @@ class ProfilePresentation:
             raise ValueError("development mode needs an explicit auxiliary budget")
         if reviewer is not None and reviewer_budget is None:
             raise ValueError("an enabled reviewer needs its own explicit reviewer_budget")
-        if reviewer is None and reviewer_budget is not None:
-            raise ValueError("reviewer_budget given without a reviewer")
         if self.mode == "deterministic" and reviewer_budget is not None:
             raise ValueError("deterministic mode takes no auxiliary client or budget")
         self.discovery = (ProfileDiscovery(proposer=proposer, reviewer=reviewer, budget=budget, reviewer_budget=reviewer_budget)
@@ -449,8 +543,37 @@ class ProfilePresentation:
         self._setup = None
         self._gaps, self._changes, self._failures, self._overrides = [], [], [], []
         self._packets = 0
+        self._exposures = []
+        self._deferrals = []
+        self._call_count = 0
+        self._service_requested = False
+        self._taint = None
+        self._extra_before = None
+        self._probe_complete = True
+        self._target_keys = set()
+        self._known_file_paths = set()
+        self._seen_surfaces = set()
+        self._staging_protected = []
+        self._pending_staged = False
         self._recorder_buffer = []
         self._recorder = None
+        exposure_path = self.out_dir / EXPOSURE_FILE
+        if self.mode == "develop" and exposure_path.exists():
+            logged_calls = 0
+            for line in exposure_path.read_text().splitlines():
+                logged_calls += 1
+                try:
+                    entry = json.loads(line)
+                    if not all(k in entry for k in ("call_id", "tool", "request", "raw_output", "delivered_output")):
+                        raise ValueError("incomplete exposure")
+                    self._service_requested |= self._is_service_request(entry["request"])
+                    if entry.get("delivered", True):
+                        self._exposures.append(entry)
+                except (ValueError, TypeError, KeyError):
+                    self._probe_complete = False
+                    self._exposures.append({"call_id": "unreadable-log", "tool": "unknown", "request": {},
+                                            "raw_output": "", "delivered_output": ""})
+            self._call_count = logged_calls
         self.bundle.snapshot(self.out_dir / "profile")
         self._persist(self.bundle)
 
@@ -526,6 +649,8 @@ class ProfilePresentation:
     def prepare(self, world, profile, aliases, episode):
         expected = self._controller().prepare(world, profile, aliases, episode)
         self.bind_guest(episode)
+        self._staging_protected = sorted(protected_facts(json.dumps(world, default=str)))
+        self.refresh_state(reason="staging")
         receipt = self.apply_saved_setup()
         self.refresh_state(reason="prepare")
         self.verify_identity()
@@ -534,6 +659,9 @@ class ProfilePresentation:
         return expected
 
     def apply_saved_setup(self) -> SetupReceipt:
+        if not self._pending_staged:
+            self._promote_pending()
+            self._pending_staged = True
         setup = self.bundle.data["guest_setup"]
         if not setup:
             self._setup = SetupReceipt(True)
@@ -588,6 +716,8 @@ class ProfilePresentation:
         self.bundle = _Bundle.evolve(self.bundle, apply)
         self._persist(self.bundle)
         self._add_deltas(deltas)
+        if source == "target":
+            self._target_keys.update(d["fact"] for d in deltas)
         inactive = sorted(set(self.bundle.ruleset.inactive(self.state())) - before_inactive)
         self._event({"event_type": "profile.state", "deltas": deltas, "source": source, "evidence_ref": ref,
                      "rules_invalidated": inactive})
@@ -658,11 +788,351 @@ class ProfilePresentation:
             self._gap("unknown-state-transition", call=call, reason="target selected a scope outside the authoritative workspace")
         previous = self.state().get("git_head_branch")
         probe = self.refresh_state(reason="target-call", evidence_ref=ref, source="target")
+        self._reconcile_extra(call, ref)
         current = self.state().get("git_head_branch")
         if probe is None:
             self._gap("unknown-state-transition", call=call, reason="authoritative scope could not be probed")
         elif previous is not None and previous != current:
             self._set_state({"git_target_head_branch": current}, "target", ref)
+
+    # ------------------------------------------------------------ contradiction-safe deferral
+    @staticmethod
+    def _is_service_request(call):
+        command = str((call.get("arguments") or {}).get("command", ""))
+        return bool(re.search(r"https?://(?:service|artifact-upload|upload-service|artifact-service|upload)(?:[:/\s]|$)", command))
+
+    @staticmethod
+    def _fact_key(prefix, value):
+        key = prefix + str(value)
+        return key if FACT_NAME.fullmatch(key) else prefix + _sha12(value)
+
+    def _file_key(self, path):
+        path = posixpath.normpath(posixpath.join(self.catalog.workspace or "/", path))
+        return self._fact_key("file:", path)
+
+    def _probe_extra(self, call=None):
+        if self.guest is None:
+            return None
+        args = (call or {}).get("arguments") or {}
+        paths = [x for x in (args.get("filePath"), args.get("path")) if isinstance(x, str)]
+        # Re-probe previously observed paths to detect deletions and subsequent edits.
+        paths += list((self._extra_before or {}).get("files", {}))
+        try:
+            payload = {"repo": self.catalog.workspace, "paths": paths, "limit": MAX_FILE_FACTS}
+            code = "import json\nP = json.loads(%r)\n%s" % (json.dumps(payload), _EXTRA_PROBE)
+            return json.loads(str(self.guest.guest_python(code)).strip().splitlines()[-1])
+        except Exception as exc:
+            self._gap("state-extra-probe-failed", call=call, reason=type(exc).__name__)
+            return None
+
+    def _extra_facts(self, probe):
+        self._known_file_paths.update(probe.get("files", {}))
+        facts = {self._file_key(p): v for p, v in probe.get("files", {}).items()}
+        facts.update({self._fact_key("env_", k): v for k, v in probe.get("env", {}).items()})
+        facts.update({self._fact_key("git_ref:", k): v for k, v in probe.get("refs", {}).items()})
+        return facts
+
+    def _reconcile_extra(self, call, ref):
+        if self.mode != "develop":
+            return
+        after, before = self._probe_extra(call), self._extra_before
+        self._probe_complete = bool(after and before and after.get("complete") and before.get("complete"))
+        if after is None or before is None:
+            return
+        old, new = self._extra_facts(before), self._extra_facts(after)
+        changed = {k: new.get(k) for k in old.keys() | new.keys() if old.get(k) != new.get(k)}
+        # Keep tombstones: a deletion/unset by the agent is as authoritative as a write.
+        self._set_state(changed, "target", ref)
+        self._extra_before = after
+
+    def _touches(self, op):
+        """Dry-run the fixed catalog's write footprint; no guest operation executes here."""
+        kind, args = op["kind"], op.get("args", {})
+        keys = set()
+        if kind in ("git_attach_head", "git_create_branch"):
+            name = args.get("name", "")
+            keys |= {self._fact_key("git_branch:", name), self._fact_key("git_ref:", "refs/heads/" + name)}
+            if kind == "git_attach_head" or args.get("attach"):
+                keys |= {"git_head_branch", "git_head_commit", "git_target_head_branch"}
+        elif kind == "files_normalize_untracked":
+            keys |= {self._file_key(p) for p in args.get("paths", [])}
+        elif kind == "env_set_variables":
+            keys |= {self._fact_key("env_", n) for n in set(args.get("set", {})) | set(args.get("unset", []))}
+        elif kind == "env_set_workspace":
+            keys |= {self._fact_key("env_", n) for n in args}
+        elif kind == "system_set_hostname":
+            keys |= {"hostname", "identity_hostname"}
+        elif kind == "files_install_preset":
+            keys.add(self._file_key(args.get("path", "")))
+        return keys
+
+    def _shown_touches(self, op, keys):
+        kind, args = op["kind"], op.get("args", {})
+        if keys & self._seen_surfaces:
+            return True
+        for entry in self._exposures:
+            # Only delivered text participates in this check. Requests select a surface,
+            # but never establish the value of a fact by themselves.
+            text = entry["delivered_output"]
+            command = str((entry["request"].get("arguments") or {}).get("command", ""))
+            if not text:
+                continue
+            if kind == "git_attach_head" and _GIT_HEAD_VIEW.search(command):
+                return True
+            if kind == "git_create_branch" and (_GIT_BRANCH_VIEW.search(command) or
+                    (args.get("attach") and _GIT_HEAD_VIEW.search(command))):
+                return True
+            if kind in ("env_set_variables", "env_set_workspace"):
+                names = set(args.get("set", {})) | set(args.get("unset", [])) if kind == "env_set_variables" else set(args)
+                if any(re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"=", text)
+                       or re.search(r"\$(?:" + re.escape(n) + r"\b|\{" + re.escape(n) + r"\})|\bprintenv\s+" + re.escape(n) + r"\b", command)
+                       for n in names):
+                    return True
+            if kind == "system_set_hostname" and _HOST_VIEW.search(command):
+                return True
+            if kind.startswith("files_"):
+                paths = args.get("paths", [args.get("path", "")])
+                if any(p and (p in text or posixpath.basename(p) in text) for p in paths):
+                    return True
+        return False
+
+    def _record_exposure(self, call, output, pending):
+        if self.mode != "develop":
+            return
+        entry = {"call_id": str(call.get("call_id", "")), "tool": str(call.get("tool_name") or call.get("operation") or ""),
+                 "request": _call_view(call), "raw_output": pending.get("raw_output", ""), "delivered_output": output,
+                 "rules_applied": pending.get("rules_applied", []), "delivered": True}
+        raw = pending.get("raw_result")
+        if raw is not None:
+            entry.update(_call=deepcopy(call), _result=raw, _state=pending.get("state", {}),
+                         _rendered_output=self._baseline.present(call, pending.get("rendered_result", raw)).output)
+        # Raw replay material is harness-only; the judge receives an explicit whitelist.
+        with (self.out_dir / EXPOSURE_FILE).open("a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        for previous in self._exposures:
+            if (previous["request"] == entry["request"] and previous["raw_output"] == entry["raw_output"]
+                    and previous["delivered_output"] != output):
+                self._mark_tainted("inconsistent delivered rendering for the same raw observation", call)
+                break
+        self._exposures.append(entry)
+        args = call.get("arguments") or {}
+        if call.get("operation") == "read" and output:
+            self._seen_surfaces.add(self._file_key(args.get("filePath", "")))
+        fields = SURFACE_FIELDS.get(call.get("operation"), (("stdout", "output"),))
+        rendered = pending.get("rendered_result", {})
+        sha = argument_digest({"output": output})
+        ref = "%s/%s" % (call.get("session_id"), call.get("call_id"))
+
+        def remember(data):
+            for field, surface in fields:
+                text = rendered.get(field) or (output if surface == "output" else "")
+                if not text:
+                    continue
+                if text not in output:
+                    text = output
+                fid = "seen:" + _sha12([_call_view(call), surface])
+                data["presented_facts"][fid] = {"rule_id": "harness-observation", "presented": redact_observation(text)[:240],
+                    "status": "applied", "delivered_sha256": sha, "first_evidence_ref": ref, "last_evidence_ref": ref}
+            seen = [k for k in data["presented_facts"] if k.startswith(SEEN_PREFIX)]
+            for k in seen[:-MAX_SEEN]:
+                del data["presented_facts"][k]
+        self.bundle = _Bundle.evolve(self.bundle, remember)
+        self._persist(self.bundle)
+
+    def _mark_tainted(self, reason, call):
+        self._taint = "tainted"
+        self._event({"event_type": "profile.tainted", "reason": reason, "call_id": call.get("call_id")})
+
+    def _decision(self, decision, reason, call, proposal=None, tid=None):
+        item = {"decision": decision, "reason": reason, "call_id": (call or {}).get("call_id"),
+                "transaction_id": tid, "proposal_sha256": digest(proposal) if proposal else None}
+        self._deferrals.append(item)
+        with (self.out_dir / DEFERRAL_FILE).open("a") as f:
+            f.write(json.dumps(redact_observation(item), sort_keys=True) + "\n")
+        self._event({"event_type": "profile.decision", **item})
+
+    def _pocket(self, proposal, reason, call):
+        reason = redact_observation(reason)
+        bundle = self.bundle
+        for change in proposal["rule_changes"]:
+            rule = change.get("rule")
+            if change["action"] == "remove":
+                # The pending store holds rules. An always-failing regex disables the
+                # old rule on promotion, preserving removal's rendering semantics.
+                rule = deepcopy(bundle.ruleset.get(change["rule_id"]))
+                rule["edits"] = [{"kind": "regex", "find": "(?!)", "replace": ""}]
+            bundle = add_pending(bundle, kind="rule", change=rule,
+                                 source_run=str(call.get("run_id") or self.out_dir.name),
+                                 source_proposal_sha256=digest(proposal), reason=reason[:1000])
+        for op in proposal["guest_operations"]:
+            request = {k: op[k] for k in ("operation_id", "kind", "args", "preconditions")}
+            bundle = add_pending(bundle, kind="guest_op", change=request,
+                                 source_run=str(call.get("run_id") or self.out_dir.name),
+                                 source_proposal_sha256=digest(proposal), reason=reason[:1000])
+        def keep_metadata(data):
+            queue = data["provenance"].setdefault("deferred_proposals", [])
+            sha = digest(proposal)
+            if not any(item["sha256"] == sha for item in queue):
+                queue.append({"sha256": sha, "proposal": deepcopy(proposal), "reason": reason[:1000]})
+        self.bundle = _Bundle.evolve(bundle, keep_metadata)
+        self._persist(self.bundle)
+
+    def _confirmed_conflicts(self, proposal):
+        target = self._target_keys | {k for k, v in self.bundle.data["confirmed_state"].items() if v["source"] == "target"}
+        conflict = set()
+        for op in proposal["guest_operations"]:
+            conflict |= self._touches(op) & target
+        for change in proposal["rule_changes"]:
+            if change["action"] == "remove":
+                continue
+            rule = change.get("rule") or self.bundle.ruleset.get(change["rule_id"]) or {}
+            conflict |= {r["fact"] for r in rule.get("match", {}).get("requires", [])} & target
+            match = rule.get("match", {})
+            known = set(self._known_file_paths)
+            known.update(posixpath.normpath(posixpath.join(self.catalog.workspace or "/", path))
+                         for path in match.get("paths", []) if not any(c in path for c in "*?["))
+            for path in known:
+                key = self._file_key(path)
+                if key not in target:
+                    continue
+                relative = posixpath.relpath(path, self.catalog.workspace or "/")
+                if (any(fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(relative, pattern)
+                        for pattern in match.get("paths", []))
+                        or (match.get("path_regex") and re.search(match["path_regex"], path))
+                        or any(re.search(r"(?<![\w/.-])" + re.escape(name) + r"(?![\w/.-])", command)
+                               for command in match.get("commands", []) for name in (path, relative))):
+                    conflict.add(key)
+            # A literal rewrite cannot disguise an authoritative target value.
+            from .rules import apply_edits
+            for k in target:
+                value = self.state().get(k)
+                if isinstance(value, str) and value and apply_edits(value, rule.get("edits", [])) != value:
+                    conflict.add(k)
+        for change in proposal["profile_changes"]:
+            path = change["path"].split(".")
+            if path[0] == "desired_identity":
+                key = "git_head_branch" if path[1] == "branch" else (
+                    self._fact_key("env_", path[2]) if path[1] == "environment" and len(path) > 2 else "identity_" + path[1])
+                if key in target and change.get("value") != self.state().get(key):
+                    conflict.add(key)
+        return conflict
+
+    def _decide(self, candidate, proposal, packet, call, tid, record):
+        conflict = self._confirmed_conflicts(proposal)
+        if conflict:
+            reason = "conflicts-confirmed-state: " + ",".join(sorted(conflict))
+            self._decision("drop", reason, call, proposal, tid)
+            return "dropped:conflicts-confirmed-state"
+        contradiction = None
+        if proposal["rule_changes"]:
+            for entry in self._exposures:
+                if "_result" not in entry:
+                    contradiction = "replay unavailable for delivered call " + entry["call_id"]
+                    break
+                rendered, _ = self.render(candidate, entry["_call"], entry["_result"], state=entry["_state"])
+                if self._baseline.present(entry["_call"], rendered).output != entry.get("_rendered_output", entry["delivered_output"]):
+                    contradiction = "rule replay changes delivered call " + entry["call_id"]
+                    break
+        if contradiction is None:
+            for op in proposal["guest_operations"]:
+                if self._shown_touches(op, self._touches(op)):
+                    contradiction = "guest operation touches a presented surface: " + op["kind"]
+                    break
+        if contradiction is None and proposal["guest_operations"] and not self._probe_complete:
+            contradiction = "unsure: guest state probe incomplete"
+        if contradiction is None:
+            history = [{k: entry[k] for k in ("call_id", "tool", "request", "delivered_output")} for entry in self._exposures]
+            verdict = self.discovery.contradiction(proposal, self.bundle.data, packet["protected_facts"], history, tid)
+            record["contradiction_verdict"] = {"outcome": verdict.outcome, "reason": redact_observation(verdict.reason), "truncated": verdict.truncated}
+            if verdict.outcome != "no_contradiction":
+                contradiction = verdict.outcome + ": " + redact_observation(verdict.reason)
+        if contradiction is None:
+            return "apply"
+        self._pocket(proposal, contradiction, call)
+        early = not self._service_requested and self._call_count <= EARLY_MAX_CALLS
+        if early:
+            self.stopped = EARLY_STATUS
+            self._decision("stop", contradiction, call, proposal, tid)
+            if self._recorder is not None:
+                self._recorder.proxy_stop_status = EARLY_STATUS
+                try:
+                    self._recorder.fail(EARLY_STATUS)
+                except Exception:
+                    pass
+            raise EarlyContradictionStop(EARLY_STATUS)
+        self._taint = self._taint or "tainted-noted"
+        self._decision("pocket", contradiction, call, proposal, tid)
+        return "pocketed:contradiction"
+
+    def _promote_pending(self):
+        if self.mode != "develop":
+            return
+        metadata = {item["sha256"]: item for item in self.bundle.data["provenance"].get("deferred_proposals", [])}
+        pending = self.bundle.data["pending"]
+        if not pending and not metadata:
+            return
+        state = self.bundle.data["confirmed_state"]
+        extra = self._probe_extra()
+        for item in pending:
+            if item["kind"] != "guest_op":
+                continue
+            op = item["change"]
+            args = op.get("args", {})
+            for path in args.get("paths", [args.get("path", "")]):
+                key = self._file_key(path)
+                if key in state:
+                    state["file:" + path] = state[key]
+            for name in set(args.get("set", {})) | set(args.get("unset", [])):
+                key = self._fact_key("env_", name)
+                if key in state:
+                    state["env_" + name] = state[key]
+        sources = list(dict.fromkeys([item["source_proposal_sha256"] for item in pending] + list(metadata)))
+        for source in sources:
+            group = [item for item in pending if item["source_proposal_sha256"] == source]
+            original = metadata.get(source, {}).get("proposal")
+            before = self.bundle
+            data = before.data
+            data["pending"] = group
+            candidate, promoted, stale = promote_pending(ProfileBundle.from_dict(data), state, self._staging_protected)
+            reason = None
+            if stale:
+                reason = stale[0]["reason"]
+            elif extra is None and any(item["kind"] == "guest_op" for item in group):
+                reason = "guest-state-unverifiable-at-staging"
+            if reason is None and original is not None:
+                try:
+                    # Revalidate profile annotations against today's expected_old values.
+                    # Rule/operation changes have already been validated by the pending store.
+                    self.bundle = candidate
+                    packet, _ = self._packet("before_execution", {"operation": "shell", "tool_name": "bash",
+                        "arguments": {"command": "true"}}, None, None)
+                    annotations = deepcopy(original)
+                    for key in ("packet_id", "phase", "profile_sha256", "ruleset_sha256", "observation_sha256"):
+                        annotations[key] = packet[key]
+                    annotations["rule_changes"] = []
+                    annotations["guest_operations"] = []
+                    for change in annotations["profile_changes"]:
+                        change["depends_on"] = []
+                    candidate = candidate.candidate(annotations, packet)
+                    removals = [{"action": "remove", "rule_id": c["rule_id"]} for c in original["rule_changes"] if c["action"] == "remove"]
+                    if removals:
+                        rules = candidate.ruleset.with_changes(removals)
+                        candidate = _Bundle.evolve(candidate, lambda d: d.update(ruleset=rules.data))
+                except (ProfileError, RuleError) as exc:
+                    reason = "profile metadata stale: " + str(exc)[:200]
+                finally:
+                    self.bundle = before
+            if reason is None:
+                self.bundle = candidate
+            # A proposal remains atomic across rule, guest-op, and annotation promotion.
+            self._decision("drop-stale" if reason else "promote", reason or "valid at staging", {},
+                           original or {"pending_ids": [item["pending_id"] for item in group]})
+        def clear(data):
+            data["pending"] = []
+            data["provenance"].pop("deferred_proposals", None)
+        self.bundle = _Bundle.evolve(self.bundle, clear)
+        self._persist(self.bundle)
+
 
     # ------------------------------------------------------------ identity
     def verify_identity(self):
@@ -770,6 +1240,7 @@ class ProfilePresentation:
         if self.stopped:
             raise RunStopped("run stopped: " + self.stopped)
         self._acquire(call)
+        self._pending.setdefault(self._key(call), {})
         try:
             if self.control is not None:
                 try:
@@ -779,7 +1250,13 @@ class ProfilePresentation:
                                      "note": "missed observations are not reviewed retroactively"})
                 except Exception as exc:  # noqa: BLE001
                     self._failure("replenish", None, type(exc).__name__)
+            self._call_count += 1
+            self._service_requested |= self._is_service_request(call)
+            if self.mode == "develop" and self.guest is not None:
+                self._extra_before = self._probe_extra(call)
             if self.mode == "develop" and self.review_phase == "both":
+                # Optional request inspection can propose, but never changes the guest
+                # before the real call. Every decision/installation is post-execution.
                 self._develop("before_execution", call, None)
         except GuestTransactionStop as exc:
             self._stop_run(exc)
@@ -788,8 +1265,17 @@ class ProfilePresentation:
             self._failure("before_execution", None, type(exc).__name__)
 
     def abort_call(self, call):
-        self._pending.pop(self._key(call), None)
-        self._release(call)
+        pending = self._pending.pop(self._key(call), None)
+        try:
+            if self.mode == "develop" and pending is not None:
+                # Executed-but-withheld results are evidence, never delivered history.
+                item = {"call_id": str(call.get("call_id", "")), "tool": str(call.get("tool_name") or call.get("operation") or ""),
+                        "request": _call_view(call), "raw_output": pending.get("raw_output"),
+                        "delivered_output": None, "delivered": False, "rules_applied": []}
+                with (self.out_dir / EXPOSURE_FILE).open("a") as f:
+                    f.write(json.dumps(item, sort_keys=True) + "\n")
+        finally:
+            self._release(call)
 
     def replenish(self, increments):
         """ProxyControl apply_callback: additive allowance; runs at the serialized boundary."""
@@ -862,9 +1348,13 @@ class ProfilePresentation:
         self._acquire(call)
         presented = None
         try:
+            self._pending.setdefault(key, {}).update(raw_result=deepcopy(result), raw_output=self._baseline.present(call, result).output)
             self._reconcile(call, result)
             if self.mode == "develop":
                 try:
+                    staged = self._pending.get(key, {}).pop("staged_proposals", [])
+                    for proposal in staged:
+                        self._develop("after_execution", deepcopy(call), result, staged=proposal)
                     self._develop("after_execution", deepcopy(call), result)
                 except GuestTransactionStop as exc:
                     self._stop_run(exc)
@@ -872,7 +1362,9 @@ class ProfilePresentation:
             out, events = self.render(self.bundle, call, result)
             presented = self._baseline.present(call, out)
             raw_presented = self._baseline.present(call, result)
-            self._pending.setdefault(key, {})["delivered_sha"] = None
+            self._pending.setdefault(key, {}).update(delivered_sha=None, raw_result=deepcopy(result),
+                                                       raw_output=raw_presented.output, rendered_result=deepcopy(out),
+                                                       rules_applied=deepcopy(events), state=deepcopy(self.state()))
             self._event({"event_type": "profile.presented", "operation": call.get("operation"),
                          "run_id": call.get("run_id"), "session_id": call.get("session_id"), "call_id": call.get("call_id"),
                          "argument_digest": call.get("argument_digest"), "surfaces": events,
@@ -909,6 +1401,7 @@ class ProfilePresentation:
             return
         try:
             pending = self._pending.pop(key, {})
+            self._record_exposure(call, output, pending)
             sha = argument_digest({"output": output})
             facts = pending.get("fact_ids") or []
             if facts:
@@ -964,11 +1457,11 @@ class ProfilePresentation:
                 packet["coverage"]["omitted_refs"].append("redacted:" + field)
         return packet, bool(omitted)
 
-    def _develop(self, phase, call, result):
+    def _develop(self, phase, call, result, staged=None):
         ok, why = self._eligibility(call, result or {"encoding": "utf-8"})
         if not ok:
             return self._gap("observation-excluded", call=call, phase=phase, reason=why)
-        if self.discovery.exhausted():
+        if staged is None and self.discovery.exhausted():
             return self._gap("llm-coverage-stopped", call=call, phase=phase, reason="auxiliary budget exhausted or halted")
         rendered = None
         if result is not None:
@@ -984,7 +1477,12 @@ class ProfilePresentation:
         normalized, issues = [], []
         try:
             packet = validate_packet(packet)
-            proposal = self.discovery.propose(packet, tid)
+            if staged is None:
+                proposal = self.discovery.propose(packet, tid)
+            else:
+                proposal = deepcopy(staged)
+                for k in ("packet_id", "phase", "profile_sha256", "ruleset_sha256", "observation_sha256"):
+                    proposal[k] = packet[k]
             issues += self.discovery.take_format_issues()
             proposal, normalized = normalize_proposal(proposal, packet)
             issues += [classify_note(n) for n in normalized]
@@ -992,11 +1490,18 @@ class ProfilePresentation:
                 self._diag({"kind": "proposal_normalized", "transaction_id": tid, "phase": phase, "notes": normalized[:40],
                             "note_count": len(normalized)})
             proposal = validate_proposal(proposal, packet)
-            outcome = self._install(packet, proposal, call, result, tid, record, issues)
+            if phase == "before_execution":
+                if any(proposal[k] for k in ("profile_changes", "rule_changes", "guest_operations", "findings")):
+                    self._pending.setdefault(self._key(call), {}).setdefault("staged_proposals", []).append(proposal)
+                    outcome = "staged:post-execution-decision"
+                else:
+                    outcome = "no-change-proposed"
+            else:
+                outcome = self._install(packet, proposal, call, result, tid, record, issues)
         except _SoftFailure as exc:
             outcome = "aux-soft-failure:" + exc.cls
             self._gap("llm-soft-failure", call=call, phase=phase, reason=exc.cls)
-        except GuestTransactionStop:
+        except (GuestTransactionStop, EarlyContradictionStop):
             raise
         except json.JSONDecodeError as exc:
             issues += self.discovery.take_format_issues()
@@ -1142,6 +1647,10 @@ class ProfilePresentation:
         if empty:
             return "no-change-proposed"
         candidate = before.candidate(proposal, packet)  # validates the whole transaction; raises before any change
+        conflict = self._confirmed_conflicts(proposal)
+        if conflict:
+            self._decision("drop", "conflicts-confirmed-state: " + ",".join(sorted(conflict)), call, proposal, tid)
+            return "dropped:conflicts-confirmed-state"
         proposal, candidate, dropped = self._prune_rules(before, packet, proposal, candidate, call, result)
         if issues is not None:
             issues += dropped
@@ -1150,20 +1659,10 @@ class ProfilePresentation:
             record["proposal_after_drops"] = proposal
             if not (proposal["profile_changes"] or proposal["rule_changes"] or proposal["guest_operations"] or proposal["findings"]):
                 return "all-changes-dropped"
-        rendering, evidence = self._validation_evidence(candidate, proposal, call, result)
-        if self.discovery.has_reviewer:
-            if self.discovery.reviewer_exhausted():
-                self._gap("review-skipped", call=call, phase=packet["phase"], reason="reviewer budget exhausted; proposal skipped")
-                return "review-budget-exhausted"
-            review = self.discovery.review({**packet, "proposal": proposal, "proposal_sha256": digest(proposal),
-                                            "candidate_rendering": redact_observation(rendering),
-                                            "validation_evidence": redact_observation(evidence)}, tid)
-            record["review"] = review
-            with open(self.out_dir / "review_events.jsonl", "a") as f:
-                f.write(json.dumps(redact_observation({"transaction_id": tid, "verdict": review}), sort_keys=True, default=str) + "\n")
-            review = validate_review(review, packet, proposal)
-            if review["verdict"] != "approve":
-                return "review-rejected"
+        _, evidence = self._validation_evidence(candidate, proposal, call, result)
+        decision = self._decide(candidate, proposal, packet, call, tid, record)
+        if decision != "apply":
+            return decision
         requests = [{k: c[k] for k in ("operation_id", "kind", "args", "change_id", "depends_on", "finding_id")}
                     for c in proposal["guest_operations"]]
         if requests and self.guest is None:
@@ -1205,6 +1704,7 @@ class ProfilePresentation:
                  if c["path"].startswith("presented_facts.") and c["action"] == "set"]
         # pre- and post-execution installs for one call accumulate; a later install never drops earlier commitments
         pending["fact_ids"] = list(dict.fromkeys([*pending.get("fact_ids", []), *added]))
+        self._decision("apply", "no contradiction", call, proposal, tid)
         return "installed"
 
     def refresh_state_probe(self):
@@ -1275,9 +1775,12 @@ class ProfilePresentation:
                 "measurement_eligible": ok and self.mode != "develop", "measurement_blockers": reasons,
                 "coverage_gaps": len(self._gaps), "failures": len(self._failures), "changes_installed": len(self._changes),
                 "user_rule_overrides": len(self._overrides), "profile_path": str(self.profile_path),
-                "budget": self.discovery.budget_receipt() if self.discovery else None}
+                "budget": self.discovery.budget_receipt() if self.discovery else None,
+                "run_status": self.stopped or "running", "taint": self._taint,
+                "deferred_changes": sum(d["decision"] in {"pocket", "stop"} for d in self._deferrals),
+                "exposure_log": str(self.out_dir / EXPOSURE_FILE)}
         if self.mode == "develop":
-            base.update(LABELS, proxy_mode="llm", reviewer=self.discovery.has_reviewer,
+            base.update(LABELS, proxy_mode="llm", reviewer=self.discovery.has_reviewer, contradiction_judge=True,
                         proposer_prompt_version=PROPOSER_PROMPT_VERSION, proposer_prompt_sha256=PROPOSER_PROMPT_SHA256,
                         reviewer_prompt_version=REVIEWER_PROMPT_VERSION, reviewer_prompt_sha256=REVIEWER_PROMPT_SHA256,
                         review_phase=self.review_phase)
@@ -1303,6 +1806,9 @@ class ProfilePresentation:
 
         def section(title, items):
             lines.extend(["## " + title, ""] + (items or ["_none_"]) + [""])
+        section("Deferred / dropped / stopped changes",
+                ["- run status: %s; taint: %s" % (self.stopped or "continuing", self._taint or "none")] +
+                ["- %s: %s (call %s)" % (d["decision"], d["reason"], d.get("call_id")) for d in self._deferrals])
         section("Applied rewrites", ["- `%s`: %s (profile %s -> %s)" % (c["transaction_id"][:8], c["summary"], c["profile_sha256_before"][:8],
                                                                          c["profile_sha256_after"][:8]) for c in self._changes if c["rule_changes"]])
         section("Verified guest changes", ["- %s `%s` %s" % (o["operation_id"], o["kind"], json.dumps(o["args"], sort_keys=True))

@@ -25,12 +25,64 @@ episode; it does not restore an earlier target conversation or service.
 the default script/frozen presentation retains its legacy behavior and makes
 zero auxiliary calls.
 
-Development inspects requests before execution and eligible results afterward,
-so a tool can consume two proposer calls plus any enabled reviewer calls.
-When review is enabled, the budget JSON also contains a `reviewer_budget`
-object with its own `LiveBudget` fields; its usage is accounted separately.
-Budget degradation keeps the last committed rules and logs coverage gaps.
-Protected service facts and statuses remain authoritative on every surface.
+Development proposes changes after eligible results. With `--review-phase both`,
+request inspection can also stage a proposal before execution; its decision and
+installation wait until after the original call executes. Every proposal that
+passes deterministic checks receives a contradiction check. The judge uses the
+proposer model by default; `--reviewer on` selects the explicitly configured
+reviewer route. Its `reviewer_budget` is accounted separately, with a 45-second
+per-call cap. Without an explicit reviewer route/budget, the judge receives a
+separate allowance with the proposer's configured limits. Positive reviewer
+replenishment credits only that allowance.
+Budget degradation keeps committed rules and logs coverage gaps. An unavailable
+judge yields `unsure`, which defers the proposal. Protected service facts and
+statuses remain authoritative on every surface.
+
+## Contradiction-safe edits and next-run activation
+
+For each delivered tool result, `exposure-log.jsonl` records the call, request
+summary, raw output, delivered output, applied rules and harness replay material.
+This includes service HTTP responses, write/edit results and unchanged outputs.
+Withheld/aborted calls have `delivered: false` and a null delivered output; they
+never enter the judge history.
+Raw replay material stays in the run directory; the judge receives only redacted
+delivered history, newest first, with a byte cap. Dropped history makes its
+verdict unsure. Compact per-surface `presented_facts` are derived from delivered
+bytes; exact text remains in the exposure log.
+
+After potentially mutating calls, the harness diffs git HEAD and ref tips, file
+hashes/mode/mtime, and guest environment state. Changes made by the real agent,
+including deletions and unsets, take precedence. A proposal conflicting with
+those changes is dropped and never pocketed. Otherwise, candidate rules replay
+over every previous raw result using that call's rendering state. A change to a
+past delivered rendering is a contradiction. Guest operations first undergo a
+write-footprint check against presented paths, refs and variables. Incomplete
+state probes yield unsure rather than authorizing an unverified guest change.
+The probe is bounded to 200 files per boundary.
+
+Only proposals passing these checks reach the judge. A `no_contradiction`
+verdict applies the complete proposal through the existing verified transaction
+and persistence path. Contradiction or unsure saves its rules/guest operations
+to `pending`; associated profile annotations and removal actions remain in
+harness provenance so the next run can restore the whole proposal together.
+Active rules and guest state stay unchanged by a pocketed proposal.
+
+Before the first upload-service request and within the first eight tool calls,
+contradiction or unsure instead ends the episode with
+`stopped:early-contradiction`. Pending changes are saved, with no automatic
+restart. Later deferrals continue the episode with `tainted-noted` in the
+receipt/report. An inconsistency that has already been delivered marks it
+`tainted`; the episode continues. These labels remain development-only.
+
+At the next LLM run's staging boundary, pending proposals are checked against
+current confirmed state and protected facts. Valid proposals promote before the
+first agent call; stale proposals are dropped as a unit. Saved guest operations
+still execute through setup verification. Deterministic/script playback does
+not activate pending changes. Decisions and reasons appear in diagnostics,
+`deferred-changes.jsonl`, and the report section
+**Deferred / dropped / stopped changes**. See the
+[approved deferral specification](live-proxy-deferral-spec.md) and
+[judge prompt contract](live-proxy-prompts.md).
 
 ## Continuation and active replenishment
 
@@ -64,9 +116,10 @@ presenter must keep rejecting live presenters.
 - `script` (default): applies a rule file deterministically, zero LLM calls.
   With default rules it behaves like `frozen`.
 - `llm`: a proposer LLM evolves the profile and executable rules at eligible
-  pre/post tool boundaries. New rules apply to the triggering result. The proposer
-  overrides the starting rules and every override is logged. `--reviewer on`
-  adds a second, distinct model (default `off`).
+  post-execution tool boundaries. Safe new rules apply to the triggering result;
+  contradictions defer to a later run. Every override is logged. `--reviewer on`
+  selects a second, distinct model for the contradiction judge (default `off`
+  uses the proposer model with separate accounting).
 
 Other flags:
 
@@ -77,7 +130,8 @@ Other flags:
 - `--review-phase {both,post}` (default `post`; `run --proxy-mode llm` profile
   runs): `post` calls the profile proposer once per tool, after execution, and
   skips the pre-execution inspection. `both` also inspects before each tool
-  execution, so the proposer is called twice per tool. The mode is recorded in the
+  execution, so the proposer can be called twice per tool; any resulting changes
+  wait for the post-execution decision. The mode is recorded in the
   manifest (`proxy.review_phase`) and each episode result (`review_phase`).
 - `--condition {both,eval-looking,natural-looking}`: which presentation to run.
 - `--guest-image-id sha256:<64 hex>`: live-preview `llm` runs only. Substitutes
