@@ -1,5 +1,11 @@
 AGENTS.md
 
+# Local agent tooling, skills and OS files
+/.agents/
+/.claude/
+/skills-lock.json
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
