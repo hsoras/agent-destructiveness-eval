@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -48,6 +49,34 @@ RUNTIME_SOURCE_COMMIT = "8ba2a9171597262df9d19516c82a5e14f18f5c63"
 PLUGIN_PACKAGE_VERSION = "1.14.41"
 ROUTER_SOURCES = Path(__file__).resolve().parents[2] / "runtime" / "artifact_upload_host" / "router"
 _DEFAULT_SOURCE = "/Users/sarosh/programming/agent-destructiveness-eval"
+_MANAGED_ENV_DENY = re.compile(r"^(ARTIFACT|UPLOAD|SERVICE|QUOTA|BEARER|LD_|DYLD_|PYTHON|GIT_|SSL_|CURL_|HTTP|NO_PROXY|ALL_PROXY)|TOKEN|SECRET|PASSW|CRED|AUTH|API_?KEY|PRIVATE|(^|_)(URL|URI|HOST|HOSTNAME|ENDPOINT|PORT|PROXY|PATH|HOME|USER|LOGNAME|SHELL|PWD|OLDPWD|IFS|PS4|PROMPT_COMMAND|BASH_ENV|ENV)(_|$)")
+_MANAGED_EXPORT = re.compile(r"export ([A-Z][A-Z0-9_]{0,63})='([A-Za-z0-9_.:/+@=,-]{0,200})'")
+_MANAGED_UNSET = re.compile(r"unset ([A-Z][A-Z0-9_]{0,63})")
+_MANAGED_ENV_READ = r'''import os,stat,json
+base='/home/alex'
+flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_DIRECTORY
+fd=os.open(base,flags)
+try:
+  for part in ('.config','workspace-profile'):
+    nxt=os.open(part,flags,dir_fd=fd); os.close(fd); fd=nxt
+  result=[]
+  for name in ('env.sh','env-vars.sh'):
+    try:
+      f=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=fd)
+      try:
+        st=os.fstat(f)
+        if not stat.S_ISREG(st.st_mode) or st.st_size>65536: result.append(''); continue
+        data=b''
+        while len(data)<=65536:
+          b=os.read(f, min(8192,65537-len(data)))
+          if not b: break
+          data+=b
+        result.append(data[:65536].decode('utf-8','replace') if len(data)<=65536 else '')
+      finally: os.close(f)
+    except OSError: result.append('')
+  print(json.dumps(result))
+finally: os.close(fd)
+'''
 
 # Flags that disable project/plugin/LSP/formatter/skill/update paths in the host runtime.
 # OPENCODE_PURE is deliberately absent: it would also disable the router plugin.
@@ -812,6 +841,16 @@ class GuestWorkerSession:
 
     def __init__(self, container: str, run_id: str, *, guest_root: str, python_path: str = "/opt/worker",
                  environment: Mapping[str, str] | None = None, poll_interval: float = 0.05):
+        self.container, self.guest_root = container, guest_root
+        # The profile is resolved from the host's pinned world manifest, never from guest-controlled state.
+        self._managed_home = None
+        try:
+            world = json.loads((Path(__file__).resolve().parents[2] / "project/artifact-upload/instance.lock.json").read_text())
+            profile = next((p for p in world["guest_profiles"] if p.get("worktree") == guest_root), None)
+            if profile and profile.get("condition") == "natural-looking":
+                self._managed_home = profile["home"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1", **(environment or {})}
         # The worker runs as root so its source and run state can be unreadable to the agent; it drops every
         # agent-driven shell, file operation and search to the guest account's uid/gid.
@@ -840,10 +879,54 @@ class GuestWorkerSession:
         return reply
 
     def execute(self, call: dict[str, Any]) -> dict[str, Any]:
-        return self._rpc({"op": "execute", "call": call})["result"]
+        return self._rpc({"op": "execute", "call": self._with_managed_env(call)})["result"]
+
+    def _with_managed_env(self, call: dict[str, Any]) -> dict[str, Any]:
+        """Passively parse trusted-profile env files on the host; never evaluate guest shell text."""
+        if not self._managed_home or call.get("tool_name") != "bash" or call.get("operation") != "shell":
+            return call
+        copied = dict(call)
+        copied["arguments"] = dict(call["arguments"])
+        explicit_env = call["arguments"].get("env", {})
+        env: dict[str, str] = {k: v for k, v in explicit_env.items() if k != "BASH_ENV"}
+        env["BASH_ENV"] = "/dev/null"
+        try:
+            reader = _MANAGED_ENV_READ.replace("base='/home/alex'", "base=" + repr(self._managed_home))
+            done = subprocess.run(["docker", "exec", "-u", "0", self.container, "python", "-c", reader],
+                                  capture_output=True, text=True, timeout=10)
+            if done.returncode:
+                copied["arguments"]["env"] = env
+                return copied
+            files = json.loads(done.stdout)
+            if not isinstance(files, list) or len(files) != 2 or any(not isinstance(x, str) for x in files):
+                copied["arguments"]["env"] = env
+                return copied
+        except (OSError, subprocess.SubprocessError, ValueError):
+            copied["arguments"]["env"] = env
+            return copied
+        managed_env: dict[str, str] = {}
+        unset: set[str] = set()
+        for text in files:
+            for line in text.splitlines():
+                if (m := _MANAGED_EXPORT.fullmatch(line)) and not _MANAGED_ENV_DENY.search(m.group(1)):
+                    managed_env[m.group(1)] = m.group(2)
+                elif (m := _MANAGED_UNSET.fullmatch(line)) and not _MANAGED_ENV_DENY.search(m.group(1)):
+                    managed_env.pop(m.group(1), None); unset.add(m.group(1))
+        # Preserve normal shell-call precedence: explicit call env is applied after managed values.
+        env.update(managed_env)
+        env.update({k: v for k, v in explicit_env.items() if k != "BASH_ENV"})
+        unset.difference_update(explicit_env)
+        # The worker protocol exposes additions but no env deletion operation. A fixed argv wrapper
+        # carries literal unsets while preserving the original command as one quoted bash -c argument.
+        command = call["arguments"]["command"]
+        if unset:
+            command = "exec /usr/bin/env " + " ".join("-u " + shlex.quote(name) for name in sorted(unset)) + " bash -c " + shlex.quote(command)
+        copied["arguments"]["command"] = command
+        copied["arguments"]["env"] = env
+        return copied
 
     def start(self, call: dict[str, Any]) -> dict[str, Any]:
-        return self._rpc({"op": "start", "call": call})["handle"]
+        return self._rpc({"op": "start", "call": self._with_managed_env(call)})["handle"]
 
     def stream(self, key: dict[str, str]) -> Iterator[dict[str, Any]]:
         while self.status(key)["state"] != "completed":
