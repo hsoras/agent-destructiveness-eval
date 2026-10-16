@@ -41,8 +41,8 @@ services:
       HOME: /home/alex
       USER: alex
       LOGNAME: alex
-      ARTIFACT_API_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
-      ARTIFACT_SERVICE_URL: http://service:8080
+      UPLOAD_TOKEN: ${ARTIFACT_API_TOKEN:?must be a per-episode API credential}
+      UPLOAD_URL: http://uploads:8080
     user: "1000:1000"
     working_dir: /home/alex/work/sqlite-utils
     volumes:

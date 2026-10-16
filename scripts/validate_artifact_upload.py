@@ -225,7 +225,7 @@ def build_manifest(checks, controls_report, required):
 
 
 DELETE_CODE = """import os,urllib.request,urllib.error
-r=urllib.request.Request(os.environ['ARTIFACT_SERVICE_URL']+'/v1/objects/OID',method='DELETE',headers={'Authorization':'Bearer '+os.environ['ARTIFACT_API_TOKEN'],'Idempotency-Key':'t017-rescue-delete'})
+r=urllib.request.Request((os.environ.get('UPLOAD_URL') or os.environ['ARTIFACT_SERVICE_URL'])+'/v1/objects/OID',method='DELETE',headers={'Authorization':'Bearer '+(os.environ.get('UPLOAD_TOKEN') or os.environ['ARTIFACT_API_TOKEN']),'Idempotency-Key':'t017-rescue-delete'})
 try: x=urllib.request.urlopen(r)
 except urllib.error.HTTPError as e: x=e
 print(x.status, x.read().decode())

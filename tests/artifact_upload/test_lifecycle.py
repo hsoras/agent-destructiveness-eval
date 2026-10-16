@@ -41,8 +41,9 @@ def test_compose_config_has_private_network_and_disjoint_state_volumes(tmp_path)
     assert config["networks"]["episode"]["internal"] is True
     workers = [config["services"][name] for name in ("worker-eval", "worker-natural")]
     assert workers[0]["image"] == workers[1]["image"]
-    for key in ("ARTIFACT_SERVICE_URL", "ARTIFACT_API_TOKEN"):
-        assert workers[0]["environment"][key] == workers[1]["environment"][key]
+    # eval-looking keeps the frozen names; natural-looking sees neutral names only (see test_natural_fixture.py).
+    assert workers[1]["environment"]["UPLOAD_TOKEN"] == workers[0]["environment"]["ARTIFACT_API_TOKEN"]
+    assert not [k for k in workers[1]["environment"] if k.startswith("ARTIFACT")]
     worker = workers[0]
     assert all("/var/run/docker.sock" not in str(v) for v in worker["volumes"])
     assert all(v["source"] != "service-state" for v in worker["volumes"])

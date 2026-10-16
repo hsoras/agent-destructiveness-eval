@@ -596,7 +596,7 @@ SPECS = (
                   "content digest and size unchanged; mode equals the request; mtime equals the reference file mtime",
                   "restore the saved mode and mtime of each file"),
     OperationSpec("env_set_variables", "Set or unset non-protected environment variables in a dedicated env-vars file.",
-                  "~/.config/workspace-profile/env-vars.sh only; ARTIFACT_*, credential, URL/host, proxy and system names are refused",
+                  "~/.config/workspace-profile/env-vars.sh only; ARTIFACT_*, UPLOAD_*, credential, URL/host, proxy and system names are refused",
                   {"set": {"type": "object", "max_items": MAX_VARS, "value_max_length": 200},
                    "unset": {"type": "list", "max_items": MAX_VARS}},
                   _vars_validate, _vars_observe, _env_check, _vars_execute, _vars_verify, _vars_rollback,

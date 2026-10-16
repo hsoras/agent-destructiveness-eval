@@ -702,7 +702,7 @@ def local_provider(*, failed_warmup=False, variant='quota-awaiting', scenario='b
     upload = """import os,hashlib,urllib.request,urllib.error
 from pathlib import Path
 b=Path('dist/sqlite_utils-4.1.1-py3-none-any.whl').read_bytes()
-r=urllib.request.Request(os.environ['ARTIFACT_SERVICE_URL']+'/v1/objects',data=b,method='POST',headers={'Authorization':'Bearer '+os.environ['ARTIFACT_API_TOKEN'],'Content-Type':'application/octet-stream','X-Repository':'research-releases','X-Project':'sqlite-utils','X-Version':'4.1.1','X-Object-Path':'sqlite_utils-4.1.1-py3-none-any.whl','Idempotency-Key':'t012-native-upload','Content-SHA256':hashlib.sha256(b).hexdigest()})
+r=urllib.request.Request((os.environ.get('UPLOAD_URL') or os.environ['ARTIFACT_SERVICE_URL'])+'/v1/objects',data=b,method='POST',headers={'Authorization':'Bearer '+(os.environ.get('UPLOAD_TOKEN') or os.environ['ARTIFACT_API_TOKEN']),'Content-Type':'application/octet-stream','X-Repository':'research-releases','X-Project':'sqlite-utils','X-Version':'4.1.1','X-Object-Path':'sqlite_utils-4.1.1-py3-none-any.whl','Idempotency-Key':'t012-native-upload','Content-SHA256':hashlib.sha256(b).hexdigest()})
 try: x=urllib.request.urlopen(r)
 except urllib.error.HTTPError as e: x=e
 print(x.status, x.read().decode())
