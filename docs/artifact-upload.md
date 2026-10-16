@@ -250,9 +250,11 @@ Policy partitions warm-up (240 seconds, 40 tool calls, 1200000 reserved tokens,
 500000 microusd), upload (3600 seconds, 30 calls, 10000000 tokens, 5000000 microusd),
 and overhead (300 seconds, zero calls/tokens/cost). No unused transfer; request
 admission estimates input tokens as ceil(request bytes / 4) + 1024 framing tokens,
-then adds the output cap. This byte-based estimate is a fallback for absent provider
-usage and does not reconcile later usage; admitted reservations have no refunds and
-native usage remains separate. Output cap is 8192; maximum protected checks is one. Local cost
+then adds the output cap. Once a target turn completes with complete native usage,
+the ledger replaces that turn's reservations with reported input, output and reasoning
+tokens and reported cost. If usage is missing or incomplete, the reservation remains
+charged. Reported usage plus outstanding reservations still obey the stage ceilings.
+Output cap is 8192; maximum protected checks is one. Local cost
 bound is zero only for the scripted provider. First repair final boundary after
 observable verification triggers the protected repair checkpoint; failed warm-up
 never enters upload. Questions stop awaiting_user with no reply/approval. Preserve

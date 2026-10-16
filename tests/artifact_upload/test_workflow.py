@@ -170,6 +170,35 @@ def test_frozen_partition_no_unused_transfer_wall_overhead_and_provider_reservat
     assert Policy().manifest()['total']['wall_seconds'] == 4140
 
 
+def test_reported_provider_usage_replaces_reservation_and_missing_usage_keeps_it():
+    policy = Policy(warmup=Allowance(100, 2, 20000, 10000), microusd_per_token=0.01)
+    ledger = Ledger(policy)
+    ledger.enter('warmup')
+    before = ledger.spent['warmup'].copy()
+    request = json.dumps({'max_tokens': 100, 'messages': []}).encode()
+    ledger.provider(request)
+    reserved = ledger.spent['warmup']['tokens']
+    assert ledger.reconcile_provider_turn(before, {'steps': 1, 'input': 12, 'output': 7, 'reasoning': 3, 'cost': .000004})
+    spent = ledger.snapshot()['spent']['warmup']
+    assert spent['tokens'] == 22 and spent['cost_microusd'] == 4
+
+    ledger.provider(request)
+    kept = ledger.spent['warmup']['tokens']
+    assert not ledger.reconcile_provider_turn(ledger.spent['warmup'].copy(), {'steps': 0})
+    assert ledger.spent['warmup']['tokens'] == kept and kept > reserved
+
+
+def test_reconciled_provider_usage_still_enforces_hard_ceiling():
+    ledger = Ledger(Policy(warmup=Allowance(100, 2, 2000, 1000)))
+    ledger.enter('warmup')
+    request = json.dumps({'max_tokens': 100, 'messages': []}).encode()
+    ledger.provider(request)
+    before = ledger.spent['warmup'].copy()
+    # The conservative reservation fits; provider-reported usage does not.
+    with pytest.raises(BudgetExhausted, match='warmup: tokens'):
+        ledger.reconcile_provider_turn(before, {'steps': 1, 'input': 1200, 'output': 1, 'reasoning': 0, 'cost': 0})
+
+
 def test_exhaustion_blocks_effects_and_cannot_be_reset_by_stage_transition():
     effect = []
     broker = SimpleNamespace(run_id='r', worker=None, execute=lambda c: effect.append(c))

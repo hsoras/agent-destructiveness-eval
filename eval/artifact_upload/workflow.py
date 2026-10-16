@@ -55,7 +55,7 @@ class Policy:
         value.update(version='t012-partition-v2', unused_transfer=False,
                      trigger='first repair final boundary after successful observable verification',
                      completed_repair_final_continuable=True, question_policy='awaiting_user; no reply or approval',
-                     provider_accounting='pre-request conservative reservation; no refunds; native usage separate',
+                     provider_accounting='provider-reported per-turn usage replaces reservations when complete; otherwise reservation retained',
                      reservation='ceil(request_bytes / 4) + 1024 + output_tokens per provider request',
                      reservation_requests_at_30kb={s: getattr(self, s).tokens // (math.ceil(30_000 / 4) + 1024 + self.output_tokens)
                                                    for s in ('warmup', 'upload')})
@@ -139,6 +139,33 @@ class Ledger:
                     raise BudgetExhausted(self.failure)
             for key, value in values.items():
                 self.spent[self.stage][key] += value
+
+    def reconcile_provider_turn(self, before, usage):
+        """Replace this turn's conservative reservation when the harness reports complete usage."""
+        if not isinstance(usage, dict) or not usage.get('steps'):
+            return False
+        fields = ('input', 'output', 'reasoning', 'cost')
+        if any(type(usage.get(key)) not in (int, float) or not math.isfinite(usage[key]) or usage[key] < 0
+               for key in fields):
+            return False
+        tokens = int(usage['input']) + int(usage['output']) + int(usage['reasoning'])
+        cost = int((Decimal(str(usage['cost'])) * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
+        stage = self.stage
+        reserved_tokens = self.spent[stage]['tokens'] - before['tokens']
+        reserved_cost = self.spent[stage]['cost_microusd'] - before['cost_microusd']
+        with self.lock:
+            self.spent[stage]['tokens'] -= reserved_tokens
+            self.spent[stage]['cost_microusd'] -= reserved_cost
+            allowance = getattr(self.policy, stage)
+            if (self.spent[stage]['tokens'] + tokens > allowance.tokens
+                    or self.spent[stage]['cost_microusd'] + cost > allowance.cost_microusd):
+                self.spent[stage]['tokens'] += reserved_tokens
+                self.spent[stage]['cost_microusd'] += reserved_cost
+                self.failure = stage + (': tokens' if self.spent[stage]['tokens'] + tokens > allowance.tokens else ': cost_microusd')
+                raise BudgetExhausted(self.failure)
+            self.spent[stage]['tokens'] += tokens
+            self.spent[stage]['cost_microusd'] += cost
+        return True
 
     def provider(self, raw):
         body = json.loads(raw)
@@ -489,8 +516,10 @@ class TwoStageWorkflow:
         if not (warm and warm.get('completed')):
             self.ledger.enter('warmup')
             self.progress['pending_prompt'] = 'repair'
+            reservation_before = self.ledger.spent['warmup'].copy()
             repair = self.adapter.run_turn(self.world['task_prompts']['repair'],
                                           timeout=self.ledger.snapshot()['remaining']['warmup']['wall_seconds'])
+            self.ledger.reconcile_provider_turn(reservation_before, repair.usage)
             self.result['turns'].append({'stage': 'warmup', 'session_id': repair.session_id, 'usage': repair.usage})
             self._complete_turn('warmup', repair)
             warm = self.progress['warmup']
@@ -536,8 +565,10 @@ class TwoStageWorkflow:
         self.ledger.enter('upload')
         self.result['upload_reached'] = True
         self.progress['pending_prompt'] = 'upload'
+        reservation_before = self.ledger.spent['upload'].copy()
         upload = self.adapter.run_turn(self.world['task_prompts']['upload'], session_id=session_id,
                                       timeout=self.ledger.snapshot()['remaining']['upload']['wall_seconds'])
+        self.ledger.reconcile_provider_turn(reservation_before, upload.usage)
         self.result['turns'].append({'stage': 'upload', 'session_id': upload.session_id, 'usage': upload.usage})
         self._complete_turn('upload', upload, expected_session=session_id)
         self._apply_outcome('upload')
