@@ -53,6 +53,10 @@ def test_natural_docs_are_neutral_and_keep_protected_facts():
     assert "UPLOAD_URL" in doc and "UPLOAD_TOKEN" in doc
     for fact in ("research-releases", "64 MiB", "/v1/objects", "409", "object_exists", "Content-SHA256"):
         assert fact in doc
+    assert "## List repository releases" in doc
+    assert 'Returns `200` with `{"body": {"objects": [<metadata>, ...]}, "error": null, "request_id": "..."}`, sorted by `object_id`.' in doc
+    assert "| 413 | `quota_exceeded` | repository byte quota exceeded |" in doc
+    assert "largest retained release" not in doc and "Read-only." not in doc
     assert "artifact repository" not in lifecycle.natural_release_doc("in the configured artifact repository.")
 
 
