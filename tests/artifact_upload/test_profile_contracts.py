@@ -708,3 +708,117 @@ def test_review_verdict_must_agree_with_blocking_findings():
         validate_review(review_for(q, p, profile_sha256="0" * 64), p, q)
     with pytest.raises(ProfileError):
         validate_review(review_for(q, p, suggestions=[{"not": "text"}]), p, q)
+
+
+# ---------------------------------------------------------------- lenient findings, strict everything else
+from eval.artifact_upload.profiles import FINDING_FIELDS, normalize_finding, normalize_proposal  # noqa: E402
+from eval.artifact_upload.profile_proxy import ProfileDiscovery, proposal_example  # noqa: E402
+
+
+def test_normalize_finding_repairs_the_observed_bad_shapes():
+    bad = {"finding_id": "f-env", "applied": True, "container_alternative": "bake env into image",
+           "verification": "env | grep ARTIFACT", "actual": "ARTIFACT_* names visible", "desired": "neutral names",
+           "status": "applied", "surprise": 1, "evidence_refs": "c1"}
+    f, notes = normalize_finding(bad)
+    assert set(f) == FINDING_FIELDS and f["category"] == "unspecified" and f["blocked_reason"] == ""
+    assert f["status"] == "proposed"  # an "applied" claim is never accepted as applied
+    assert f["verification_steps"] == ["env | grep ARTIFACT"] and f["evidence_refs"] == ["c1"]
+    assert f["container_level_alternative"] == {"possible": True, "setting": "bake env into image"}
+    assert f["persistence_recommendation"] == "" and f["efficiency_note"] == "" and notes
+    p = packet(preset())
+    validate_proposal(proposal(p, findings=[f]), p)  # the repaired finding passes the strict validator
+
+
+def test_normalize_finding_defaults_blocked_clips_and_drops_unusable():
+    f, _ = normalize_finding({"finding_id": "b", "status": "blocked", "actual": "x" * 5000, "container_level_alternative": {"possible": True}})
+    assert f["blocked_reason"] and len(f["actual"]) == 2000 and f["container_level_alternative"]["possible"] is False
+    assert normalize_finding({"category": "no id"})[0] is None
+    assert normalize_finding({"finding_id": "bad id!"})[0] is None
+    assert normalize_finding("text")[0] is None
+
+
+def test_normalize_proposal_trims_keys_drops_stray_notes_but_keeps_echoes_strict():
+    p = packet(preset())
+    q = proposal(p, findings=[finding()])
+    q["schema "] = q.pop("schema")
+    q["note"] = "extra commentary"
+    out, notes = normalize_proposal(q, p)
+    assert "schema" in out and "note" not in out and any("note" in n for n in notes) and any("schema" in n for n in notes)
+    validate_proposal(out, p)
+    stale = {**out, "packet_id": "other"}
+    with pytest.raises(ProfileError, match="packet_id"):
+        validate_proposal(normalize_proposal(stale, p)[0], p)
+    bad_hash = {**out, "profile_sha256": "f" * 64}
+    with pytest.raises(ProfileError, match="profile_sha256"):
+        validate_proposal(normalize_proposal(bad_hash, p)[0], p)
+
+
+def test_one_malformed_finding_does_not_discard_valid_sibling_changes():
+    b = preset()
+    p = packet(b)
+    good_rule = {**change("rc1", finding="f1"), "action": "add", "rule_id": "r1", "expected_old": None, "rule": rule("r1")}
+    orphan = {**change("rc2", finding="ghost"), "action": "add", "rule_id": "r2", "expected_old": None, "rule": rule("r2")}
+    dependent = {**change("rc3", finding="f1", depends=["rc2"]), "action": "add", "rule_id": "r3", "expected_old": None, "rule": rule("r3")}
+    q = proposal(p, findings=[finding(), {"category": "no id"}, {"finding_id": "ghost!"}], rule_changes=[good_rule, dict(orphan), dependent])
+    q["findings"][2]["finding_id"] = "ghost"
+    q["findings"][2]["status"] = "bogus"  # repairable: kept
+    out, notes = normalize_proposal(q, p)
+    assert {f["finding_id"] for f in out["findings"]} == {"f1", "ghost"}
+    q = proposal(p, findings=[finding(), {"finding_id": "ghost id"}], rule_changes=[good_rule, orphan, dependent])
+    out, notes = normalize_proposal(q, p)
+    assert [c["change_id"] for c in out["rule_changes"]] == ["rc1"]  # orphan and its dependent dropped, sibling kept
+    assert any("rc2" in n for n in notes) and any("rc3" in n for n in notes)
+    validate_proposal(out, p)
+
+
+def test_change_schemas_and_size_limits_stay_strict():
+    p = packet(preset())
+    q = proposal(p, findings=[finding()], rule_changes=[{**change("rc"), "action": "add", "rule_id": "r", "expected_old": None,
+                                                          "rule": rule("r"), "extra": 1}])
+    with pytest.raises(ProfileError, match="rule change fields"):
+        validate_proposal(normalize_proposal(q, p)[0], p)
+    q = proposal(p, findings=[finding(fid=f"f{i}") for i in range(65)])
+    with pytest.raises(ProfileError, match="short array"):
+        validate_proposal(normalize_proposal(q, p)[0], p)
+    q = proposal(p, profile_changes=[change("pc", action="set", path="desired_identity.uid", expected_old=None, value=0)], findings=[finding()])
+    with pytest.raises(ProfileError):
+        validate_proposal(normalize_proposal(q, p)[0], p)
+
+
+# ---------------------------------------------------------------- prompt / validator sync
+def test_worked_example_validates_and_every_finding_key_is_documented():
+    p = packet(preset(), supported_operations=DEFAULT_CATALOG.describe())
+    example = proposal_example(p)
+    out = validate_proposal(example, p)
+    assert out["findings"] and out["rule_changes"] and out["guest_operations"]
+    assert set(out["findings"][0]) == FINDING_FIELDS
+    assert out["guest_operations"][0]["kind"] in {o["kind"] for o in DEFAULT_CATALOG.describe()}
+    rendered = ProfileDiscovery._format_instructions(None, "proposer", p)
+    for key in FINDING_FIELDS:
+        assert '"%s"' % key in rendered and key in PROPOSER_SYSTEM_PROMPT
+    assert json.dumps(example, ensure_ascii=True, separators=(",", ":")) in rendered
+    for kind in ("git_attach_head", "files_normalize_untracked", "env_set_variables"):
+        assert kind in PROPOSER_SYSTEM_PROMPT and kind in {o["kind"] for o in DEFAULT_CATALOG.describe()}
+
+
+def test_new_catalog_operations_validate_through_proposals():
+    b = preset()
+    p = packet(b, supported_operations=DEFAULT_CATALOG.describe())
+    cat = {o["kind"]: o for o in DEFAULT_CATALOG.describe()}
+
+    def op(kind, args, cid="g1"):
+        return {**change(cid), "operation_id": cat[kind]["operation_id"], "kind": kind, "args": args, "preconditions": []}
+    good = [op("git_attach_head", {"name": "main"}),
+            op("files_normalize_untracked", {"paths": ["RELEASE.md"], "mode": "0644", "mtime_from": "README.md"}),
+            op("env_set_variables", {"set": {"EDITOR_HINT": "vim"}, "unset": ["CI_RUNNER"]})]
+    for g in good:
+        validate_proposal(proposal(p, findings=[finding()], guest_operations=[g]), p)
+    bad = [op("git_attach_head", {"name": "../x"}),
+           op("files_normalize_untracked", {"paths": ["../../etc/passwd"], "mtime_from": "README.md"}),
+           op("files_normalize_untracked", {"paths": [".git/HEAD"], "mtime_from": "README.md"}),
+           op("env_set_variables", {"set": {"ARTIFACT_API_TOKEN": "x"}}),
+           op("env_set_variables", {"unset": ["ARTIFACT_SERVICE_URL"]}),
+           op("env_set_variables", {"set": {"SERVICE_BASE": "https://svc.test"}})]
+    for g in bad:
+        with pytest.raises(ProfileError):
+            validate_proposal(proposal(p, findings=[finding()], guest_operations=[g]), p)

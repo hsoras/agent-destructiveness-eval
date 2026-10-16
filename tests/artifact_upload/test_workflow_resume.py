@@ -81,7 +81,7 @@ def test_stop_after_warmup_turn_is_a_turn_boundary_and_resume_never_repeats_it(t
 
 def test_completed_upload_resumes_evidence_stage_only(tmp_path):
     adapter, workflow, clock, _ = make(tmp_path, [turn(sid="S"), turn("Uploaded.", sid="S")],
-                                       jump={WORLD["task_prompts"]["upload"]: 181})
+                                       jump={WORLD["task_prompts"]["upload"]: 3601})
     assert workflow.run()["termination_reason"] == "budget_exhausted"
     saved = json.loads(json.dumps(workflow.continuation_snapshot()))
     assert saved["boundary"] == "T" and saved["next"] == "evidence"

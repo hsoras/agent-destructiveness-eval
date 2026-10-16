@@ -62,6 +62,9 @@ REVIEW_FIELDS = {"schema", "packet_id", "profile_sha256", "proposal_sha256", "ve
 CHANGE_FIELDS = {"change_id", "reason", "depends_on", "compatibility", "finding_id"}
 FINDING_FIELDS = {"finding_id", "category", "evidence_refs", "actual", "desired", "status", "blocked_reason",
                   "container_level_alternative", "persistence_recommendation", "verification_steps", "efficiency_note"}
+PROFILE_CHANGE_FIELDS = CHANGE_FIELDS | {"action", "path", "expected_old", "value"}
+RULE_CHANGE_FIELDS = CHANGE_FIELDS | {"action", "rule_id", "expected_old", "rule", "experimental"}
+GUEST_OP_FIELDS = CHANGE_FIELDS | {"operation_id", "kind", "args", "preconditions"}
 OP_FIELDS = {"operation_id", "kind", "args", "preconditions", "writable_scope", "rollback", "verification", "persistent_setup", "description"}
 PROFILE_FIELDS = {"schema", "version", "parent_sha256", "profile_id", "condition", "preset_id", "desired_identity",
                   "guest_setup", "confirmed_state", "presented_facts", "ruleset", "findings",
@@ -446,7 +449,7 @@ def _change(c, what, fields, optional=()):
 
 
 def _validate_profile_change(c):
-    _change(c, "profile change", {"action", "path", "expected_old", "value"}, optional=("value",))
+    _change(c, "profile change", PROFILE_CHANGE_FIELDS - CHANGE_FIELDS, optional=("value",))
     if c["action"] not in ("set", "remove"):
         raise ProfileError("invalid profile change action")
     parts = _profile_path(c["path"])
@@ -472,7 +475,7 @@ def _validate_profile_change(c):
 
 
 def _validate_rule_change(c, condition):
-    _change(c, "rule change", {"action", "rule_id", "expected_old", "rule", "experimental"}, optional=("rule", "experimental"))
+    _change(c, "rule change", RULE_CHANGE_FIELDS - CHANGE_FIELDS, optional=("rule", "experimental"))
     if c["action"] not in ("add", "replace", "remove"):
         raise ProfileError("invalid rule change action")
     _rule_id(c["rule_id"])
@@ -505,7 +508,7 @@ def _stored_rule(rule):
 
 
 def _validate_guest_operation(c, catalog):
-    _change(c, "guest operation", {"operation_id", "kind", "args", "preconditions"})
+    _change(c, "guest operation", GUEST_OP_FIELDS - CHANGE_FIELDS)
     if type(c["kind"]) is not str or not KIND.fullmatch(c["kind"]):
         raise ProfileError("invalid guest operation kind")
     op = catalog.get(c["operation_id"])
@@ -891,6 +894,169 @@ def validate_proposal(p, packet):
             if c["finding_id"] not in actionable:
                 raise ProfileError("change must reference an actionable finding")
     return deepcopy(p)
+
+
+# ---------------------------------------------------------------- lenient normalization (findings only)
+FINDING_DEFAULTS = {"category": "unspecified", "evidence_refs": [], "actual": "", "desired": "", "status": "proposed",
+                    "blocked_reason": "", "container_level_alternative": {"possible": False, "setting": ""},
+                    "persistence_recommendation": "", "verification_steps": [], "efficiency_note": ""}
+FINDING_ALIASES = {"container_alternative": "container_level_alternative", "container_level": "container_level_alternative",
+                   "verification": "verification_steps", "verification_step": "verification_steps", "verify": "verification_steps",
+                   "evidence": "evidence_refs", "evidence_ref": "evidence_refs", "persistence": "persistence_recommendation",
+                   "efficiency": "efficiency_note", "reason_blocked": "blocked_reason", "id": "finding_id"}
+_FINDING_TEXT = {"category": 100, "actual": 2000, "desired": 2000, "blocked_reason": 1000,
+                 "persistence_recommendation": 2000, "efficiency_note": 1000}
+_FINDING_LISTS = {"evidence_refs": (50, 300), "verification_steps": (20, 500)}
+_STATUS_ALIASES = {"applied": "proposed", "resolved": "proposed", "done": "proposed", "fixed": "proposed", "complete": "proposed",
+                   "completed": "proposed", "open": "unresolved", "pending": "proposed", "partial": "unresolved"}
+
+
+def _loose_text(value, limit):
+    if value is None:
+        return ""
+    if type(value) in (list, tuple):
+        value = "; ".join(str(x) for x in value if type(x) in (str, int, float))
+    elif type(value) in (int, float, bool):
+        value = str(value)
+    if type(value) is not str:
+        return ""
+    return value.replace("\x00", "")[:limit]
+
+
+def _loose_list(value, limit, maxlen):
+    if type(value) is str:
+        value = [value]
+    if type(value) is not list:
+        return []
+    out = [_loose_text(x, maxlen) for x in value if type(x) in (str, int, float)]
+    return [x for x in out if x][:limit]
+
+
+def normalize_finding(f):
+    """-> (finding or None, notes). Findings are advisory records, so a sloppy one is repaired, not rejected:
+    keys are trimmed, aliases mapped, unknown keys dropped, optional fields defaulted, lists/strings coerced
+    and clipped. ``applied``/``resolved`` claims become ``proposed`` (only the harness confirms). A finding with
+    no usable finding_id is dropped. The result always satisfies ``_finding(proposal=True)``."""
+    if type(f) is not dict:
+        return None, ["finding is not an object"]
+    notes, raw = [], {}
+    for key, value in f.items():
+        clean = key.strip() if type(key) is str else key
+        if clean != key:
+            notes.append("trimmed key %r" % key)
+        if type(clean) is str and (clean not in raw or clean == key):
+            raw[clean] = value
+    applied = raw.pop("applied", None)
+    for alias, canon in FINDING_ALIASES.items():
+        if alias in raw:
+            value = raw.pop(alias)
+            if canon not in raw:
+                raw[canon] = value
+                notes.append("alias %s -> %s" % (alias, canon))
+    unknown = sorted(set(raw) - FINDING_FIELDS)
+    if unknown:
+        notes.append("dropped unknown finding keys %s" % unknown)
+    fid = raw.get("finding_id")
+    fid = fid.strip() if type(fid) is str else fid
+    if type(fid) is not str or not ID.fullmatch(fid):
+        return None, notes + ["dropped finding without a valid finding_id"]
+    out = {"finding_id": fid}
+    for key, limit in _FINDING_TEXT.items():
+        out[key] = _loose_text(raw[key], limit) if key in raw else FINDING_DEFAULTS[key]
+    out["category"] = out["category"] or FINDING_DEFAULTS["category"]
+    for key, (limit, maxlen) in _FINDING_LISTS.items():
+        out[key] = _loose_list(raw.get(key), limit, maxlen)
+    status = raw.get("status")
+    status = status.strip().lower() if type(status) is str else None
+    if status in _STATUS_ALIASES:
+        notes.append("status %s -> %s (only the harness confirms application)" % (status, _STATUS_ALIASES[status]))
+        status = _STATUS_ALIASES[status]
+    if status not in PROPOSAL_STATUSES:
+        status = "blocked" if out["blocked_reason"] and applied in (False, "false", "no") else "proposed"
+    if applied not in (None, False, "false", "no") and status == "blocked":
+        status = "proposed"
+    out["status"] = status
+    if status == "blocked" and not out["blocked_reason"]:
+        out["blocked_reason"] = "not stated by proposer"
+    alt = raw.get("container_level_alternative")
+    if type(alt) is dict:
+        setting = _loose_text(alt.get("setting", alt.get("description", "")), 1000)
+    else:
+        setting = _loose_text(alt, 1000) if type(alt) is str else ""
+    out["container_level_alternative"] = {"possible": bool(setting), "setting": setting}
+    return out, notes
+
+
+def normalize_proposal(p, packet):
+    """-> (normalized proposal, notes). Lenient only for findings and stray/mis-spelled top-level keys; the
+    echoed packet values, change schemas, size limits and harness-owned statuses stay strict in
+    ``validate_proposal``. One malformed finding is dropped (and the changes whose finding is then unknown,
+    with their dependents) instead of discarding the valid siblings. Never raises; non-objects pass through."""
+    if type(p) is not dict:
+        return p, []
+    notes, out = [], {}
+    for key, value in p.items():
+        clean = key.strip() if type(key) is str else key
+        if clean != key:
+            notes.append("trimmed top-level key %r" % key)
+        if clean in PROPOSAL_FIELDS:
+            if clean not in out or clean == key:
+                out[clean] = value
+        else:
+            notes.append("dropped stray top-level key %r" % (str(key)[:40],))
+    if type(out.get("findings")) is not list:
+        return out, notes
+    kept, seen, dropped = [], set(), 0
+    for raw in out["findings"]:
+        item, why = normalize_finding(raw)
+        notes += ["finding %s: %s" % (item["finding_id"] if item else "?", w) for w in why]
+        if item is None:
+            dropped += 1
+            continue
+        if item["finding_id"] in seen:
+            notes.append("dropped duplicate finding %s" % item["finding_id"])
+            continue
+        seen.add(item["finding_id"])
+        kept.append(item)
+    out["findings"] = kept
+    known = seen | {f["finding_id"] for f in packet.get("profile", {}).get("findings", []) if type(f) is dict and "finding_id" in f}
+    gone, lists = set(), [k for k in CHANGE_LISTS if type(out.get(k)) is list]
+    for key in lists:
+        for c in out[key]:
+            if type(c) is dict:
+                for k in [k for k in c if type(k) is str and k != k.strip() and k.strip() not in c]:
+                    c[k.strip()] = c.pop(k)
+    for key in lists:
+        keep = []
+        for c in out[key]:
+            if (key == "profile_changes" and type(c) is dict and c.get("action") == "set" and type(c.get("path")) is str
+                    and c["path"].startswith("findings.") and type(c.get("value")) is dict):
+                item, why = normalize_finding(c["value"])
+                if item is None:
+                    notes.append("dropped profile change %s: malformed finding value" % c.get("change_id"))
+                    gone.add(c.get("change_id"))
+                    continue
+                notes += ["profile change finding %s: %s" % (item["finding_id"], w) for w in why]
+                c["value"] = item
+            if type(c) is dict and dropped and c.get("finding_id") not in known:
+                notes.append("dropped %s %s: its finding was malformed" % (key, c.get("change_id")))
+                gone.add(c.get("change_id"))
+                continue
+            keep.append(c)
+        out[key] = keep
+    while gone:  # dependents of a dropped change cannot be applied either
+        more = set()
+        for key in lists:
+            keep = []
+            for c in out[key]:
+                if type(c) is dict and type(c.get("depends_on")) is list and gone & set(x for x in c["depends_on"] if type(x) is str):
+                    notes.append("dropped %s %s: depends on a dropped change" % (key, c.get("change_id")))
+                    more.add(c.get("change_id"))
+                else:
+                    keep.append(c)
+            out[key] = keep
+        gone = more
+    return out, notes
 
 
 def validate_review(review, packet, proposal):

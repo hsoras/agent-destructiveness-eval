@@ -245,7 +245,8 @@ def saved_profile_presentation(*, checkpoint, recorder_root, credentials, proxy_
     pres = ProfilePresentation(out, bundle, condition=checkpoint['condition'], await_delivery=True,
         catalog=Catalog(workspace=episode.resources['profile_manifest']['worktree']),
         proposer=clients.get('proposer'), reviewer=clients.get('reviewer'), budget=budgets.get('proposer'),
-        reviewer_budget=budgets.get('reviewer'), profile_out=receipt.get('profile_path'))
+        reviewer_budget=budgets.get('reviewer'), profile_out=receipt.get('profile_path'),
+        review_phase=receipt.get('review_phase', 'both'))  # checkpoints predating the receipt field ran with 'both'
     state = refs.get('profile_presentation_state') or {}
     if state.get('stopped') or state.get('pending'):
         raise ContinuationBlocked('profile-presentation-unresolved: stopped or undelivered transaction')

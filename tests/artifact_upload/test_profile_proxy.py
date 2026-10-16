@@ -197,6 +197,7 @@ BUDGET = LiveBudget(cost_usd=1.0, max_call_cost_usd=0.01, pairs=10)
 def develop(tmp_path, replies, reviewer=None, bundle=None, **kw):
     bundle = bundle or bundle_with([])
     kw.setdefault("reviewer_budget", BUDGET if reviewer is not None else None)
+    kw.setdefault("review_phase", "both")  # scripted reply sequences assume the pre- and post-execution calls
     return ProfilePresentation(tmp_path / "out", bundle, proposer=Scripted(replies), reviewer=reviewer, budget=kw.pop("budget", BUDGET),
                                check_identity=False, **kw)
 
@@ -925,8 +926,95 @@ def test_accounted_time_and_no_hidden_retry(tmp_path):
             import time as t
             t.sleep(0.05)
             return super().complete(payload, **kw)
-    pres = ProfilePresentation(tmp_path / "o", bundle_with([]), proposer=Slow([]), budget=BUDGET, check_identity=False)
+    pres = ProfilePresentation(tmp_path / "o", bundle_with([]), proposer=Slow([]), budget=BUDGET, check_identity=False, review_phase="both")
     run(pres, call(command="true"), result("x\n"))
     u = pres.usage()
     assert u["calls"] == 2 and 0.09 <= u["aux_seconds"] < 1.0  # both calls timed once, no discover() double count
     assert pres.discovery.proposer._retry_length is False
+
+
+@pytest.mark.parametrize("phase,expected", [("both", 2), ("post", 1)])
+def test_review_phase_controls_proposer_calls_per_tool(tmp_path, phase, expected):
+    client = Scripted([])
+    pres = ProfilePresentation(tmp_path / "out", bundle_with([]), proposer=client, budget=BUDGET,
+                               check_identity=False, review_phase=phase)
+    run(pres, call(command="true"), result())
+    assert len(client.calls) == expected
+    assert pres.review_phase == phase
+    blob = json.dumps([c[1] for c in client.calls])
+    assert ("before_execution" in blob) == (phase == "both") and "after_execution" in blob
+
+
+def test_review_phase_defaults_to_post_and_is_recorded_in_receipt(tmp_path):
+    pres = ProfilePresentation(tmp_path / "d", bundle_with([]), proposer=Scripted([]), budget=BUDGET, check_identity=False)
+    assert pres.review_phase == "post"
+    assert pres.receipt()["review_phase"] == "post"
+
+
+def test_review_phase_rejects_unknown_value(tmp_path):
+    with pytest.raises(ValueError):
+        develop(tmp_path, [], review_phase="pre")
+
+
+# ------------------------------------------------------------------ lenient findings / truncation through the proxy
+def _sloppy_finding(fid="f1"):
+    """The shape the live proposer actually sent (docs: logs/live-preview-2026-10-14/ANALYSIS.md)."""
+    return {"finding_id": fid, "applied": True, "container_alternative": {"possible": False, "setting": ""},
+            "verification": "hostname", "actual": "worker-07", "desired": "alex-dev", "status": "applied",
+            "evidence_refs": ["c1"], "persistence_recommendation": "bake into image", "efficiency_note": "n", "note": "stray"}
+
+
+def test_sloppy_findings_are_normalized_and_rules_still_install(tmp_path):
+    r = rule("h", ["hostname"], "worker-07", "alex-dev")
+
+    def sloppy(p):
+        q = empty(p, findings=[_sloppy_finding(), {"category": "no id at all"}], rule_changes=[add_rule("rc", r)])
+        q["schema "] = q.pop("schema")  # trailing-space key typo
+        q["notes"] = "stray top-level note"
+        return q
+    pres = develop(tmp_path, [lambda p: empty(p), sloppy])
+    out = run(pres, call(command="hostname"), result("worker-07\n"))
+    assert pres.bundle.ruleset.get("h")["origin"] == "llm"
+    stored = next(f for f in pres.bundle.data["findings"] if f["finding_id"] == "f1")
+    assert stored["status"] in ("unresolved", "applied") and stored["category"] == "unspecified"
+    lines = [json.loads(x) for x in (tmp_path / "out" / "candidate_profile.jsonl").read_text().splitlines()]
+    norm = [x for x in lines if x.get("normalized")]
+    assert norm and norm[0]["outcome"] == "installed"
+    assert any("dropped stray top-level key" in n for n in norm[0]["normalized"])
+    assert out.output  # tool result delivered
+
+
+def test_applied_claim_is_never_accepted_and_echo_mismatch_still_rejects(tmp_path):
+    r = rule("h", ["hostname"], "worker-07", "alex-dev")
+    stale = lambda p: {**empty(p, findings=[_sloppy_finding()], rule_changes=[add_rule("rc", r)]), "packet_id": "wrong"}
+    pres = develop(tmp_path, [lambda p: empty(p), stale])
+    run(pres, call(command="hostname"), result("worker-07\n"))
+    assert pres.bundle.ruleset.get("h") is None
+    last = [json.loads(x) for x in (tmp_path / "out" / "candidate_profile.jsonl").read_text().splitlines()][-1]
+    assert last["outcome"].startswith("rejected:ProfileError") and "packet_id" in last["outcome"]
+
+
+class _Truncating(Scripted):
+    def complete(self, payload, **kw):
+        self.calls.append((self.system_prompt, copy.deepcopy(payload)))
+        full = json.dumps(empty(payload, summary="x" * 200))
+        return Reply(full[: len(full) - 30], 10, 10, 0.001)
+
+
+def test_truncated_json_is_logged_clearly_and_leaves_state_untouched(tmp_path):
+    pres = develop(tmp_path, [])
+    pres.discovery.proposer = type(pres.discovery.proposer)(_Truncating([]), retry_length=False)
+    before = pres.bundle.sha256
+    run(pres, call(command="hostname"), result("worker-07\n"))
+    assert pres.bundle.sha256 == before
+    lines = [json.loads(x) for x in (tmp_path / "out" / "candidate_profile.jsonl").read_text().splitlines()]
+    assert lines and all(x["outcome"].startswith("rejected:truncated-json") and "output_tokens" in x["outcome"] for x in lines)
+
+
+def test_instructions_carry_the_exact_worked_example_to_the_model(tmp_path):
+    pres = develop(tmp_path, [lambda p: empty(p)])
+    run(pres, call(command="hostname"), result("worker-07\n"))
+    text, fmt = pres.discovery.proposer._c.format_instructions[0]
+    from eval.artifact_upload.profiles import FINDING_FIELDS
+    assert all('"%s"' % k in text for k in FINDING_FIELDS) and "git_attach_head" in text and '"rule_changes":[{' in text
+    assert fmt == {"type": "json_object"}

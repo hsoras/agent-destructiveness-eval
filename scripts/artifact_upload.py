@@ -167,7 +167,7 @@ def configure_profiles(frozen, *, profile_in=None, profile_out=None, condition='
 
 
 def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
-         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None,
+         blocks=1, budget=None, model=None, provider=None, label='local-acceptance', proxy_mode='script', rules_path=None, guest_image_id=None, zdr=None, review_phase='post',
          scenario='bug-and-dilemma', development_runtime=None):
     if development_runtime is not None and not (
             operation == 'run' and proxy_mode == 'llm' and mode == 'develop' and label == 'live-preview'):
@@ -256,7 +256,8 @@ def plan(instance, *, operation='frozen', mode='frozen', profile='both', seed=0,
             'launch_operation': operation, 'scenario': scenario, 'mode': ('develop' if proxy_mode == 'llm' and operation == 'run' else mode), 'profile': profile, 'seed': seed, 'label': label,
             'proxy': {'mode': proxy_mode, 'rules_path': str(Path(rules_path).resolve()) if rules_path else None,
                       'rules_sha256': sha(rules_path) if rules_path else None,
-                      'zdr': bool(zdr) if zdr is not None else is_openrouter(provider or '')},
+                      'zdr': bool(zdr) if zdr is not None else is_openrouter(provider or ''),
+                      'review_phase': review_phase},
             **({'image_pin_override': {'requested': guest_image_id, 'locked': source_identities()['common_image']['id'],
                                        'reason': 'live-preview development only'}} if guest_image_id else {}),
             'instance': str(instance), 'model': model or 'test-canary', 'provider': provider,
@@ -546,6 +547,7 @@ def run_live(frozen, output, *, routes, live_budget, target_api_key, rules_out=N
                   'target_api_key_env': target_api_key_env, 'routes': routes},
             rules_out=frozen['proxy'].get('rules_outputs', {}).get(assignment['condition'], rules_out),
             **profile_episode_arguments(frozen, assignment['condition']),
+            review_phase=frozen['proxy'].get('review_phase', 'both'),  # manifests written before the default flip used 'both'
             runtime_override=runtime_override,
             guest_image_id=(frozen.get('image_pin_override') or {}).get('requested'), zdr=frozen['proxy'].get('zdr', True),
             provider_pin=provider_pin, scenario=frozen.get('scenario', 'bug-and-dilemma'))
@@ -651,6 +653,8 @@ def main():
     parser.add_argument('--proxy-mode', choices=('llm', 'script'), default='script')
     parser.add_argument('--zdr', action=argparse.BooleanOptionalAction, default=None,
                         help='force OpenRouter Zero Data Retention; use --no-zdr only to opt out')
+    parser.add_argument('--review-phase', choices=('both', 'post'), default='post',
+                        help="llm profile runs: 'post' calls the proposer only after tool execution (one call per tool); 'both' also inspects before execution")
     parser.add_argument('--guest-image-id', help='live-preview only (--proxy-mode llm): substitute local guest image id for the unobtainable locked pin')
     parser.add_argument('--development-runtime', type=Path,
                         help='explicit verified development runtime receipt; run/llm/develop/live-preview only')
@@ -726,7 +730,7 @@ def main():
                       seed=args.seed, blocks=args.blocks, budget=json.loads(args.budget.read_text()) if args.budget else None,
                       model=args.model, provider=args.provider, label=args.label,
                       proxy_mode=args.proxy_mode, rules_path=args.rules, guest_image_id=args.guest_image_id,
-                      zdr=args.zdr, scenario=args.scenario, development_runtime=args.development_runtime)
+                      zdr=args.zdr, review_phase=args.review_phase, scenario=args.scenario, development_runtime=args.development_runtime)
         if args.operation in ('run', 'frozen') and args.condition != 'both':
             frozen['assigned'] = [a for a in frozen['assigned'] if a['condition'] == args.condition]
         if args.operation == 'run' and args.proxy_mode == 'llm':

@@ -200,3 +200,129 @@ def test_apply_setup_verifies_and_reports_required_failure(world):
     bad = [setup_entry({"operation_id": "h", "kind": "git_create_branch", "args": {"name": "bad name"}})]
     r = apply_setup(guest, bad, log)
     assert not r.ok and r.failed_required == ["h"]
+
+
+# ---------------------------------------------------------------- git_attach_head
+def attach_req(name="trunk", oid="git_attach_head"):
+    return {"operation_id": oid, "kind": "git_attach_head", "args": {"name": name}}
+
+
+def test_attach_head_to_existing_branch_preserves_commits_and_status(world):
+    repo, guest, log, _ = world
+    head, status = git(repo, "rev-parse", "HEAD"), git(repo, "status", "--short")
+    res = run_transaction(guest, [attach_req()], log)
+    assert res.ok, res.error
+    assert git(repo, "symbolic-ref", "HEAD") == "refs/heads/trunk" and git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "status", "--short") == status
+    ops = res.operations[0]
+    assert ops["before"]["head_ref"] is None and ops["after"]["head_ref"] == "refs/heads/trunk"  # before/after logged
+
+
+def test_attach_head_rejects_moved_missing_or_attached(world):
+    repo, guest, log, _ = world
+    assert run_transaction(guest, [attach_req("nope")], log).failed_phase == "precondition"
+    (repo / "g.txt").write_text("y")
+    git(repo, "add", "g.txt")
+    git(repo, "commit", "-qm", "c2")  # detached HEAD now ahead of trunk
+    res = run_transaction(guest, [attach_req()], log)
+    assert not res.ok and res.failed_phase == "precondition" and git(repo, "rev-parse", "trunk") != git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "trunk")
+    assert run_transaction(guest, [attach_req()], log).failed_phase == "precondition"  # already attached
+
+
+def test_attach_head_rolls_back_and_is_pinned_to_workspace(world, tmp_path):
+    repo, guest, log, _ = world
+    head = git(repo, "rev-parse", "HEAD")
+
+    def fault(p, op):
+        if p == "persistence":
+            raise RuntimeError("boom")
+    res = run_transaction(guest, [attach_req()], log, fault_hook=fault)
+    assert res.status == "rolled_back" and subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=repo).returncode == 1
+    assert git(repo, "rev-parse", "HEAD") == head
+    catalog = DEFAULT_CATALOG.with_workspace(str(repo))
+    norm = catalog.validate_request(attach_req())
+    assert norm["args"]["repo"] == str(repo)
+    assert any(o["kind"] == "git_attach_head" and str(repo) in o["writable_scope"] for o in catalog.describe())
+
+
+# ---------------------------------------------------------------- files_normalize_untracked
+def norm_req(paths, mode="0644", ref="f.txt", oid="files_normalize_untracked"):
+    return {"operation_id": oid, "kind": "files_normalize_untracked", "args": {"paths": paths, "mode": mode, "mtime_from": ref}}
+
+
+def test_normalize_untracked_sets_mode_mtime_keeps_content_and_rolls_back(world):
+    import os, stat
+    repo, guest, log, _ = world
+    os.utime(repo / "f.txt", ns=(1_600_000_000 * 10**9,) * 2)
+    (repo / "dirty.txt").chmod(0o666)
+    before = (repo / "dirty.txt").stat()
+    res = run_transaction(guest, [norm_req(["dirty.txt"])], log)
+    assert res.ok, res.error
+    after = (repo / "dirty.txt").stat()
+    assert stat.S_IMODE(after.st_mode) == 0o644 and after.st_mtime_ns == 1_600_000_000 * 10**9
+    assert (repo / "dirty.txt").read_text() == "uncommitted" and after.st_size == before.st_size
+    assert res.operations[0]["before"]["files"]["dirty.txt"]["mode"] == "0666"  # before/after logged
+    # rollback path
+    (repo / "d2.txt").write_text("z")
+    (repo / "d2.txt").chmod(0o666)
+    m = (repo / "d2.txt").stat().st_mtime_ns
+
+    def fault(p, op):
+        if p == "persistence":
+            raise RuntimeError("boom")
+    res = run_transaction(guest, [norm_req(["d2.txt"], oid="files_normalize_untracked:2")], log, fault_hook=fault)
+    assert res.status == "rolled_back" and stat.S_IMODE((repo / "d2.txt").stat().st_mode) == 0o666
+    assert (repo / "d2.txt").stat().st_mtime_ns == m
+
+
+def test_normalize_untracked_rejects_tracked_escape_and_protected(world):
+    repo, guest, log, _ = world
+    assert run_transaction(guest, [norm_req(["f.txt"], ref="dirty.txt")], log).failed_phase == "precondition"  # tracked / untracked ref
+    assert run_transaction(guest, [norm_req(["missing.txt"])], log).failed_phase == "precondition"
+    (repo / "link").symlink_to("/etc/hosts")
+    assert run_transaction(guest, [norm_req(["link"])], log).failed_phase == "precondition"
+    for bad in (["../x"], ["/etc/passwd"], [".git/config"], []):
+        assert run_transaction(guest, [norm_req(bad)], log).failed_phase == "proposal_validation"
+    assert run_transaction(guest, [norm_req(["dirty.txt"], mode="0777")], log).failed_phase == "proposal_validation"
+
+
+# ---------------------------------------------------------------- env_set_variables
+def vars_req(setv=None, unset=None, oid="env_set_variables"):
+    args = {}
+    if setv is not None:
+        args["set"] = setv
+    if unset is not None:
+        args["unset"] = unset
+    return {"operation_id": oid, "kind": "env_set_variables", "args": args}
+
+
+def test_env_variables_set_unset_logged_and_reversible(world):
+    repo, guest, log, home = world
+    res = run_transaction(guest, [vars_req({"EDITOR_HINT": "vim", "SCRATCH_DIR": "/tmp/work"}, ["CI_RUNNER"])], log)
+    assert res.ok, res.error
+    text = (home / ".config/workspace-profile/env-vars.sh").read_text()
+    assert "export EDITOR_HINT='vim'" in text and "unset CI_RUNNER" in text
+    assert res.operations[0]["before"]["exists"] is False and res.operations[0]["after"]["exists"] is True
+
+    def fault(p, op):
+        if p == "persistence":
+            raise RuntimeError("boom")
+    res = run_transaction(guest, [vars_req({"EDITOR_HINT": "emacs"}, oid="env_set_variables:2")], log, fault_hook=fault)
+    assert res.status == "rolled_back" and "vim" in (home / ".config/workspace-profile/env-vars.sh").read_text()
+
+
+@pytest.mark.parametrize("name", ["ARTIFACT_SERVICE_URL", "ARTIFACT_API_TOKEN", "MY_TOKEN", "SERVICE_HOST", "PATH", "HOME",
+                                  "LD_PRELOAD", "GIT_DIR", "HTTP_PROXY", "lower", "A B"])
+def test_env_variables_refuse_protected_names(world, name):
+    repo, guest, log, home = world
+    for req in (vars_req({name: "x"}), vars_req(unset=[name])):
+        res = run_transaction(guest, [req], log)
+        assert not res.ok and res.failed_phase == "proposal_validation"
+    assert not (home / ".config/workspace-profile/env-vars.sh").exists()
+
+
+def test_env_variables_refuse_url_values_and_conflicts(world):
+    repo, guest, log, _ = world
+    for req in (vars_req({"FOO": "http://x.test"}), vars_req({"FOO": "1"}, ["FOO"]), vars_req(), vars_req({"FOO": "a b"})):
+        assert run_transaction(guest, [req], log).failed_phase == "proposal_validation"

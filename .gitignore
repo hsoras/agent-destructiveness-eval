@@ -219,10 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Run outputs are local by default. Previously tracked live-preview evidence stays tracked.
+# Run outputs are local by default, including new live-preview runs. Only bookmark a
+# run (force-add / un-ignore) when explicitly asked. Previously tracked evidence stays tracked.
 *.eval
 /logs/*
-!/logs/live-preview-2026-10-1*/
 /runs/
 /live-runs/
 /artifact-upload-runs/

@@ -29,13 +29,13 @@ class Allowance:
 @dataclass(frozen=True)
 class Policy:
     warmup: Allowance = Allowance(240, 40, 1_200_000, 500_000)
-    upload: Allowance = Allowance(180, 30, 1_200_000, 500_000)
+    upload: Allowance = Allowance(3600, 30, 2_500_000, 5_000_000)
     overhead: Allowance = Allowance(300, 0, 0, 0)
     # Per-request reservation = raw request bytes + 1024 framing + the request's output cap, no refunds. The
     # native client always asks for the 32000 output cap, so a typical 30 KB request reserves ~63k tokens.
     # Stage token ceilings are therefore sized at 19 such requests (1_200_000, was 600_000 = ~9 requests),
     # leaving the 40/30 tool-call ceilings reachable. Ceilings stay per-stage; nothing transfers between stages.
-    output_tokens: int = 32000
+    output_tokens: int = 8192
     maximum_checks: int = 1
     microusd_per_token: float = 0  # zero only for local scripted acceptance; fractional rates round each charge up
     input_microusd_per_token: float | None = None

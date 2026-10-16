@@ -38,6 +38,7 @@ ENV_KEYS = ("DISPLAY", "TERM", "COLORTERM", "LANG", "LC_ALL", "TZ", "EDITOR", "V
 ENV_VALUE = re.compile(r"[A-Za-z0-9_.:/+@=,-]{0,200}")
 FILE_ROOTS = (".config/workspace-profile/", ".config/workspace-dotfiles/", ".local/share/backgrounds/")
 MAX_FILE_BYTES = 64 * 1024
+GIT_REPO_KINDS = ("git_create_branch", "git_attach_head", "files_normalize_untracked")  # pinned to the approved workspace
 
 
 def _sanitize(text, limit=300) -> str:
@@ -246,6 +247,10 @@ _ENV_HEADER = "# managed by workspace profile proxy\n"
 
 
 def _env_observe(guest, args):
+    return _observe_managed(guest, _ENV_FILE)
+
+
+def _observe_managed(guest, rel):
     return _run(guest, '''import os, base64, hashlib
 path = os.path.join(os.environ["HOME"], P["rel"])
 data = open(path, "rb").read() if os.path.isfile(path) and not os.path.islink(path) else None
@@ -254,7 +259,7 @@ dirs = {"/".join(parts[:i + 1]): os.path.isdir(os.path.join(os.environ["HOME"], 
 print(json.dumps({"exists": data is not None, "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
                   "b64": base64.b64encode(data).decode() if data is not None else None,
                   "link": os.path.islink(path), "dirs": dirs}))
-''', {"rel": _ENV_FILE})
+''', {"rel": rel})
 
 
 def _env_render(args) -> bytes:
@@ -293,12 +298,16 @@ def _env_execute(guest, args, obs):
                               "exclusive": not obs["exists"]})
 
 
+def _env_rollback(guest, args, before):
+    _rollback_managed(guest, before, _ENV_FILE)
+
+
 def _env_verify(args, before, after):
     if after["sha256"] != hashlib.sha256(_env_render(args)).hexdigest():
         raise OperationError("verification", "environment file content differs from the request")
 
 
-def _env_rollback(guest, args, before):
+def _rollback_managed(guest, before, rel):
     _run(guest, '''import os, base64
 path = os.path.join(os.environ["HOME"], P["rel"])
 if P["old"] is None:
@@ -309,7 +318,7 @@ if P["old"] is None:
 else:
     open(path, "wb").write(base64.b64decode(P["old"]))
 print(json.dumps({"ok": True}))
-''', {"rel": _ENV_FILE, "old": before["b64"],
+''', {"rel": rel, "old": before["b64"],
                                                   "new_dirs": sorted((d for d, there in before["dirs"].items() if not there), reverse=True)})
 
 
@@ -385,6 +394,179 @@ def _files_satisfied(args, obs):
     return obs["files"][args["path"]].get("sha256") == hashlib.sha256(base64.b64decode(args["content_b64"])).hexdigest()
 
 
+# ---- git_attach_head: point a detached HEAD at the existing branch that already names the same commit
+def _attach_validate(args):
+    _only(args, ("name",), ("name",))
+    if not isinstance(args["name"], str) or not BRANCH.fullmatch(args["name"]):
+        _bad("invalid branch name")
+    return {"name": args["name"]}
+
+
+def _attach_check(args, obs):
+    if obs["head_commit"] is None:
+        raise OperationError("precondition", "repository has no commit")
+    if obs["head_ref"] is not None:
+        raise OperationError("precondition", "HEAD is already attached to a branch")
+    if obs["branch_commit"] is None:
+        raise OperationError("precondition", "branch does not exist; use git_create_branch")
+    if obs["branch_commit"] != obs["head_commit"]:
+        raise OperationError("precondition", "branch does not point at the detached HEAD commit; refs are never moved")
+
+
+def _attach_execute(guest, args, obs):
+    _run(guest, _GIT + 'git("symbolic-ref", "HEAD", "refs/heads/" + P["name"])\nprint(json.dumps({"ok": True}))\n', {**args})
+
+
+def _attach_verify(args, before, after):
+    if after["head_ref"] != "refs/heads/" + args["name"]:
+        raise OperationError("verification", "HEAD is not attached to the branch")
+    if (after["head_commit"] != before["head_commit"] or after["branch_commit"] != before["branch_commit"]
+            or after["status_sha256"] != before["status_sha256"]):
+        raise OperationError("verification", "commits, refs or working-tree status changed")
+
+
+def _attach_rollback(guest, args, before):
+    _git_rollback(guest, args, before)
+
+
+# ---- files_normalize_untracked: mode and mtime of listed untracked files only
+NORMALIZE_MODES = ("0600", "0644", "0755")
+
+
+def _rel_ok(rel):
+    return (isinstance(rel, str) and 0 < len(rel) <= 200 and not rel.startswith("/") and not rel.endswith("/")
+            and ".." not in rel.split("/") and "//" not in rel and "\0" not in rel and rel.split("/")[0] != ".git")
+
+
+def _norm_validate(args):
+    _only(args, ("paths", "mode", "mtime_from"), ("paths", "mtime_from"))
+    paths, mode, ref = args["paths"], args.get("mode", "0644"), args["mtime_from"]
+    if (not isinstance(paths, list) or not 0 < len(paths) <= 16 or len(set(paths)) != len(paths)
+            or not all(_rel_ok(x) for x in paths) or not _rel_ok(ref) or ref in paths):
+        _bad("paths must be 1-16 distinct repository-relative file paths outside .git; mtime_from another path")
+    if mode not in NORMALIZE_MODES:
+        _bad("mode must be one of %s" % ", ".join(NORMALIZE_MODES))
+    return {"paths": list(paths), "mode": mode, "mtime_from": ref}
+
+
+def _norm_observe(guest, args):
+    return _run(guest, _GIT + '''import hashlib
+root = os.path.realpath(P.get("repo") or os.getcwd())
+def info(rel):
+    p = os.path.join(root, rel)
+    if not os.path.lexists(p):
+        return {"state": "absent"}
+    if os.path.islink(p) or not os.path.isfile(p) or not os.path.realpath(p).startswith(root + os.sep):
+        return {"state": "other"}
+    st = os.stat(p)
+    tracked = git("ls-files", "--error-unmatch", "--", rel, ok=(0, 1)).returncode == 0
+    return {"state": "file", "tracked": tracked, "mode": "%04o" % (st.st_mode & 0o7777), "mtime_ns": st.st_mtime_ns,
+            "size": st.st_size, "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()}
+print(json.dumps({"files": {rel: info(rel) for rel in P["paths"]}, "ref": info(P["mtime_from"])}))
+''', {**args})
+
+
+def _norm_check(args, obs):
+    for rel, st in obs["files"].items():
+        if st["state"] != "file":
+            raise OperationError("precondition", "not a regular file inside the workspace: " + rel)
+        if st["tracked"]:
+            raise OperationError("precondition", "file is tracked; only untracked files are normalized: " + rel)
+    if obs["ref"]["state"] != "file" or not obs["ref"]["tracked"]:
+        raise OperationError("precondition", "mtime_from must be a tracked regular file")
+
+
+def _norm_execute(guest, args, obs):
+    _run(guest, _GIT + '''root = os.path.realpath(P.get("repo") or os.getcwd())
+for rel in P["paths"]:
+    p = os.path.join(root, rel)
+    os.chmod(p, int(P["mode"], 8))
+    os.utime(p, ns=(os.stat(p).st_atime_ns, P["mtime_ns"]))
+print(json.dumps({"ok": True}))
+''', {**args, "mtime_ns": obs["ref"]["mtime_ns"]})
+
+
+def _norm_verify(args, before, after):
+    for rel, old in before["files"].items():
+        new = after["files"][rel]
+        if (new.get("sha256"), new.get("size")) != (old["sha256"], old["size"]):
+            raise OperationError("verification", "file content or size changed: " + rel)
+        if new["mode"] != args["mode"] or new["mtime_ns"] != before["ref"]["mtime_ns"]:
+            raise OperationError("verification", "mode/mtime not applied: " + rel)
+    if after["ref"] != before["ref"]:
+        raise OperationError("verification", "reference file changed")
+
+
+def _norm_rollback(guest, args, before):
+    _run(guest, _GIT + '''root = os.path.realpath(P.get("repo") or os.getcwd())
+for rel, old in P["files"].items():
+    p = os.path.join(root, rel)
+    if os.path.isfile(p) and not os.path.islink(p) and old.get("state") == "file":
+        os.chmod(p, int(old["mode"], 8))
+        os.utime(p, ns=(os.stat(p).st_atime_ns, old["mtime_ns"]))
+print(json.dumps({"ok": True}))
+''', {**args, "files": before["files"]})
+
+
+def _norm_satisfied(args, obs):
+    return all(st["state"] == "file" and st["mode"] == args["mode"] and st["mtime_ns"] == obs["ref"].get("mtime_ns")
+               for st in obs["files"].values())
+
+
+# ---- env_set_variables: harness-managed env-vars file; protected/service/system names are refused
+_VARS_FILE = ".config/workspace-profile/env-vars.sh"
+VAR_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_VAR_DENY = re.compile(r"^(ARTIFACT|UPLOAD|SERVICE|QUOTA|BEARER|LD_|DYLD_|PYTHON|GIT_|SSL_|CURL_|HTTP|NO_PROXY|ALL_PROXY)"
+                       r"|TOKEN|SECRET|PASSW|CRED|AUTH|API_?KEY|PRIVATE|(^|_)(URL|URI|HOST|HOSTNAME|ENDPOINT|PORT|PROXY|PATH|HOME|USER|"
+                       r"LOGNAME|SHELL|PWD|OLDPWD|IFS|PS4|PROMPT_COMMAND|BASH_ENV|ENV)(_|$)")
+MAX_VARS = 16
+
+
+def _var_name(name):
+    if not isinstance(name, str) or not VAR_NAME.fullmatch(name) or _VAR_DENY.search(name):
+        _bad("environment variable name is protected or not allowed: %s" % str(name)[:40])
+    return name
+
+
+def _vars_validate(args):
+    _only(args, ("set", "unset"))
+    setv, unset = args.get("set", {}), args.get("unset", [])
+    if not isinstance(setv, dict) or not isinstance(unset, list) or not 0 < len(setv) + len(unset) <= MAX_VARS:
+        _bad("set (object) and unset (list) must hold 1-%d names in total" % MAX_VARS)
+    for k, v in setv.items():
+        _var_name(k)
+        if not isinstance(v, str) or not ENV_VALUE.fullmatch(v) or "://" in v:
+            _bad("environment value not approved for " + k)
+    for k in unset:
+        _var_name(k)
+    if len(set(unset)) != len(unset) or set(unset) & set(setv):
+        _bad("a name may be set or unset once")
+    return {"set": dict(sorted(setv.items())), "unset": sorted(unset)}
+
+
+def _vars_render(args) -> bytes:
+    return (_ENV_HEADER + "".join("export %s='%s'\n" % kv for kv in args["set"].items())
+            + "".join("unset %s\n" % k for k in args["unset"])).encode()
+
+
+def _vars_observe(guest, args):
+    return _observe_managed(guest, _VARS_FILE)
+
+
+def _vars_execute(guest, args, obs):
+    _run(guest, _WRITE_FILE, {"rel": _VARS_FILE, "data": base64.b64encode(_vars_render(args)).decode(), "mode": 0o644,
+                              "exclusive": not obs["exists"]})
+
+
+def _vars_verify(args, before, after):
+    if after["sha256"] != hashlib.sha256(_vars_render(args)).hexdigest():
+        raise OperationError("verification", "environment variable file content differs from the request")
+
+
+def _vars_rollback(guest, args, before):
+    _rollback_managed(guest, before, _VARS_FILE)
+
+
 def _no_check(args, obs):
     return None
 
@@ -397,6 +579,30 @@ SPECS = (
                   ("HEAD has a commit", "refs/heads/<name> does not exist"),
                   "ref equals the pre-state HEAD commit; HEAD commit and porcelain status unchanged; HEAD attached when requested",
                   "restore HEAD ref/commit; delete the new ref only if it still equals the created commit"),
+    OperationSpec("git_attach_head", "Attach a detached HEAD to an existing branch that already points at the same commit.",
+                  "git HEAD symbolic ref only; no ref, commit, index or file changes",
+                  {"name": {"type": "string", "required": True, "max_length": 100}},
+                  _attach_validate, _git_observe, _attach_check, _attach_execute, _attach_verify, _attach_rollback,
+                  lambda args, obs: obs["head_ref"] == "refs/heads/" + args["name"],
+                  ("HEAD is detached", "refs/heads/<name> exists and equals the HEAD commit"),
+                  "HEAD names the branch; HEAD commit, branch ref and porcelain status unchanged",
+                  "re-detach HEAD at the saved commit"),
+    OperationSpec("files_normalize_untracked", "Set file mode and mtime of listed untracked files to match a tracked reference file.",
+                  "mode and mtime of up to 16 untracked regular files inside the workspace; contents and sizes untouched",
+                  {"paths": {"type": "list", "required": True, "max_items": 16}, "mode": {"type": "enum", "values": list(NORMALIZE_MODES)},
+                   "mtime_from": {"type": "string", "required": True, "max_length": 200}},
+                  _norm_validate, _norm_observe, _norm_check, _norm_execute, _norm_verify, _norm_rollback, _norm_satisfied,
+                  ("every path is an untracked regular file in the workspace", "mtime_from is a tracked regular file"),
+                  "content digest and size unchanged; mode equals the request; mtime equals the reference file mtime",
+                  "restore the saved mode and mtime of each file"),
+    OperationSpec("env_set_variables", "Set or unset non-protected environment variables in a dedicated env-vars file.",
+                  "~/.config/workspace-profile/env-vars.sh only; ARTIFACT_*, credential, URL/host, proxy and system names are refused",
+                  {"set": {"type": "object", "max_items": MAX_VARS, "value_max_length": 200},
+                   "unset": {"type": "list", "max_items": MAX_VARS}},
+                  _vars_validate, _vars_observe, _env_check, _vars_execute, _vars_verify, _vars_rollback,
+                  lambda args, obs: obs["sha256"] == hashlib.sha256(_vars_render(args)).hexdigest(),
+                  ("path is not a symlink", "existing file, if any, is harness-managed"),
+                  "file digest equals the rendered request", "restore previous file bytes or remove the new file"),
     OperationSpec("system_set_hostname", "Set the guest hostname to the profile value; service DNS is untouched.",
                   "the guest UTS hostname only", {"hostname": {"type": "hostname", "required": True}},
                   _host_validate, _host_observe, _no_check, _host_execute,
@@ -454,7 +660,7 @@ class Catalog:
         for kind in self.kinds():
             for oid in self.operation_ids(kind):
                 entry = self._specs[kind].describe(oid)
-                if kind == "git_create_branch":
+                if kind in GIT_REPO_KINDS:
                     entry["writable_scope"] = ("git refs in %s only; " % (self.workspace or "the guest working directory")
                                                + entry["writable_scope"])[:500]
                 out.append(entry)
@@ -469,7 +675,7 @@ class Catalog:
         if not isinstance(oid, str) or oid not in self.operation_ids(spec.kind):
             _bad("operation_id is not a catalog entry for this kind")
         args = spec.validate(deepcopy(request["args"]))
-        if spec.kind == "git_create_branch" and self.workspace is not None:
+        if spec.kind in GIT_REPO_KINDS and self.workspace is not None:
             args["repo"] = self.workspace  # never caller-chosen; the guest re-verifies the real path
         return {**{k: deepcopy(v) for k, v in request.items() if k != "args"}, "args": args}
 

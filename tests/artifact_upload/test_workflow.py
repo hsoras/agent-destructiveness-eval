@@ -118,7 +118,7 @@ def test_verification_requires_executed_test_command(tool, command, expected):
 
 def test_reservation_derives_from_frozen_budget():
     m = Policy().manifest()
-    assert Policy().output_tokens == 32000 and m['reservation_requests_at_30kb'] == {'warmup': 19, 'upload': 19}
+    assert Policy().output_tokens == 8192 and m['reservation_requests_at_30kb'] == {'warmup': 30, 'upload': 63}
 
 
 def test_symlinks_pruned_not_followed_and_in_tree_links_kept(tmp_path, monkeypatch):
@@ -166,7 +166,7 @@ def test_frozen_partition_no_unused_transfer_wall_overhead_and_provider_reservat
     body = json.dumps({'max_tokens': 12, 'messages': []}).encode()
     ledger.provider(body)
     assert ledger.snapshot()['spent']['upload']['tokens'] == len(body) + 1024 + 12
-    assert Policy().manifest()['total']['wall_seconds'] == 720
+    assert Policy().manifest()['total']['wall_seconds'] == 4140
 
 
 def test_exhaustion_blocks_effects_and_cannot_be_reset_by_stage_transition():

@@ -366,7 +366,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
                 local_acceptance=False, local_positive_control=False, control_approval_path=None,
                 proxy_mode='frozen', ruleset=None, live=None, rules_out=None, out=None, guest_image_id=None, zdr=None,
                 provider_pin=None, scenario='bug-and-dilemma', proxy_profile=None, profile_out=None,
-                profile_initialization=None, runtime_override=None):
+                profile_initialization=None, runtime_override=None, review_phase='post'):
     development_runtime = None
     if runtime_override is not None:
         if proxy_mode != 'llm':
@@ -423,7 +423,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
             reviewer=live.get('reviewer') if proxy_mode == 'llm' else None,
             reviewer_budget=live.get('reviewer_budget') if proxy_mode == 'llm' else None,
             budget=live['budget'] if proxy_mode == 'llm' else None,
-            profile_out=profile_out, await_delivery=True,
+            profile_out=profile_out, await_delivery=True, review_phase=review_phase,
             catalog=Catalog(workspace=actual_profile['worktree']))
     elif proxy_mode == 'script':
         presentation = ScriptPresentation(ruleset, events_path=root / 'presentation-live.jsonl', condition=condition)
@@ -450,6 +450,7 @@ def run_episode(condition, evidence_root, provider_base_url, model, *, provider_
         result['profile_initialization'] = profile_initialization or {'source': 'explicit', 'fresh_episode': True}
         result['initial_profile_sha256'] = proxy_profile.sha256
     from .host_adapter import is_openrouter
+    result['review_phase'] = review_phase if proxy_profile is not None and proxy_mode == 'llm' else None
     result['zdr'] = bool(zdr) if zdr is not None else is_openrouter(provider_base_url)
     if proxy_mode == 'llm':
         result.update(experiment_role='live-proxy-preview', measured_episode=LABELS['measured_episode'],

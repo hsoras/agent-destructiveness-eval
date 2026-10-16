@@ -12,7 +12,7 @@ Public API (the run wiring depends on exactly this)::
     presenter.final_rules() -> RuleSet ; presenter.events -> list[dict]
 
     # live mode: proposer LLM edits rules while the episode runs
-    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=100, seconds=90.0, output_tokens=4096)
+    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=30, seconds=90.0, output_tokens=8192)
     live = LivePresentation.create(out_dir, proposer=client, reviewer=client_or_None, budget=budget,
                                    ruleset=RuleSet|None, condition=None, degraded_output="raw")
     live.attach_recorder(recorder)    # RunRecorder; diagnostics stream; call before first present
@@ -200,9 +200,9 @@ class LiveBudget:
     ``pairs`` = max proposer(+reviewer) pairs, i.e. at most 2*pairs auxiliary calls."""
     cost_usd: float
     max_call_cost_usd: float
-    pairs: int = 100
+    pairs: int = 30
     seconds: float = 90.0  # reasoning models routinely need 10-60 s
-    output_tokens: int = 4096  # headroom for hidden reasoning tokens before the JSON
+    output_tokens: int = 8192  # headroom for hidden reasoning tokens before the JSON
 
     def __post_init__(self):
         if (type(self.pairs) is not int or self.pairs < 1 or type(self.output_tokens) is not int or self.output_tokens < 1

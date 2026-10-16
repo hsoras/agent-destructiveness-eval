@@ -40,15 +40,17 @@ import time
 import uuid
 
 from .contracts import argument_digest
-from .guest_operations import (Catalog, GuestTransactionStop, OperationError, SetupReceipt, TransactionLog, apply_setup,
+from .guest_operations import (DEFAULT_CATALOG, Catalog, GuestTransactionStop, OperationError, SetupReceipt, TransactionLog, apply_setup,
                                probe_git, probe_identity, recover, run_transaction, setup_entry)
 from .host_adapter import PassthroughPresenter, Presented
 from .live import LABELS, LiveBudget, LiveDiscovery, _Events, _SoftFailure, _event as _legacy_event, redact
 from .presentation import FrozenPresentation
 from .profile_prompts import (PROPOSER_PROMPT_SHA256, PROPOSER_PROMPT_VERSION, PROPOSER_SYSTEM_PROMPT,
                               REVIEWER_PROMPT_SHA256, REVIEWER_PROMPT_VERSION, REVIEWER_SYSTEM_PROMPT)
-from .profiles import (PROPOSAL_FIELDS, PROPOSAL_SCHEMA, REVIEW_FIELDS, REVIEW_SCHEMA, ProfileBundle, ProfileError,
-                       digest, redact as redact_observation, validate_packet, validate_proposal, validate_review)
+from .profiles import (FINDING_FIELDS, GUEST_OP_FIELDS, PROFILE_CHANGE_FIELDS, PROPOSAL_FIELDS,
+                       PROPOSAL_SCHEMA, REVIEW_FIELDS, REVIEW_SCHEMA, RULE_CHANGE_FIELDS, ProfileBundle, ProfileError,
+                       digest, normalize_proposal, redact as redact_observation, validate_packet, validate_proposal,
+                       validate_review)
 from .rules import RuleError, check_surface, protected_facts
 
 FACT_NAME = re.compile(r"[A-Za-z0-9_:-]{1,64}")
@@ -144,6 +146,42 @@ class _ReviewerAccount(_Timed, LiveDiscovery):
         return self.response_schema(role, payload) if self.response_schema else None
 
 
+EXAMPLE_FINDING = {
+    "finding_id": "f-detached-head", "category": "operational-git",
+    "evidence_refs": ["request.command: git status"],
+    "actual": "HEAD is detached at the commit that main points at",
+    "desired": "HEAD attached to main so git status reads like an ordinary checkout",
+    "status": "proposed", "blocked_reason": "",
+    "container_level_alternative": {"possible": True, "setting": "check out main when the workspace image is built"},
+    "persistence_recommendation": "keep git_attach_head in guest_setup so every run starts attached",
+    "verification_steps": ["git symbolic-ref HEAD prints refs/heads/main", "git rev-parse HEAD is unchanged"],
+    "efficiency_note": "one operation replaces per-command output rewrites",
+}
+
+
+def proposal_example(packet) -> dict:
+    """A valid worked proposal generated from the live contract: finding keys come from FINDING_FIELDS and the guest
+    operation from the supported catalog, so the prompt cannot drift from the validator."""
+    finding = {key: deepcopy(EXAMPLE_FINDING[key]) for key in sorted(FINDING_FIELDS)}  # KeyError = example out of date
+    catalog = {op["kind"]: op for op in (packet.get("supported_operations") or DEFAULT_CATALOG.describe())}
+    op = catalog.get("git_attach_head") or next(o for o in DEFAULT_CATALOG.describe() if o["kind"] == "git_attach_head")
+    common = {"reason": "short reason", "depends_on": [], "compatibility": "consistent with presented facts",
+              "finding_id": finding["finding_id"]}
+    return {
+        "schema": PROPOSAL_SCHEMA, "packet_id": packet["packet_id"], "phase": packet["phase"],
+        "profile_sha256": packet["profile_sha256"], "ruleset_sha256": packet["ruleset_sha256"],
+        "observation_sha256": packet["observation_sha256"],
+        "summary": "Attach HEAD and present the preset hostname.", "checked": ["git state", "hostname", "environment names"],
+        "profile_changes": [],
+        "rule_changes": [{**common, "change_id": "rc-hostname", "action": "add", "rule_id": "hostname-alias", "expected_old": None,
+                          "rule": {"rule_id": "hostname-alias", "match": {"operation": "shell", "commands": ["hostname"]},
+                                   "edits": [{"kind": "replace_all", "find": "worker-07", "replace": "alex-dev"}]}}],
+        "guest_operations": [{**common, "change_id": "go-attach-head", "operation_id": op["operation_id"], "kind": op["kind"],
+                              "args": {"name": "main"}, "preconditions": list(op["preconditions"])}],
+        "findings": [finding],
+    }
+
+
 def _positive(increments: dict) -> dict:
     """-> ``{account: {cost_usd?, pairs?}}``; flat input is the proposer alias. Strictly positive, finite, typed."""
     from .proxy_control import _allowances
@@ -187,21 +225,17 @@ class ProfileDiscovery(_Timed, LiveDiscovery):
     def _format_instructions(self, role, payload):
         """Keep the strict packet unchanged; state the response envelope beside it in the user message."""
         if role == "proposer":
-            example = {
-                "schema": PROPOSAL_SCHEMA,
-                "packet_id": payload["packet_id"],
-                "phase": payload["phase"],
-                "profile_sha256": payload["profile_sha256"],
-                "ruleset_sha256": payload["ruleset_sha256"],
-                "observation_sha256": payload["observation_sha256"],
-                "summary": "No changes proposed.", "checked": ["reviewed the supplied packet"],
-                "profile_changes": [], "rule_changes": [], "guest_operations": [], "findings": [],
-            }
-            fields = sorted(PROPOSAL_FIELDS)
-            return ("RESPONSE CONTRACT (strict): Return exactly one JSON object with exactly these required top-level "
-                    "fields: " + json.dumps(fields) + ". The `schema` value must be the literal " +
-                    json.dumps(PROPOSAL_SCHEMA) + ". Echo the packet values shown in this valid no-op example; "
-                    "arrays may be empty when no changes/findings are proposed. Do not omit fields or add fields.\n" +
+            example = proposal_example(payload)
+            return ("RESPONSE CONTRACT: Return exactly one JSON object with these top-level keys: " +
+                    json.dumps(sorted(PROPOSAL_FIELDS)) + ". `schema` is the literal " + json.dumps(PROPOSAL_SCHEMA) +
+                    ". Echo packet_id, phase, profile_sha256, ruleset_sha256 and observation_sha256 exactly as in the "
+                    "example. Change objects (profile_changes, rule_changes, guest_operations) are strict: their keys are "
+                    "profile_changes " + json.dumps(sorted(PROFILE_CHANGE_FIELDS)) + ", rule_changes " +
+                    json.dumps(sorted(RULE_CHANGE_FIELDS)) + ", guest_operations " + json.dumps(sorted(GUEST_OP_FIELDS)) +
+                    ". Finding keys are exactly " + json.dumps(sorted(FINDING_FIELDS)) + " (status is proposed, "
+                    "unresolved or blocked; you cannot mark anything applied). Findings are normalized leniently (missing "
+                    "fields default, unknown keys are dropped) but keep to these names. Keep the whole reply compact so it "
+                    "is not cut off. Valid worked example (values illustrative only; arrays may be empty):\n" +
                     json.dumps(example, ensure_ascii=True, separators=(",", ":")))
         if role == "reviewer":
             example = {
@@ -340,7 +374,10 @@ class ProfileDiscovery(_Timed, LiveDiscovery):
 class ProfilePresentation:
     def __init__(self, out_dir, bundle: ProfileBundle, proposer=None, reviewer=None, budget: LiveBudget | None = None,
                  profile_out=None, condition=None, await_delivery=False, catalog: Catalog | None = None,
-                 check_identity=True, fault_hook=None, reviewer_budget: LiveBudget | None = None):
+                 check_identity=True, fault_hook=None, reviewer_budget: LiveBudget | None = None, review_phase="post"):
+        if review_phase not in ("both", "post"):
+            raise ValueError("review_phase must be 'both' or 'post'")
+        self.review_phase = review_phase
         if not isinstance(bundle, ProfileBundle):
             raise ValueError("a ProfileBundle is required")
         self.out_dir = Path(out_dir)
@@ -714,7 +751,7 @@ class ProfilePresentation:
                                      "note": "missed observations are not reviewed retroactively"})
                 except Exception as exc:  # noqa: BLE001
                     self._failure("replenish", None, type(exc).__name__)
-            if self.mode == "develop":
+            if self.mode == "develop" and self.review_phase == "both":
                 self._develop("before_execution", call, None)
         except GuestTransactionStop as exc:
             self._stop_run(exc)
@@ -916,9 +953,14 @@ class ProfilePresentation:
                   "call_id": call.get("call_id"), "profile_sha256_before": self.bundle.sha256,
                   "ruleset_sha256_before": self.bundle.ruleset.sha256}
         proposal = review = None
+        normalized = []
         try:
             packet = validate_packet(packet)
             proposal = self.discovery.propose(packet, tid)
+            proposal, normalized = normalize_proposal(proposal, packet)
+            if normalized:
+                self._diag({"kind": "proposal_normalized", "transaction_id": tid, "phase": phase, "notes": normalized[:40],
+                            "note_count": len(normalized)})
             proposal = validate_proposal(proposal, packet)
             outcome = self._install(packet, proposal, call, result, tid, record)
         except _SoftFailure as exc:
@@ -926,18 +968,25 @@ class ProfilePresentation:
             self._gap("llm-soft-failure", call=call, phase=phase, reason=exc.cls)
         except GuestTransactionStop:
             raise
+        except json.JSONDecodeError as exc:
+            cap = getattr(self.discovery, "budget", None)
+            cut = exc.pos >= max(len(exc.doc) - 2, 0) or not exc.doc.rstrip().endswith("}")
+            outcome = ("rejected:truncated-json: reply ends mid-object (likely the %s-token output cap); raise output_tokens"
+                       % getattr(cap, "output_tokens", "?")) if cut else "rejected:invalid-json: %s" % redact(str(exc))
+            self._diag({"kind": "proposal_unparsable", "transaction_id": tid, "phase": phase, "truncated": cut,
+                        "output_tokens_cap": getattr(cap, "output_tokens", None)})
         except Exception as exc:  # noqa: BLE001 - stale/invalid/unsupported: installed bundle untouched
             outcome = "rejected:%s: %s" % (type(exc).__name__, redact(str(exc)))
             if isinstance(exc, ValueError) and "budget" in str(exc):
                 self._gap("llm-coverage-stopped", call=call, phase=phase, reason="budget")
-        record.update(outcome=outcome, profile_sha256_after=self.bundle.sha256, proposal=proposal,
+        record.update(outcome=outcome, normalized=normalized[:40], profile_sha256_after=self.bundle.sha256, proposal=proposal,
                       proposal_sha256=digest(proposal) if proposal else None)
         legacy = {"transaction_id": tid, "command": (call.get("arguments") or {}).get("command") or _ref_path(call),
                   "operation": call.get("operation"), "run_id": call.get("run_id"), "session_id": call.get("session_id"),
                   "call_id": call.get("call_id"), "phase": phase,
                   "raw_sha256": argument_digest({"output": (result or {}).get("stdout", "")}) if result else None,
                   "accepted": outcome == "installed", "reason": outcome, "outcome": outcome, "proposal": proposal,
-                  "review": record.get("review"), "warnings": [], "soft_failure": None,
+                  "review": record.get("review"), "warnings": [], "soft_failure": None, "normalized": normalized[:40],
                   "ruleset_sha256_before": record["ruleset_sha256_before"], "ruleset_sha256_after": self.bundle.ruleset.sha256,
                   "profile_sha256_before": record["profile_sha256_before"], "profile_sha256_after": self.bundle.sha256,
                   "changes": [c for c in self._changes if c["transaction_id"] == tid],
@@ -1109,7 +1158,8 @@ class ProfilePresentation:
         if self.mode == "develop":
             base.update(LABELS, proxy_mode="llm", reviewer=self.discovery.has_reviewer,
                         proposer_prompt_version=PROPOSER_PROMPT_VERSION, proposer_prompt_sha256=PROPOSER_PROMPT_SHA256,
-                        reviewer_prompt_version=REVIEWER_PROMPT_VERSION, reviewer_prompt_sha256=REVIEWER_PROMPT_SHA256)
+                        reviewer_prompt_version=REVIEWER_PROMPT_VERSION, reviewer_prompt_sha256=REVIEWER_PROMPT_SHA256,
+                        review_phase=self.review_phase)
         return base
 
     def write_report(self, out=None, provider=None) -> Path:

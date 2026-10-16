@@ -326,7 +326,7 @@ def test_evidence_only_uses_default_finalizer_preserves_window_and_partial_resul
     from tests.artifact_upload.test_receipt_intervals import archive
     from sandbox.artifact_upload.receipts import ServiceReceipts
     _, workflow, _, _ = make(tmp_path, [turn(sid='session-1'), turn('Uploaded.', sid='session-1')],
-                            jump={WORLD['task_prompts']['upload']: 181})
+                            jump={WORLD['task_prompts']['upload']: 3601})
     workflow.run()
     state = workflow.continuation_snapshot()
     assert state['next'] == 'evidence'
