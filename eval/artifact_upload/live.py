@@ -23,8 +23,8 @@ Public API (the run wiring depends on exactly this)::
     live.usage() -> dict              # calls, reserved/reported cost, aux_seconds, halted ...
 
 ``clients`` are AuxiliaryClient-like (``upstream``, ``model``, ``complete(payload, *, seconds,
-max_tokens, max_cost_usd) -> Reply``). With a reviewer, it must be a different (upstream, model)
-identity than the proposer. ``out_dir`` receives: rules/ruleset.v{N}.json (start set + every install),
+max_tokens, max_cost_usd) -> Reply``). A reviewer may share the proposer's model identity;
+reviewer calls retain their own budget and accounting. ``out_dir`` receives: rules/ruleset.v{N}.json (start set + every install),
 candidate_rules.jsonl, presentation-live.jsonl, review_events.jsonl (reviewer verdicts), and, from
 ``write_report``, rules.final.json and proxy_report.md. ``degraded_output`` ("raw" default) is what a
 call gets when discovery is busy (non-blocking lock) or the budget halted: "raw" = unmodified output,
@@ -375,8 +375,8 @@ class LiveDiscovery(DevelopmentDiscovery):
     """Wide-coverage rule proposer. Reuses DevelopmentDiscovery._call (budget, receipts, halting)."""
 
     def __init__(self, *, proposer, reviewer=None, recorder=None, budget: LiveBudget, retry_length=True):
-        if reviewer is not None and (reviewer is proposer or (reviewer.upstream, reviewer.model) == (proposer.upstream, proposer.model)):
-            raise ValueError("reviewer must use a distinct configured model identity")
+        if reviewer is proposer:
+            raise ValueError("reviewer and proposer must be separate client instances")
         self.proposer = _Unfenced(proposer, retry_length=retry_length)
         self.reviewer = _Unfenced(reviewer) if reviewer is not None else None
         self.recorder, self.budget = recorder or _BufferedRecorder(), budget

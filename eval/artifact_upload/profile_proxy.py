@@ -5,7 +5,7 @@ Runtime API (what the run wiring uses)::
     pres = ProfilePresentation(out_dir, bundle, proposer=None, reviewer=None, budget=None, profile_out=None,
                                condition=None, await_delivery=False)
     # proposer None  -> deterministic mode: zero auxiliary calls, applies saved setup + explicit rules.
-    # proposer given -> development mode (LiveBudget required); reviewer optional, distinct model identity.
+    # proposer given -> development mode (LiveBudget required); reviewer optional, separately budgeted.
     pres.control = ProxyControl          # optional; apply_pending() runs under serialization at each boundary
     pres.attach_recorder(recorder)       # RunRecorder; diagnostics stream
     pres.service_aliases / .provenance / .fixture_bytes()      # frozen fixture, delegated
@@ -382,7 +382,7 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
         class Client:
             def complete(self, payload, **limits):
                 # The normal transport reserves and accounts the reviewer allowance; no retries.
-                return json.dumps(account._call("reviewer", payload, transaction))
+                return json.dumps(account._call("contradiction_judge", payload, transaction))
 
         return judge_contradiction(Client(), proposal=proposal, profile=profile, protected_facts=facts,
                                    delivered_history=history, cap_bytes=HISTORY_CAP_BYTES)

@@ -809,6 +809,19 @@ def test_reviewer_needs_its_own_budget_and_accounts_separately(tmp_path):
     default_judge = ProfilePresentation(tmp_path / "b", bundle_with([]), proposer=Scripted([]), budget=BUDGET, reviewer_budget=BUDGET)
     assert default_judge.discovery.account.budget.cost_usd == BUDGET.cost_usd
     assert default_judge.discovery.account.budget.seconds == 120
+
+
+def test_reviewer_may_share_proposer_identity_and_judge_call_is_labeled(tmp_path):
+    proposer = Scripted([])
+    reviewer = Scripted([], model="m1")
+    pres = ProfilePresentation(tmp_path / "same-model", bundle_with([]), proposer=proposer,
+                              reviewer=reviewer, budget=BUDGET, reviewer_budget=BUDGET)
+    assert pres.discovery.proposer.model == pres.discovery.account.proposer.model == "m1"
+    verdict = pres.discovery.account._call("contradiction_judge", {"schema": "contradiction-check.v1"}, "txn-judge")
+    assert verdict["outcome"] == "no_contradiction"
+    buffered = pres.discovery.account.recorder.recorder
+    calls = [payload for stream, payload in buffered.items if payload.get("kind") == "development_auxiliary_call"]
+    assert calls[-1]["role"] == "contradiction_judge"
     r = rule("h", ["hostname"], "worker-07", "alex-dev")
 
     def approve(payload):

@@ -327,11 +327,12 @@ def test_budget_rejects_unbounded_settings(kwargs):
         Budget(**({'cost_usd': .1, 'max_call_cost_usd': .01} | kwargs))
 
 
-def test_same_reviewer_model_identity_is_forbidden(setup):
+def test_same_reviewer_model_identity_is_allowed(setup):
     discovery, _, proposer, _, recorder = setup
-    with pytest.raises(ValueError):
-        DevelopmentDiscovery(mode='develop', proposer=proposer, reviewer=MockClient('proposer'), recorder=recorder,
-            budget=Budget(.1, .01), base_digests=BASE, source_batch_id='old')
+    same_model = MockClient('proposer')
+    allowed = DevelopmentDiscovery(mode='develop', proposer=proposer, reviewer=same_model, recorder=recorder,
+        budget=Budget(.1, .01), base_digests=BASE, source_batch_id='old')
+    assert (allowed.proposer.upstream, allowed.proposer.model) == (same_model.upstream, same_model.model)
 
 
 def test_guarded_transport_uses_mock_local_provider_without_tools_or_retry():

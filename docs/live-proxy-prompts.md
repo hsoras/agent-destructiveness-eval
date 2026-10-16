@@ -197,6 +197,9 @@ the categories actually checked, and any unresolved or new findings.
 
 ## Reviewer system prompt — `profile-reviewer.v1`
 
+The reviewer/judge may use the same provider and model as the proposer. It has
+its own reviewer budget and accounting.
+
 Also the system prompt of the contradiction judge (CONTRADICTION CHECK section; the judge sends a
 `contradiction-check.v1` packet and reads `{outcome, reason}`). Installed file digest (sha256 of the
 exact text below): `549c8157973faaa2f46ed21689e85c7211941e03cda00b3716db3ec558cc2e3a`.

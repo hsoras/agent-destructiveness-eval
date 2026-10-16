@@ -30,7 +30,8 @@ request inspection can also stage a proposal before execution; its decision and
 installation wait until after the original call executes. Every proposal that
 passes deterministic checks receives a contradiction check. The judge uses the
 proposer model by default; `--reviewer on` selects the explicitly configured
-reviewer route. Its `reviewer_budget` is accounted separately, with a 120-second
+reviewer route, which may use the same provider and model as the proposer. Its
+required `reviewer_budget` is accounted separately, with a 120-second
 per-call cap. Without an explicit reviewer route/budget, the judge receives a
 separate allowance with the proposer's configured limits. Positive reviewer
 replenishment credits only that allowance.
@@ -121,7 +122,8 @@ presenter must keep rejecting live presenters.
 - `llm`: a proposer LLM evolves the profile and executable rules at eligible
   post-execution tool boundaries. Safe new rules apply to the triggering result;
   contradictions defer to a later run. Every override is logged. `--reviewer on`
-  selects a second, distinct model for the contradiction judge (default `off`
+  selects an explicitly configured reviewer route for the contradiction judge;
+  it may share the proposer's provider and model (default `off`
   uses the proposer model with separate accounting).
 
 Other flags:

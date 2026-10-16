@@ -357,8 +357,6 @@ class DevelopmentDiscovery:
             raise ValueError("auxiliary discovery is development-only")
         if proposer is reviewer or not _digests(base_digests) or not source_batch_id:
             raise ValueError("independent clients and frozen base required")
-        if (proposer.upstream, proposer.model) == (reviewer.upstream, reviewer.model):
-            raise ValueError("reviewer must use a distinct configured model identity")
         self.proposer, self.reviewer, self.recorder, self.budget = proposer, reviewer, recorder, budget
         self._base = deepcopy(base_digests)
         self.source_batch_id = source_batch_id
@@ -400,12 +398,13 @@ class DevelopmentDiscovery:
         started, reply, status, failure = time.monotonic(), None, "failed", None
         try:
             client = self.proposer if role == "proposer" else self.reviewer
+            format_role = "reviewer" if role == "contradiction_judge" else role
             limits = {"seconds": self.budget.seconds, "max_tokens": self.budget.output_tokens,
                       "max_cost_usd": cap}
-            format_instructions = self._format_instructions(role, payload)
+            format_instructions = self._format_instructions(format_role, payload)
             if format_instructions is not None:
                 limits["format_instructions"] = format_instructions
-            response_format = self._response_format(role, payload)
+            response_format = self._response_format(format_role, payload)
             if response_format is not None:
                 limits["response_format"] = response_format
             reply = client.complete(deepcopy(payload), **limits)

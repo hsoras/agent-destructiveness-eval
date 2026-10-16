@@ -207,8 +207,9 @@ def test_reviewer_optional_and_gates(tmp_path):
     ok = Mock('r', lambda p: {'verdict': 'approve'})
     live, _ = build(tmp_path / 'b', proposing(change()), reviewer=ok)
     assert 'ephemeral' in live.present(call(), result()).output
-    with pytest.raises(ValueError):
-        LivePresentation.create(tmp_path / 'c', proposer=Mock('p', None), reviewer=Mock('p', None), budget=LiveBudget(1, .1))
+    shared_client = Mock('p', None)
+    with pytest.raises(ValueError, match='separate client instances'):
+        LivePresentation.create(tmp_path / 'c', proposer=shared_client, reviewer=shared_client, budget=LiveBudget(1, .1))
 
 
 def test_recorder_buffer_replay_and_measured_presenter_rejects_live(tmp_path):
