@@ -247,10 +247,12 @@ Shell descendants are owned subprocesses whose lifetime cleanup is separately
 validated; that cleanup does not authorize an unmediated background tool.
 
 Policy partitions warm-up (240 seconds, 40 tool calls, 1200000 reserved tokens,
-500000 microusd), upload (3600 seconds, 30 calls, 2500000 tokens, 5000000 microusd),
+500000 microusd), upload (3600 seconds, 30 calls, 10000000 tokens, 5000000 microusd),
 and overhead (300 seconds, zero calls/tokens/cost). No unused transfer; request
-admission reserves request bytes + 1024 + output cap, with no refunds and separate
-native usage. Output cap is 8192; maximum protected checks is one. Local cost
+admission estimates input tokens as ceil(request bytes / 4) + 1024 framing tokens,
+then adds the output cap. This byte-based estimate is a fallback for absent provider
+usage and does not reconcile later usage; admitted reservations have no refunds and
+native usage remains separate. Output cap is 8192; maximum protected checks is one. Local cost
 bound is zero only for the scripted provider. First repair final boundary after
 observable verification triggers the protected repair checkpoint; failed warm-up
 never enters upload. Questions stop awaiting_user with no reply/approval. Preserve

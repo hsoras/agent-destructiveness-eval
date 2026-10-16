@@ -118,7 +118,8 @@ def test_verification_requires_executed_test_command(tool, command, expected):
 
 def test_reservation_derives_from_frozen_budget():
     m = Policy().manifest()
-    assert Policy().output_tokens == 8192 and m['reservation_requests_at_30kb'] == {'warmup': 30, 'upload': 63}
+    assert Policy().output_tokens == 8192 and m['reservation_requests_at_30kb'] == {'warmup': 71, 'upload': 598}
+    assert Policy().upload.tokens == 10_000_000
 
 
 def test_symlinks_pruned_not_followed_and_in_tree_links_kept(tmp_path, monkeypatch):
@@ -165,7 +166,7 @@ def test_frozen_partition_no_unused_transfer_wall_overhead_and_provider_reservat
     assert snap['remaining']['upload']['tool_calls'] == Policy().upload.tool_calls
     body = json.dumps({'max_tokens': 12, 'messages': []}).encode()
     ledger.provider(body)
-    assert ledger.snapshot()['spent']['upload']['tokens'] == len(body) + 1024 + 12
+    assert ledger.snapshot()['spent']['upload']['tokens'] == math.ceil(len(body) / 4) + 1024 + 12
     assert Policy().manifest()['total']['wall_seconds'] == 4140
 
 
@@ -229,7 +230,7 @@ def test_budget_guard_attempts_once_and_reserves_once_on_upstream_failure(tmp_pa
         assert status == (503 if failure_mode == 'retryable_status' else 502)
         assert guard.stats['received'] == guard.stats['audited'] == 1
         assert guard.provider_summary()['retries'] == 0
-        assert ledger.snapshot()['spent']['upload']['tokens'] == len(raw) + 1024 + 16
+        assert ledger.snapshot()['spent']['upload']['tokens'] == math.ceil(len(raw) / 4) + 1024 + 16
         if failure_mode == 'retryable_status':
             assert len(seen) == guard.stats['forwarded'] == 1
             assert body == b'{"error":"temporarily unavailable"}'
@@ -250,12 +251,12 @@ def test_provider_bound_accepts_null_alias_and_reserves_stricter_active_bound():
     captured_shape = json.dumps({'max_completion_tokens': None, 'max_tokens': 8192,
                                  'model': 'test-canary', 'messages': []}).encode()
     ledger.provider(captured_shape)
-    assert ledger.snapshot()['spent']['upload']['tokens'] == len(captured_shape) + 1024 + 8192
+    assert ledger.snapshot()['spent']['upload']['tokens'] == math.ceil(len(captured_shape) / 4) + 1024 + 8192
 
     stricter = json.dumps({'max_completion_tokens': 4096, 'max_tokens': 8192, 'messages': []}).encode()
     ledger.provider(stricter)
     assert ledger.snapshot()['spent']['upload']['tokens'] == (
-        len(captured_shape) + 1024 + 8192 + len(stricter) + 1024 + 4096)
+        math.ceil(len(captured_shape) / 4) + 1024 + 8192 + math.ceil(len(stricter) / 4) + 1024 + 4096)
 
 
 @pytest.mark.parametrize(('body', 'message'), [
@@ -441,7 +442,7 @@ def test_fractional_target_rate_reserves_wire_bytes_at_max_price_and_rounds_up()
     ledger.enter('upload')
     raw = json.dumps({'model': 'z-ai/glm-5.3-flash', 'messages': [], 'max_tokens': 8192}).encode()
     ledger.provider(raw)
-    tokens = len(raw) + 1024 + 8192
+    tokens = math.ceil(len(raw) / 4) + 1024 + 8192
     assert ledger.spent['upload']['tokens'] == tokens
     assert ledger.spent['upload']['cost_microusd'] == math.ceil(tokens * 0.07)
 
@@ -462,7 +463,7 @@ def test_split_prices_reserve_input_and_output_separately_with_ceiling_and_legac
     ledger = Ledger(policy)
     ledger.enter('upload')
     ledger.provider(raw)
-    input_tokens = len(raw) + 1024
+    input_tokens = math.ceil(len(raw) / 4) + 1024
     assert ledger.spent['upload']['tokens'] == input_tokens + 1
     assert ledger.spent['upload']['cost_microusd'] == (
         math.ceil(input_tokens * 0.05) + math.ceil(1 * 0.40))
@@ -505,7 +506,7 @@ def test_split_price_policy_json_loads_and_cost_cutoff_prevents_forwarding():
 def test_split_price_cost_limit_is_cumulative_for_repeated_title_requests():
     body = json.dumps({'model': 'azure/gpt-5-nano', 'messages': [{'role': 'user', 'content': 'title'}],
                        'max_tokens': 32}).encode()
-    input_tokens = len(body) + 1024
+    input_tokens = math.ceil(len(body) / 4) + 1024
     one_charge = math.ceil(input_tokens * 0.05) + math.ceil(32 * 0.40)
     ledger = Ledger(Policy(upload=Allowance(900, 40, 100_000, one_charge), output_tokens=8192,
                            input_microusd_per_token=0.05, output_microusd_per_token=0.40))

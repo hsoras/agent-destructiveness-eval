@@ -29,12 +29,12 @@ class Allowance:
 @dataclass(frozen=True)
 class Policy:
     warmup: Allowance = Allowance(240, 40, 1_200_000, 500_000)
-    upload: Allowance = Allowance(3600, 30, 2_500_000, 5_000_000)
+    upload: Allowance = Allowance(3600, 30, 10_000_000, 5_000_000)
     overhead: Allowance = Allowance(300, 0, 0, 0)
-    # Per-request reservation = raw request bytes + 1024 framing + the request's output cap, no refunds. The
-    # native client always asks for the 32000 output cap, so a typical 30 KB request reserves ~63k tokens.
-    # Stage token ceilings are therefore sized at 19 such requests (1_200_000, was 600_000 = ~9 requests),
-    # leaving the 40/30 tool-call ceilings reachable. Ceilings stay per-stage; nothing transfers between stages.
+    # Input token reservation estimates UTF-8 request bytes at 4 bytes/token, plus 1024 framing tokens
+    # and the request's output cap. This is still a conservative fallback, with no refunds. The
+    # native client always asks for the 32000 output cap, so a typical 30 KB request reserves ~40.5k tokens.
+    # Ceilings stay per-stage; nothing transfers between stages.
     output_tokens: int = 8192
     maximum_checks: int = 1
     microusd_per_token: float = 0  # zero only for local scripted acceptance; fractional rates round each charge up
@@ -56,8 +56,8 @@ class Policy:
                      trigger='first repair final boundary after successful observable verification',
                      completed_repair_final_continuable=True, question_policy='awaiting_user; no reply or approval',
                      provider_accounting='pre-request conservative reservation; no refunds; native usage separate',
-                     reservation='request_bytes + 1024 + output_tokens per provider request',
-                     reservation_requests_at_30kb={s: getattr(self, s).tokens // (30_000 + 1024 + self.output_tokens)
+                     reservation='ceil(request_bytes / 4) + 1024 + output_tokens per provider request',
+                     reservation_requests_at_30kb={s: getattr(self, s).tokens // (math.ceil(30_000 / 4) + 1024 + self.output_tokens)
                                                    for s in ('warmup', 'upload')})
         return value
 
@@ -159,7 +159,7 @@ class Ledger:
             self.failure = ('provider output bound exceeds frozen ceiling '
                             f'(model={model!r}, active_bounds={bounds}, ceiling={self.policy.output_tokens})')
             raise BudgetExhausted(self.failure)
-        input_tokens = len(raw) + 1024  # conservative UTF-8 input plus framing
+        input_tokens = math.ceil(len(raw) / 4) + 1024  # approximate UTF-8 tokens plus framing
         tokens = input_tokens + cap
         input_rate = self.policy.input_microusd_per_token
         output_rate = self.policy.output_microusd_per_token
