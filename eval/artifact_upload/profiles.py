@@ -28,7 +28,7 @@ SCHEMA = "artifact-proxy-profile.v1"
 PACKET_SCHEMA = "profile-packet.v1"
 PROPOSAL_SCHEMA = "profile-proposal.v1"
 REVIEW_SCHEMA = "profile-review.v1"
-VERSION = 1
+VERSION = 2
 CONDITIONS = ("natural-looking", "eval-looking")
 PHASES = ("before_execution", "after_execution")
 # Desired identity the model may change. uid/gid/os are invariants of the locked image.
@@ -74,7 +74,7 @@ GUEST_OP_FIELDS = CHANGE_FIELDS | {"operation_id", "kind", "args", "precondition
 OP_FIELDS = {"operation_id", "kind", "args", "preconditions", "writable_scope", "rollback", "verification", "persistent_setup", "description"}
 PROFILE_FIELDS = {"schema", "version", "parent_sha256", "profile_id", "condition", "preset_id", "desired_identity",
                   "guest_setup", "confirmed_state", "presented_facts", "ruleset", "findings",
-                  "experimental_discrepancies", "provenance"}
+                  "experimental_discrepancies", "provenance", "pending"}
 
 # ---------------------------------------------------------------- secrets
 # Key names are split into words so "output_tokens" is judged as words, not substrings.
@@ -682,11 +682,16 @@ def _apply_rule_changes(rules, changes):
 
 # ---------------------------------------------------------------- profile bundle
 def _profile_data(data):
+    # v1 profiles predate deferred changes; normalize them before strict validation.
+    if type(data) is dict and data.get("schema") == SCHEMA and data.get("version") == 1 and "pending" not in data:
+        data = {**data, "version": VERSION, "pending": []}
     _plain(data)
     _object(data, PROFILE_FIELDS, "profile")
     if data["schema"] != SCHEMA:
         raise ProfileError("wrong profile schema")
-    _number(data["version"], "profile version", lo=1)
+    _number(data["version"], "profile version", lo=VERSION)
+    if data["version"] < VERSION:
+        raise ProfileError("unsupported profile version")
     if data["condition"] not in CONDITIONS:
         raise ProfileError("unknown profile condition")
     parent = data["parent_sha256"]
@@ -714,6 +719,33 @@ def _profile_data(data):
         _ident(key, "presented fact id")
         _commitment(commitment, proposal=False)
     _dicts(data["guest_setup"], "guest_setup")
+    if type(data["pending"]) is not list or len(data["pending"]) > MAX_ITEMS:
+        raise ProfileError("invalid pending changes")
+    pending_ids = set()
+    for entry in data["pending"]:
+        _object(entry, {"pending_id", "kind", "change", "source_run", "source_proposal_sha256", "reason", "created_at"}, "pending change")
+        _ident(entry["pending_id"], "pending_id")
+        if entry["kind"] not in ("rule", "guest_op"):
+            raise ProfileError("invalid pending kind")
+        _text(entry["source_run"], "pending source_run", 200)
+        if type(entry["source_proposal_sha256"]) is not str or not HASH.fullmatch(entry["source_proposal_sha256"]):
+            raise ProfileError("invalid pending proposal digest")
+        _text(entry["reason"], "pending reason", 1000)
+        _text(entry["created_at"], "pending created_at", 100)
+        if entry["pending_id"] in pending_ids:
+            raise ProfileError("duplicate pending_id")
+        pending_ids.add(entry["pending_id"])
+        if entry["kind"] == "rule":
+            try:
+                RuleSet.from_dict({"schema": RULES_SCHEMA, "version": 1, "parent_sha256": None,
+                                   "rules": [entry["change"]], "label_map": {}})
+            except (RuleError, TypeError, KeyError) as exc:
+                raise ProfileError(f"invalid pending rule: {exc}") from exc
+        else:
+            try:
+                DEFAULT_CATALOG.validate_request(entry["change"])
+            except (OperationError, TypeError, KeyError) as exc:
+                raise ProfileError(f"invalid pending guest operation: {exc}") from exc
     _dicts(data["experimental_discrepancies"], "experimental_discrepancies")
     findings = _dicts(data["findings"], "findings")
     for f in findings:
@@ -755,9 +787,9 @@ class ProfileBundle:
         identity = {"os": "linux", "user": guest["account"], "uid": guest["uid"], "gid": guest["gid"],
                     "hostname": guest["hostname"], "home": guest["home"], "worktree": guest["worktree"],
                     "display": {}, "environment": {}}
-        return cls.from_dict({"schema": SCHEMA, "version": 1, "parent_sha256": None,
+        return cls.from_dict({"schema": SCHEMA, "version": VERSION, "parent_sha256": None,
             "profile_id": str(uuid.uuid4()), "condition": condition, "preset_id": condition,
-            "desired_identity": identity, "guest_setup": [], "confirmed_state": {}, "presented_facts": {},
+            "desired_identity": identity, "guest_setup": [], "confirmed_state": {}, "presented_facts": {}, "pending": [],
             "ruleset": default_ruleset(condition).data,
             "findings": [], "experimental_discrepancies": [], "provenance": {"preset": condition}})
 
