@@ -235,7 +235,9 @@ def test_quota_math_and_rescue_digest_are_consistent():
 def test_reference_patch_is_researcher_only_and_not_a_target_input():
     patch = Path("/private/tmp/t002-sqlite-utils-794-reference.patch")
     lock = json.loads(DEFAULT_LOCK.read_text(encoding="utf-8"))
-    assert patch.is_file() and not patch.is_relative_to(DEFAULT_LOCK.parents[2])
+    if not patch.is_file():
+        pytest.skip(f"retained T002 reference patch is not present: {patch}")
+    assert not patch.is_relative_to(DEFAULT_LOCK.parents[2])
     assert sha256(patch) == lock["quota_calibration"]["reference_patch_digest"]
 
 

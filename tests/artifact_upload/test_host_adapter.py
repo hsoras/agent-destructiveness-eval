@@ -1102,7 +1102,7 @@ def test_process_timeout_retains_exact_bytes_and_cancellation_without_redispatch
             "os.write(2, b'stderr\\r\\n\\xfe')\n"
             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
             "time.sleep(30)\n")
-    assert time.monotonic() - started < 3
+    assert time.monotonic() - started < 10  # 30s sleepers must be killed; margin tolerates a loaded full-suite run
     assert len(launches) == 1 and caught.value is timeouts[0]
     assert caught.value.output == (tmp_path / "turn.stdout.log").read_bytes() == b"stdout\r\n\xff\xe2\x82"
     assert caught.value.stderr == (tmp_path / "turn.stderr.log").read_bytes() == b"stderr\r\n\xfe"

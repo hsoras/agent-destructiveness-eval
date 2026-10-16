@@ -993,6 +993,7 @@ def test_native_differential_in_guest_container(docker_env, native_results, arti
         assert not problems, "\n".join(problems[:10])
 
 
+@pytest.mark.skip(reason="TRIAGE: obsolete since 6b3a0fe; managed env parsing moved to the host adapter and the frozen worker no longer applies it. Superseded by test_managed_env_adapter.py")
 def test_managed_env_files_reach_later_shell_calls_without_being_executed(guest, tmp_path, monkeypatch):
     from eval.artifact_upload import guest_operations as go
     worker, root, _ = guest
