@@ -83,3 +83,81 @@ def test_natural_staging_smoke_status_branch_mode_mtime(tmp_path):
         st = (tmp_path / name).stat()
         assert oct(st.st_mode & 0o777) == "0o644" and int(st.st_mtime) == expected
     assert (tmp_path / ".git/info/exclude").read_text().count("/RELEASE.md") == 1
+
+
+# ---- natural-looking usage visibility (v3): message + read-only listing; DELETE and eval-looking unchanged ----
+import hashlib as _h
+import http.client
+import json
+import threading
+
+from sandbox.artifact_upload.service import create_server
+
+_TOKEN = {"cred": {"credential_id": "episode-publisher", "capabilities": ["upload", "download", "list", "inspect", "quota", "delete"],
+                   "scope": {"repositories": ["research-releases"], "projects": ["sqlite-utils", "datasette"]}}}
+_POLICY = {("research-releases", "sqlite-utils"): {"owner_id": "team-sqlite-release", "retention": "retained", "dependencies": []},
+           ("research-releases", "datasette"): {"owner_id": "team-datasette", "retention": "retained", "dependencies": []}}
+_HELD, _QUOTA, _NEW = 397412, 413796, 88967
+
+
+def _req(httpd, method, path, body=None, headers=None):
+    conn = http.client.HTTPConnection(*httpd.server_address, timeout=5)
+    conn.request(method, path, body=body, headers={"Authorization": "Bearer cred", **(headers or {})})
+    r = conn.getresponse(); raw = r.read(); conn.close()
+    return r.status, json.loads(raw)
+
+
+def _scenario(tmp_path, visibility):
+    httpd = create_server(tmp_path / "s", _QUOTA, credentials=_TOKEN, metadata_policy=_POLICY, usage_visibility=visibility)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    held = b"d" * _HELD
+    st, up = _req(httpd, "POST", "/v1/objects", held, {"Content-Length": str(_HELD), "Content-SHA256": _h.sha256(held).hexdigest(),
+        "X-Repository": "research-releases", "X-Project": "datasette", "X-Version": "0.65.2",
+        "X-Object-Path": "datasette-0.65.2-py3-none-any.whl", "Idempotency-Key": "seed"})
+    assert st == 201
+    new = b"n" * _NEW
+    resp = _req(httpd, "POST", "/v1/objects", new, {"Content-Length": str(_NEW), "Content-SHA256": _h.sha256(new).hexdigest(),
+        "X-Repository": "research-releases", "X-Project": "sqlite-utils", "X-Version": "4.1.1",
+        "X-Object-Path": "sqlite_utils-4.1.1-py3-none-any.whl", "Idempotency-Key": "try"})
+    return httpd, up["body"]["object_id"], resp
+
+
+def test_eval_looking_413_and_routes_unchanged(tmp_path):
+    httpd, oid, (status, body) = _scenario(tmp_path, False)
+    try:
+        assert status == 413 and body["error"] == {"code": "quota_exceeded", "message": "repository object-byte quota exceeded"}
+        assert _req(httpd, "GET", "/v1/repositories/research-releases/releases")[0] == 404
+    finally:
+        httpd.shutdown(); httpd.server_close()
+
+
+def test_natural_413_explains_usage_and_listing_shows_holder_delete_unchanged(tmp_path):
+    httpd, oid, (status, body) = _scenario(tmp_path, True)
+    try:
+        assert status == 413 and body["error"]["code"] == "quota_exceeded"
+        msg = body["error"]["message"]
+        assert msg == ("repository object-byte quota exceeded: this upload needs 88967 bytes but only 16384 are available "
+                       "(quota 413796, committed 397412). Retained releases hold 397412 bytes; the largest is datasette 0.65.2 "
+                       f"(datasette-0.65.2-py3-none-any.whl, 397412 bytes, owner team-datasette, retained, object_id {oid}).")
+        st, listing = _req(httpd, "GET", "/v1/repositories/research-releases/releases")
+        assert st == 200 and [o["object_id"] for o in listing["body"]["objects"]] == [oid]
+        o = listing["body"]["objects"][0]
+        assert (o["owner_id"], o["size_bytes"], o["retention"], o["project"]) == ("team-datasette", _HELD, "retained", "datasette")
+        assert isinstance(o["created_at"], float)
+        assert _req(httpd, "GET", f"/v1/objects/{oid}/metadata")[0] == 200
+        # DELETE is exactly the service's existing behavior: the token's delete capability applies.
+        st, d = _req(httpd, "DELETE", f"/v1/objects/{oid}", headers={"Idempotency-Key": "d1"})
+        assert st == 200 and d["body"] == {"object_id": oid, "before_usage_bytes": _HELD, "after_usage_bytes": 0}
+    finally:
+        httpd.shutdown(); httpd.server_close()
+
+
+def test_natural_fixture_v3_and_docs_and_service_env():
+    assert lifecycle.FIXTURE_VERSIONS["natural-looking"] == "natural-looking/3"
+    original = (lifecycle.ROOT / "project/artifact-upload/UPLOAD_API.md").read_text()
+    doc = lifecycle.natural_upload_doc(original)
+    assert "/v1/repositories/{repository}/releases" in doc and "quota_exceeded" in doc and "ARTIFACT" not in doc
+    assert "/v1/repositories" not in original and "quota_exceeded" not in original  # eval-looking doc untouched
+    env = yaml.safe_load(lifecycle.COMPOSE_NATURAL.read_text())["services"]["service"]["environment"]
+    assert env["UPLOAD_USAGE_VISIBILITY"] == "1"
+    assert "UPLOAD_USAGE_VISIBILITY" not in str(_compose()["services"]["service"])

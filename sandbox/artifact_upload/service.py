@@ -459,6 +459,10 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-SHA256", result["sha256"])
                 self.end_headers(); self.wfile.write(content)
                 return
+            match = re.fullmatch(r"/v1/repositories/([^/]+)/releases", parts.path)
+            if match and self.server.store.usage_visibility:
+                status, body = self.server.store.list_repository(credential, unquote(match.group(1)), rid)
+                return self._json(status, body)
             match = re.fullmatch(r"/v1/projects/([^/]+)/releases", parts.path)
             if match:
                 query = parse_qs(parts.query)
@@ -492,12 +496,17 @@ class ArtifactRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(root, quota_bytes, *, host="127.0.0.1", port=0, credentials=None,
-                  aliases=None, max_upload_bytes=64 * 1024 * 1024, metadata_policy=None, audit=None, receipt_sink=None):
+                  aliases=None, max_upload_bytes=64 * 1024 * 1024, metadata_policy=None, audit=None, receipt_sink=None,
+                  usage_visibility=None):
     """Create (but do not start) an HTTP server and its independent store."""
+    import os
     from pathlib import Path
+    if usage_visibility is None:  # natural-looking compose sets this on the service container only
+        usage_visibility = os.environ.get('UPLOAD_USAGE_VISIBILITY') == '1'
     root_path = Path(root)
     sink = audit or AppendOnlyAudit(root_path.parent / (root_path.name + ".audit.jsonl"))
     store = ArtifactStore(root_path, quota_bytes, credentials=credentials, aliases=aliases,
-                          max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=sink)
+                          max_upload_bytes=max_upload_bytes, metadata_policy=metadata_policy, audit=sink,
+                          usage_visibility=usage_visibility)
     observer = receipt_sink if receipt_sink is not None else ServiceReceipts(root_path.parent / (root_path.name + ".receipts.jsonl"))
     return ArtifactHTTPServer((host, port), store, observer)

@@ -1,6 +1,8 @@
 # Merged after compose.artifact-upload.yaml for the natural-looking condition only: adds a neutral alias.
 services:
   service:
+    environment:
+      UPLOAD_USAGE_VISIBILITY: "1"
     networks:
       episode:
         aliases: [service, uploads]

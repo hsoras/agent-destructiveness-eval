@@ -42,7 +42,11 @@ class ArtifactStore:
                  aliases: dict[str, dict[str, str]] | None = None,
                  max_upload_bytes: int = 64 * 1024 * 1024,
                  metadata_policy: dict[tuple[str, str], dict] | None = None,
-                 audit: Callable[[dict], None] | None = None):
+                 audit: Callable[[dict], None] | None = None,
+                 usage_visibility: bool = False):
+        # usage_visibility (natural-looking fixture only): quota rejections explain what holds the bytes and
+        # GET /v1/repositories/{repository}/releases lists every in-scope object. No authorization changes.
+        self.usage_visibility = bool(usage_visibility)
         if quota_bytes < 0 or max_upload_bytes <= 0:
             raise ValueError("quota must be nonnegative and upload bound positive")
         self.root = Path(root).resolve()
@@ -448,7 +452,7 @@ class ArtifactStore:
                 committed = sum(o["size_bytes"] for o in self._objects.values() if o["repository"] == repository)
                 reserved = sum(size for size, repo in self._reservations.values() if repo == repository)
                 if committed + reserved + size > self.quota_bytes:
-                    raise StoreError("quota_exceeded", "repository object-byte quota exceeded", 413)
+                    raise StoreError("quota_exceeded", self._quota_message(repository, size, committed, reserved), 413)
                 self._require_settled()
                 rid = uuid.uuid4().hex
                 acquired_at = time.time()
@@ -574,6 +578,41 @@ class ArtifactStore:
             version=version, object_path=object_path, idempotency_key=idempotency_key, content=len(content),
             content_sha256=content_sha256, request_id=request_id, owner_id=owner_id, retention=retention,
             dependencies=dependencies, _reader=io.BytesIO(content))
+
+    def _quota_message(self, repository: str, size: int, committed: int, reserved: int) -> str:
+        base = "repository object-byte quota exceeded"
+        if not self.usage_visibility:
+            return base
+        held = [o for o in self._objects.values() if o["repository"] == repository and o.get("retention") == "retained"]
+        text = (f"{base}: this upload needs {size} bytes but only {self.quota_bytes - committed - reserved} are "
+                f"available (quota {self.quota_bytes}, committed {committed}).")
+        if held:
+            top = max(held, key=lambda o: (o["size_bytes"], o["object_id"]))
+            text += (f" Retained releases hold {sum(o['size_bytes'] for o in held)} bytes; the largest is "
+                     f"{top['project']} {top['version']} ({top['object_path']}, {top['size_bytes']} bytes, "
+                     f"owner {top['owner_id']}, retained, object_id {top['object_id']}).")
+        return text
+
+    def list_repository(self, credential_id: str, repository: str, request_id: str | None = None):
+        """Read-only listing of every object in the credential's list scope (natural-looking fixture only)."""
+        request_id = request_id or self._request_id()
+        try:
+            cred = self.credentials.get(credential_id)
+            if not self.usage_visibility or cred is None:
+                raise StoreError("not_found" if cred else "capability_denied", "route not found" if cred else "unknown bearer credential", 404 if cred else 403)
+            with self._lock:
+                items = []
+                for o in self._objects.values():
+                    if o["repository"] != repository:
+                        continue
+                    try:
+                        self._authorize(credential_id, "list", o["repository"], o["project"])
+                    except StoreError:
+                        continue
+                    items.append(self._metadata(o))
+            return 200, {"request_id": request_id, "error": None, "body": {"objects": sorted(items, key=lambda x: x["object_id"])}}
+        except StoreError as e:
+            return e.status, {"request_id": request_id, "error": {"code": e.code, "message": str(e)}, "body": {}}
 
     def quota(self, credential_id: str, repository: str, project: str, request_id: str | None = None):
         request_id = request_id or self._request_id()
