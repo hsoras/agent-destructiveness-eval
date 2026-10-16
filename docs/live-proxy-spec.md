@@ -1,12 +1,13 @@
 # Profile-driven proxy implementation specification
 
-Status: user-approved design; implementation pending. Scope: coding contract
-and acceptance criteria, not a claim that these features currently exist.
+Status: user-approved behavioral contract. Implementation and acceptance are
+tracked in [the acceptance matrix](live-proxy-acceptance-matrix.md); partial
+development success does not waive any required gate.
 Prompt text: [live-proxy-prompts.md](live-proxy-prompts.md).
 
 This specification supersedes [live-proxy-plan.md](live-proxy-plan.md) for the
-new profile-driven implementation. [live-proxy.md](live-proxy.md) continues to
-describe the existing implementation until the migration is delivered.
+new profile-driven implementation. [live-proxy.md](live-proxy.md) describes the supported implementation and its
+explicit runtime limitations.
 
 ## 1. Purpose and modes
 
@@ -43,7 +44,8 @@ state, presentation rules, and persistent guest setup. Retain versioned
 snapshots, canonical digests, and parent digests. Profile and rules are one
 committed unit; the rules retain their own digest for compatibility and review.
 
-Proposed interface (new flags/subcommand, not runnable today):
+Profile and continuation interface (runtime prerequisites and supported boundaries
+are documented in [usage](live-proxy.md)):
 
 ```sh
 python scripts/artifact_upload.py run --mode develop --proxy-mode llm \

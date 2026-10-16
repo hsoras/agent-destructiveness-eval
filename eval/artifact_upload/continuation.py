@@ -337,6 +337,71 @@ def _save(target: Path, checkpoint: dict[str, Any]) -> None:
     _atomic_json(target / "checkpoint.json", checkpoint)
 
 
+class RestoreFidelityBlocked(RuntimeError):
+    """Guest process state cannot be shown restorable/absent; the message is a safe, concrete blocker."""
+
+
+PROCESS_ATTESTATION_SCHEMA = "guest-process-state-attestation/v1"
+# Observation (docker top, ps) never qualifies, and no process checkpoint/restore exists in Episode.restore, so only
+# an *enforced* absence contract can qualify -- and only when an independent verifier vouches for it.
+PROCESS_ATTESTATION_METHODS = ("enforced-process-free-boundary",)
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def process_restore_problem(snapshot: Any, verifier: Callable[[dict[str, Any], dict[str, Any]], bool] | None = None) -> str | None:
+    """Why this guest snapshot may not drive a cold restore, or None when evidence-backed attestation is complete.
+
+    Pure and side-effect free (only reads the attestation artifact). The snapshot must be quiescent, durably
+    exported, carry no process-state gap, and carry an attestation whose artifact hash verifies and whose
+    content declares no required process state uncaptured. ``verifier(snapshot, evidence_body)`` must independently
+    confirm the enforced-absence claim; production supplies none (no enforcement mechanism exists), so every real
+    snapshot stays blocked. A hash-checked JSON assertion alone is never sufficient.
+    """
+    if not isinstance(snapshot, dict):
+        return "guest snapshot is malformed"
+    gaps = snapshot.get("gaps", [])
+    if not isinstance(gaps, list) or any(not isinstance(g, dict) for g in gaps):
+        return "guest snapshot gaps are malformed"
+    for gap in gaps:
+        if "process" in str(gap.get("name", "")).lower():
+            return f"declared unrestorable guest process state: {_safe(gap.get('name'), 60)}"
+    if snapshot.get("quiescent") is not True or snapshot.get("durable_volume_export") is not True:
+        return "snapshot is not attested quiescent and durably exported"
+    att = snapshot.get("process_state_attestation")
+    if att is None:
+        return "no process-state attestation: absence of required guest process state is not established"
+    if (not isinstance(att, dict) or att.get("schema") != PROCESS_ATTESTATION_SCHEMA
+            or att.get("method") not in PROCESS_ATTESTATION_METHODS or att.get("quiescent") is not True
+            or att.get("required_process_state_uncaptured") is not False
+            or not isinstance(att.get("evidence_sha256"), str) or not _HEX64.match(att["evidence_sha256"])):
+        return "process-state attestation is malformed or does not attest quiescent capture with no uncaptured required process state"
+    rows = [a for a in snapshot.get("artifacts", []) if isinstance(a, dict) and a.get("kind") == "process-state-attestation"]
+    if len(rows) != 1 or rows[0].get("sha256") != att["evidence_sha256"] or not isinstance(rows[0].get("path"), str):
+        return "process-state attestation has no matching evidence artifact"
+    try:
+        raw = Path(rows[0]["path"]).read_bytes()
+        body = json.loads(raw)
+    except (OSError, ValueError):
+        return "process-state attestation evidence is unreadable"
+    if hashlib.sha256(raw).hexdigest() != att["evidence_sha256"]:
+        return "process-state attestation evidence digest mismatch"
+    if not isinstance(body, dict) or any(body.get(k) != att[k] for k in ("schema", "method", "quiescent", "required_process_state_uncaptured")):
+        return "process-state attestation evidence does not support the attestation"
+    if verifier is None:
+        return "no verifier can confirm enforced absence of guest process state in this build; process memory is not restorable"
+    try:
+        confirmed = verifier(snapshot, body) is True
+    except Exception:
+        confirmed = False
+    return None if confirmed else "process-state attestation was not confirmed by the enforcement verifier"
+
+
+def require_process_restore_attestation(snapshot: Any, verifier: Callable[[dict[str, Any], dict[str, Any]], bool] | None = None) -> None:
+    problem = process_restore_problem(snapshot, verifier)
+    if problem:
+        raise RestoreFidelityBlocked(problem)
+
+
 def _block(target: Path, checkpoint: dict[str, Any], missing: list[dict[str, Any]]) -> None:
     clean = [{"name": _safe(m.get("name"), 80), "reason": _safe(m.get("reason", ""), 200)} for m in missing]
     checkpoint["last_continue_attempt"] = {"at": datetime.now(timezone.utc).isoformat(), "status": "blocked", "missing": clean}
@@ -385,6 +450,8 @@ def continue_run(run_dir: str | Path, *, additional_allowances: dict[str, Any] |
             if callable(check):
                 try:
                     check(arg)
+                except RestoreFidelityBlocked as exc:
+                    _block(target, checkpoint, [{"name": "guest-process-state-unrestorable", "reason": str(exc)}])
                 except Exception as exc:
                     _block(target, checkpoint, [{"name": name, "reason": type(exc).__name__}])
         try:

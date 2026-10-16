@@ -97,6 +97,12 @@ def paused(tmp_path, monkeypatch):
     blob = tmp_path / "vol.tar"
     blob.write_bytes(b"v")
     store = NativeSessionStore(stage, runtime=runtime, runtime_sha256=host_adapter.RUNTIME_SHA256)
+    # Test-only evidence: real captures never carry this (see docs/live-proxy-process-restoration.md).
+    claim = {"schema": "guest-process-state-attestation/v1", "method": "enforced-process-free-boundary",
+             "quiescent": True, "required_process_state_uncaptured": False}
+    att = tmp_path / "process-attestation.json"
+    att.write_bytes(json.dumps(claim, sort_keys=True).encode())
+    att_sha = hashlib.sha256(att.read_bytes()).hexdigest()
     capture_checkpoint(
         run, run_id="run-1", session_id="session-1", condition="natural-looking",
         model_provider_refs={"provider": "http://provider", "model": "m", "api_key_env": "TEST_KEY",
@@ -104,8 +110,10 @@ def paused(tmp_path, monkeypatch):
                              "native_tool_schema_sha256": hashlib.sha256(TOOLS.encode()).hexdigest()},
         workflow=state, ledger=workflow.ledger.continuation_snapshot(), resources={}, native_session=store,
         boundary=state["boundary"], journal_path=run / "broker" / "executions.jsonl", output_store=outputs,
-        resource_snapshot=lambda: {"durable_volume_export": True, "artifacts": [
-            {"owner": "worker", "kind": "volume", "path": str(blob), "sha256": hashlib.sha256(b"v").hexdigest(), "bytes": 1}]},
+        resource_snapshot=lambda: {"durable_volume_export": True, "quiescent": True, "gaps": [],
+            "process_state_attestation": {**claim, "evidence_sha256": att_sha}, "artifacts": [
+            {"owner": "worker", "kind": "volume", "path": str(blob), "sha256": hashlib.sha256(b"v").hexdigest(), "bytes": 1},
+            {"owner": "episode", "kind": "process-state-attestation", "path": str(att), "sha256": att_sha, "bytes": att.stat().st_size}]},
         measurement={"measured": False}, proxy_allowances={"cost_usd": 1.0, "pairs": 4})
     db.execute("update message set data='mutated after pause'")
     db.commit()
@@ -122,7 +130,8 @@ def paused(tmp_path, monkeypatch):
         worker_calls.append(ep)
         return SimpleNamespace(close=lambda: None)
 
-    hooks = {"episode": episode, "worker": worker,
+    hooks = {"episode": episode, "process_attestation_verifier": lambda snapshot, body: True,  # test-only stand-in
+             "worker": worker,
              "adapter": FakeAdapter, "evidence": lambda ep, ad, led: (lambda: {"passed": True}, SimpleNamespace(snapshot=lambda: {}))}
     env = {**ENV, "AUX_KEY": "sk-aux"}
     return SimpleNamespace(run=run, hooks=hooks, runtime=runtime, env=env, episodes=episodes,
@@ -235,6 +244,24 @@ def test_mid_turn_boundary_stays_a_saved_blocker(paused, tmp_path):
     with pytest.raises(ContinuationBlocked, match="workflow-boundary"):
         go(paused)
     assert FakeAdapter.log == [] and paused.episodes == []
+
+
+@pytest.mark.parametrize("boundary", ["P", "M", "unclassified", None])
+def test_native_only_mid_turn_boundary_blocks_before_any_restore(paused, boundary):
+    """A native snapshot taken mid-turn must block even when the workflow state claims a clean T boundary."""
+    ck = paused.run / "checkpoint.json"
+    raw = json.loads(ck.read_text())
+    assert raw["workflow"]["boundary"] == "T"
+    raw["native_session"]["snapshot"]["boundary"] = boundary
+    from eval.artifact_upload.continuation import canonical_digest
+    raw.pop("checkpoint_sha256")
+    raw["checkpoint_sha256"] = canonical_digest(raw)
+    ck.write_text(json.dumps(raw))
+    with pytest.raises(ContinuationBlocked, match="native-boundary"):
+        go(paused)
+    assert FakeAdapter.log == [] and paused.episodes == [] and not paused.worker_calls
+    blocked = load_checkpoint(paused.run)
+    assert blocked["last_continue_attempt"]["status"] == "blocked"
 
 
 def test_default_profile_factory_deterministic_has_zero_auxiliary_usage(tmp_path):

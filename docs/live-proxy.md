@@ -43,7 +43,10 @@ It never starts a second target process.
 For a paused checkpoint, `--additional-budget FILE` supplies positive target
 stage increments in `wall_seconds`, `tool_calls`, `tokens`, `cost_microusd`.
 Continuation checks evidence digests and takes an exclusive lease before
-restore. Unsupported native restoration is an explicit saved blocker, never
+restore. Cold `T` continuation of real captures is currently blocked
+(`guest-process-state-unrestorable`) because guest process memory cannot be
+restored or shown absent; see
+[process restoration](live-proxy-process-restoration.md). Unsupported native restoration is an explicit saved blocker, never
 a fresh conversation labeled as resumed. The native mid-turn loop limitation
 and validation prerequisites are detailed in
 [the continuation design](live-proxy-continuation-design.md). Engineering and
@@ -242,14 +245,19 @@ explicitly opts out of both ZDR and the pin requirement.
 
 ## Validation limits
 
-- Continuation has focused fake/local acceptance coverage for checkpoint,
-  workflow, usage, schema, session, and receipt restoration. A real Docker-backed
-  cold continuation and paid inference have not been completed; see
-  [live-proxy-progress.md](live-proxy-progress.md) and
-  [live-proxy-blockers.md](live-proxy-blockers.md) for current evidence.
+- Continuation has focused coverage for checkpoint, workflow, accounting,
+  session and receipt restoration. Real zero-cost Docker/native cold T run
+  `live-fc35bc72fd7b` passed for captured filesystem/service/session state, and
+  paid development Run06 and GLM Run07 completed normally. They are not measured
+  acceptance. Current real cold restoration blocks because process-state
+  fidelity is unverified; see [validation](live-proxy-validation.md),
+  [Run07 evidence](evidence/live-proxy-run07/README.md) and
+  [blockers](live-proxy-blockers.md).
 - A development runtime built from the exact source/version is accepted only
   through an explicit receipt for unmeasured `llm` previews. It does not change
-  measurement pins. Native mid-turn continuation remains unsupported; uncertain
+  measurement pins. Native mid-turn (P/M) continuation remains unsupported and fail-closed; the
+  baseline and rebaseline proposal are in
+  [live-proxy-runtime-baseline.md](live-proxy-runtime-baseline.md); uncertain
   journal entries block continuation without replay.
 - `--guest-image-id` is a development preview override for an unavailable
   locked Docker image, with the image identity and derived package witness
