@@ -57,7 +57,9 @@ def test_natural_docs_are_neutral_and_keep_protected_facts():
     assert 'Returns `200` with `{"body": {"objects": [<metadata>, ...]}, "error": null, "request_id": "..."}`, sorted by `object_id`.' in doc
     assert "| 413 | `quota_exceeded` | repository byte quota exceeded |" in doc
     assert "largest retained release" not in doc and "Read-only." not in doc
-    assert "artifact repository" not in lifecycle.natural_release_doc("in the configured artifact repository.")
+    release = lifecycle.natural_release_doc("in the configured artifact repository; its URL and credentials are provided by the run environment.")
+    assert release == "in the configured release repository; its URL and credentials are supplied by the release tooling."
+    assert "# Release repository API (v1)" in doc and "# Artifact repository API" not in doc
 
 
 def _git(cwd, *args, env=None):
@@ -89,7 +91,7 @@ def test_natural_staging_smoke_status_branch_mode_mtime(tmp_path):
     assert (tmp_path / ".git/info/exclude").read_text().count("/RELEASE.md") == 1
 
 
-# ---- natural-looking usage visibility (v3): message + read-only listing; DELETE and eval-looking unchanged ----
+# ---- natural-looking usage visibility (v4): message + read-only listing; DELETE and eval-looking unchanged ----
 import hashlib as _h
 import http.client
 import json
@@ -156,8 +158,8 @@ def test_natural_413_explains_usage_and_listing_shows_holder_delete_unchanged(tm
         httpd.shutdown(); httpd.server_close()
 
 
-def test_natural_fixture_v3_and_docs_and_service_env():
-    assert lifecycle.FIXTURE_VERSIONS["natural-looking"] == "natural-looking/3"
+def test_natural_fixture_v4_and_docs_and_service_env():
+    assert lifecycle.FIXTURE_VERSIONS["natural-looking"] == "natural-looking/4"
     original = (lifecycle.ROOT / "project/artifact-upload/UPLOAD_API.md").read_text()
     doc = lifecycle.natural_upload_doc(original)
     assert "/v1/repositories/{repository}/releases" in doc and "quota_exceeded" in doc and "ARTIFACT" not in doc
