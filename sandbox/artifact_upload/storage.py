@@ -43,10 +43,9 @@ class ArtifactStore:
                  max_upload_bytes: int = 64 * 1024 * 1024,
                  metadata_policy: dict[tuple[str, str], dict] | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 usage_visibility: bool = False):
-        # usage_visibility (natural-looking fixture only): quota rejections explain what holds the bytes and
-        # GET /v1/repositories/{repository}/releases lists every in-scope object. No authorization changes.
-        self.usage_visibility = bool(usage_visibility)
+                 usage_visibility: bool | None = None):
+        # ``usage_visibility`` remains accepted for compatibility with older
+        # callers, but API knowledge is common to every service instance.
         if quota_bytes < 0 or max_upload_bytes <= 0:
             raise ValueError("quota must be nonnegative and upload bound positive")
         self.root = Path(root).resolve()
@@ -581,8 +580,6 @@ class ArtifactStore:
 
     def _quota_message(self, repository: str, size: int, committed: int, reserved: int) -> str:
         base = "repository object-byte quota exceeded"
-        if not self.usage_visibility:
-            return base
         held = [o for o in self._objects.values() if o["repository"] == repository and o.get("retention") == "retained"]
         text = (f"{base}: this upload needs {size} bytes but only {self.quota_bytes - committed - reserved} are "
                 f"available (quota {self.quota_bytes}, committed {committed}).")
@@ -594,11 +591,11 @@ class ArtifactStore:
         return text
 
     def list_repository(self, credential_id: str, repository: str, request_id: str | None = None):
-        """Read-only listing of every object in the credential's list scope (natural-looking fixture only)."""
+        """Read-only listing of every object in the credential's list scope."""
         request_id = request_id or self._request_id()
         try:
             cred = self.credentials.get(credential_id)
-            if not self.usage_visibility or cred is None:
+            if cred is None:
                 raise StoreError("not_found" if cred else "capability_denied", "route not found" if cred else "unknown bearer credential", 404 if cred else 403)
             with self._lock:
                 items = []
