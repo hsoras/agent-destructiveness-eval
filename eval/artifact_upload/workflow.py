@@ -55,7 +55,7 @@ class Policy:
         value.update(version='t012-partition-v2', unused_transfer=False,
                      trigger='first repair final boundary after successful observable verification',
                      completed_repair_final_continuable=True, question_policy='awaiting_user; no reply or approval',
-                     provider_accounting='provider-reported per-turn usage replaces reservations when complete; otherwise reservation retained',
+                     provider_accounting='provider-reported per-request usage (uncached input + output) replaces each reservation when the response completes, and per-turn usage reconciles at turn end; missing usage keeps the reservation; cached input tokens are not counted',
                      reservation='ceil(request_bytes / 4) + 1024 + output_tokens per provider request',
                      reservation_requests_at_30kb={s: getattr(self, s).tokens // (math.ceil(30_000 / 4) + 1024 + self.output_tokens)
                                                    for s in ('warmup', 'upload')})
@@ -199,6 +199,88 @@ class Ledger:
             cost = (_ceil_microusd(input_tokens, input_rate)
                     + _ceil_microusd(cap, output_rate))
         self.charge(tokens=tokens, cost_microusd=cost)
+        return Reservation(self.stage, tokens, cost)
+
+    def settle(self, reservation, usage):
+        """Replace one finished request's reservation with its provider-reported usage.
+
+        Called as soon as the response is fully relayed, so a long turn never accumulates stale reservations;
+        only requests still in flight hold a reservation. Cached input tokens (``cached_tokens`` and
+        cache writes) are NOT counted toward ``tokens``: the ceiling covers uncached input + output (+ reasoning,
+        which is already inside completion tokens), the same basis ``reconcile_provider_turn`` uses. Missing or
+        malformed usage keeps the full reservation (fail closed). Returns True when replaced.
+        """
+        parsed = parse_request_usage(usage)
+        if parsed is None or reservation is None or getattr(reservation, 'settled', True):
+            return False
+        tokens, cost = parsed
+        with self.lock:
+            reservation.settled = True
+            stage = reservation.stage
+            if cost is None:  # tokens known, cost not: keep the conservative cost reservation
+                cost = reservation.cost
+            self.spent[stage]['tokens'] += tokens - reservation.tokens
+            self.spent[stage]['cost_microusd'] += cost - reservation.cost
+            allowance = getattr(self.policy, stage)
+            if self.spent[stage]['tokens'] > allowance.tokens:
+                self.failure = self.failure or stage + ': tokens'
+            elif self.spent[stage]['cost_microusd'] > allowance.cost_microusd:
+                self.failure = self.failure or stage + ': cost_microusd'
+        return True
+
+
+class Reservation:
+    def __init__(self, stage, tokens, cost):
+        self.stage, self.tokens, self.cost, self.settled = stage, tokens, cost, False
+
+
+def parse_request_usage(raw):
+    """Extract (uncached tokens, cost_microusd or None) from a chat-completion JSON or SSE body, else None."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode('utf-8', 'replace')
+    if not isinstance(raw, str):
+        return None
+    candidates = []
+    try:
+        candidates.append(json.loads(raw))
+    except ValueError:
+        for line in raw.splitlines():
+            if line.startswith('data:') and line[5:].strip() not in ('', '[DONE]'):
+                try:
+                    candidates.append(json.loads(line[5:].strip()))
+                except ValueError:
+                    continue
+    usage = None
+    for item in candidates:
+        if isinstance(item, dict) and isinstance(item.get('usage'), dict):
+            usage = item['usage']
+    if usage is None:
+        return None
+
+    def num(value):
+        return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    prompt, completion = num(usage.get('prompt_tokens')), num(usage.get('completion_tokens'))
+    if prompt is None or completion is None:
+        return None
+    details = usage.get('prompt_tokens_details') if isinstance(usage.get('prompt_tokens_details'), dict) else {}
+    cached = (num(details.get('cached_tokens')) or 0) + (num(details.get('cache_write_tokens')) or 0)
+    tokens = int(max(prompt - cached, 0) + completion)
+    cost = num(usage.get('cost'))
+    if cost is not None:
+        cost = int((Decimal(str(cost)) * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
+    return tokens, cost
+
+
+class _Tee:
+    def __init__(self, inner):
+        self.inner, self.data = inner, bytearray()
+
+    def write(self, chunk):
+        self.data.extend(chunk)
+        return self.inner.write(chunk)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 def _ceil_microusd(tokens, rate):
@@ -249,16 +331,18 @@ class BudgetGuard(RecordingProviderGuard):
 
     def _forward(self, handler, raw):
         try:
-            self.ledger.provider(raw)
+            reservation = self.ledger.provider(raw)
         except BudgetExhausted:
             self.recorder.append('workflow_events', {'kind': 'budget_stop', 'resources': self.ledger.snapshot()})
             self._refuse(handler, 403, 'frozen episode budget exhausted')
             if getattr(self.ledger, 'stop', None):
                 self.ledger.stop()
             return
+        tee = handler.wfile = _Tee(handler.wfile)
         try:
             return super()._forward(handler, raw)
         finally:
+            self.ledger.settle(reservation, tee.data)  # unparseable usage keeps the reservation
             if self.recorder.failure and getattr(self.ledger, 'stop', None):
                 self.ledger.stop()
 
