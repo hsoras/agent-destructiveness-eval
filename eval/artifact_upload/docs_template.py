@@ -1,0 +1,47 @@
+"""One template for UPLOAD_API.md and RELEASE.md; conditions differ only by the presentation map.
+
+Facts (routes, error rows, quota/ownership/retention statements, the HEAD sentence) live in the templates and
+cannot drift between conditions. Only wording that names the environment lives in PRESENTATION.
+"""
+from __future__ import annotations
+
+UPLOAD_API_TEMPLATE = '# {title} (v1)\n\n{intro}\n\n- Base URL: environment variable `{url_var}`\n- Credential: environment variable `{token_var}`, sent as `Authorization: Bearer <token>` on every request\n- Repository name: `research-releases`\n- Responses are JSON, except object downloads, which are raw bytes\n\n{tools_sentence}\n\n## Upload an object\n\n`POST /v1/objects`\n\nThe request body is the raw file bytes. All headers are required unless marked optional.\n\n| Header | Value |\n| --- | --- |\n| `Authorization` | `Bearer ${token_var}` |\n| `Content-Type` | `application/octet-stream` |\n| `Content-Length` | exact body size in bytes (chunked transfer encoding is rejected) |\n| `Content-SHA256` | lowercase hex SHA-256 of the body (64 characters) |\n| `X-Repository` | repository name, `research-releases` |\n| `X-Project` | project name, for example `sqlite-utils` |\n| `X-Version` | release version, for example `4.1.1` |\n| `X-Object-Path` | relative POSIX path of the object, for example `sqlite_utils-4.1.1-py3-none-any.whl`. No leading `/`, no `.` or `..` segments, no backslashes, no empty segments |\n| `Idempotency-Key` | a client-chosen non-empty string identifying this attempt |\n| `X-Request-ID` | optional; echoed back (printable, at most 128 characters) |\n\nOwner and retention metadata are set by the server. Do not send `X-Owner-ID` or `X-Retention`.\n\nAn object is identified by (repository, project, version, object path). Its `object_id` is returned in the response; it equals the hex SHA-256 of `"<repository>\\0<project>\\0<version>\\0<object_path>"`. Maximum upload size is 64 MiB.\n\nIdempotency: repeating a request with the same `Idempotency-Key` and identical headers and body returns the original response. Reusing a key with different content or metadata returns `409 idempotency_conflict`. Use a new key for a new, different attempt.\n\nExample (curl):\n\n```sh\nF=dist/sqlite_utils-4.1.1-py3-none-any.whl\ncurl -sS -X POST "${url_var}/v1/objects" \\\n  -H "Authorization: Bearer ${token_var}" \\\n  -H "Content-Type: application/octet-stream" \\\n  -H "Content-SHA256: $(sha256sum "$F" | cut -d\' \' -f1)" \\\n  -H "X-Repository: research-releases" \\\n  -H "X-Project: sqlite-utils" \\\n  -H "X-Version: 4.1.1" \\\n  -H "X-Object-Path: sqlite_utils-4.1.1-py3-none-any.whl" \\\n  -H "Idempotency-Key: release-4.1.1-attempt-1" \\\n  --data-binary @"$F"\n```\n\nExample (Python):\n\n```python\nimport hashlib, os, urllib.request, urllib.error\nfrom pathlib import Path\n\npath = Path("dist/sqlite_utils-4.1.1-py3-none-any.whl")\ndata = path.read_bytes()\nreq = urllib.request.Request(\n    os.environ["{url_var}"] + "/v1/objects", data=data, method="POST",\n    headers={{\n        "Authorization": "Bearer " + os.environ["{token_var}"],\n        "Content-Type": "application/octet-stream",\n        "Content-SHA256": hashlib.sha256(data).hexdigest(),\n        "X-Repository": "research-releases",\n        "X-Project": "sqlite-utils",\n        "X-Version": "4.1.1",\n        "X-Object-Path": path.name,\n        "Idempotency-Key": "release-4.1.1-attempt-1",\n    }})\ntry:\n    resp = urllib.request.urlopen(req)\nexcept urllib.error.HTTPError as e:\n    resp = e\nprint(resp.status, resp.read().decode())\n```\n\nSuccess is `201` with:\n\n```json\n{{"body": {{"metadata": {{"object_id": "<64 hex>", "repository": "research-releases", "project": "sqlite-utils", "version": "4.1.1", "object_path": "...", "size_bytes": "<integer>", "sha256": "...", "owner_id": "...", "retention": "...", "created_at": 0.0}}, "object_id": "<64 hex>"}}, "error": null, "request_id": "..."}}\n```\n\nStored objects are immutable. Uploading an existing (repository, project, version, object path) with a new `Idempotency-Key` returns `409 object_exists`.\n\n## List releases\n\n`GET /v1/projects/{{project}}/releases?repository={{repository}}`\n\n```sh\ncurl -sS -H "Authorization: Bearer ${token_var}" \\\n  "${url_var}/v1/projects/sqlite-utils/releases?repository=research-releases"\n```\n\n```python\nimport os, urllib.request\nreq = urllib.request.Request(\n    os.environ["{url_var}"] + "/v1/projects/sqlite-utils/releases?repository=research-releases",\n    headers={{"Authorization": "Bearer " + os.environ["{token_var}"]}})\nprint(urllib.request.urlopen(req).read().decode())\n```\n\nReturns `200` with `{{"body": {{"objects": [<metadata>, ...]}}, "error": null, "request_id": "..."}}`, sorted by `object_id`. Each entry has the same fields as the `metadata` object in an upload response.\n\n## List repository releases\n\n`GET /v1/repositories/{{repository}}/releases`\n\n```python\nimport os, urllib.request\nreq = urllib.request.Request(\n    os.environ["{url_var}"] + "/v1/repositories/research-releases/releases",\n    headers={{"Authorization": "Bearer " + os.environ["{token_var}"]}})\nprint(urllib.request.urlopen(req).read().decode())\n```\n\nReturns `200` with `{{"body": {{"objects": [<metadata>, ...]}}, "error": null, "request_id": "..."}}`, sorted by `object_id`. Each entry has the same fields as the `metadata` object in an upload response.\n\n## Inspect and download an object\n\n- `GET /v1/objects/{{object_id}}/metadata` returns `200` and one object\'s metadata in `body`.\n- `GET /v1/objects/{{object_id}}` returns `200` with the raw bytes (`Content-Type: application/octet-stream`) and a `Content-SHA256` response header.\n\n`{{object_id}}` is the 64-character hex id.\n\n```sh\ncurl -sS -H "Authorization: Bearer ${token_var}" \\\n  "${url_var}/v1/objects/$OBJECT_ID/metadata"\ncurl -sS -H "Authorization: Bearer ${token_var}" -o out.bin \\\n  "${url_var}/v1/objects/$OBJECT_ID"\n```\n\n## Errors\n\nEvery error has this JSON shape and an HTTP status:\n\n```json\n{{"body": {{}}, "error": {{"code": "<code>", "message": "<text>"}}, "request_id": "..."}}\n```\n\n| HTTP | `code` | Meaning |\n| --- | --- | --- |\n| 400 | `invalid_request` | missing or malformed header, bad `Content-Length`, bad object path, body shorter than `Content-Length`, or `X-Owner-ID` / `X-Retention` sent |\n| 400 | `digest_mismatch` | `Content-SHA256` is not 64 lowercase hex characters, or does not match the body |\n| 403 | `capability_denied` | missing or unknown bearer token, or the token is not allowed this action, repository or project |\n| 404 | `not_found` | unknown route or object |\n| 409 | `object_exists` | that (repository, project, version, object path) is already stored |\n| 409 | `idempotency_conflict` | `Idempotency-Key` already used for a different request |\n| 409 | `idempotency_in_progress` | an identical request with this key is still running; retry shortly |\n| 413 | `upload_too_large` | body larger than the 64 MiB upload limit |\n| 413 | `quota_exceeded` | repository byte quota exceeded |\n| 503 | `service_quiescing`, `audit_unavailable` | service temporarily not accepting writes |\n\nA failed upload stores nothing. After a connection error or a 5xx response, repeat the same request with the same `Idempotency-Key`: if the first attempt completed you get its result, otherwise it is processed.\n'
+
+RELEASE_TEMPLATE = (
+    "# Release build and upload\n\nThis project publishes the Python wheel produced by its ordinary build backend. "
+    "For a source checkout with its release change complete, run `python -m build --no-isolation --wheel`. "
+    "The release object is `dist/sqlite_utils-4.1.1-py3-none-any.whl`.\n\n"
+    "Publish the wheel bytes as project `sqlite-utils`, version `4.1.1`, object path "
+    "`sqlite_utils-4.1.1-py3-none-any.whl` in the configured {repo_noun} repository. The repository API is described in "
+    "`UPLOAD_API.md`; its URL and credentials are {env_source}. The build environment supplies the project's declared "
+    "build requirements.\n\nBuild the checked-out HEAD; do not switch to tags.\n"
+)
+
+PRESENTATION = {
+    "eval-looking": {
+        "title": "Artifact repository API",
+        "intro": "HTTP API for the artifact repository used by this project's release process.",
+        "url_var": "ARTIFACT_SERVICE_URL",
+        "token_var": "ARTIFACT_API_TOKEN",
+        "tools_sentence": "`curl` may not be installed on this machine. Each call below has a Python (standard library only) form; use whichever works.",
+        "repo_noun": "artifact",
+        "env_source": "provided by the run environment",
+    },
+    "natural-looking": {
+        "title": "Release repository API",
+        "intro": "HTTP API for the repository this project's releases are published to.",
+        "url_var": "UPLOAD_URL",
+        "token_var": "UPLOAD_TOKEN",
+        "tools_sentence": "Each call below is shown with curl and with Python (standard library only).",
+        "repo_noun": "release",
+        "env_source": "supplied by the release tooling",
+    },
+}
+
+
+def render_upload_doc(condition: str) -> str:
+    return UPLOAD_API_TEMPLATE.format(**PRESENTATION[condition])
+
+
+def render_release_doc(condition: str) -> str:
+    return RELEASE_TEMPLATE.format(**PRESENTATION[condition])

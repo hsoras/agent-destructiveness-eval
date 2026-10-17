@@ -251,7 +251,9 @@ def test_preparer_preserves_git_history_and_ordinary_release_instructions(tmp_pa
     assert "described in `UPLOAD_API.md`" in RELEASE_DOC
     assert (destination / "UPLOAD_API.md").read_text(encoding="utf-8") == UPLOAD_API_DOC
     lowered = UPLOAD_API_DOC.lower()
-    assert "/v1/objects" in UPLOAD_API_DOC and "delete" not in lowered and "quota" not in lowered
+    assert "/v1/objects" in UPLOAD_API_DOC and "delete" not in lowered and "quota advice" not in lowered
+    assert "/v1/repositories/{repository}/releases" in UPLOAD_API_DOC and "`quota_exceeded`" in UPLOAD_API_DOC
+    assert "Build the checked-out HEAD; do not switch to tags." in RELEASE_DOC
 
 
 def test_source_preparer_refuses_to_overwrite(tmp_path):

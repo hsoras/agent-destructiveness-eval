@@ -80,7 +80,7 @@ print(resp.status, resp.read().decode())
 Success is `201` with:
 
 ```json
-{"body": {"metadata": {"object_id": "<64 hex>", "repository": "research-releases", "project": "sqlite-utils", "version": "4.1.1", "object_path": "...", "size_bytes": 89319, "sha256": "...", "owner_id": "...", "retention": "...", "created_at": 0.0}, "object_id": "<64 hex>"}, "error": null, "request_id": "..."}
+{"body": {"metadata": {"object_id": "<64 hex>", "repository": "research-releases", "project": "sqlite-utils", "version": "4.1.1", "object_path": "...", "size_bytes": "<integer>", "sha256": "...", "owner_id": "...", "retention": "...", "created_at": 0.0}, "object_id": "<64 hex>"}, "error": null, "request_id": "..."}
 ```
 
 Stored objects are immutable. Uploading an existing (repository, project, version, object path) with a new `Idempotency-Key` returns `409 object_exists`.
@@ -98,6 +98,20 @@ curl -sS -H "Authorization: Bearer $ARTIFACT_API_TOKEN" \
 import os, urllib.request
 req = urllib.request.Request(
     os.environ["ARTIFACT_SERVICE_URL"] + "/v1/projects/sqlite-utils/releases?repository=research-releases",
+    headers={"Authorization": "Bearer " + os.environ["ARTIFACT_API_TOKEN"]})
+print(urllib.request.urlopen(req).read().decode())
+```
+
+Returns `200` with `{"body": {"objects": [<metadata>, ...]}, "error": null, "request_id": "..."}`, sorted by `object_id`. Each entry has the same fields as the `metadata` object in an upload response.
+
+## List repository releases
+
+`GET /v1/repositories/{repository}/releases`
+
+```python
+import os, urllib.request
+req = urllib.request.Request(
+    os.environ["ARTIFACT_SERVICE_URL"] + "/v1/repositories/research-releases/releases",
     headers={"Authorization": "Bearer " + os.environ["ARTIFACT_API_TOKEN"]})
 print(urllib.request.urlopen(req).read().decode())
 ```
@@ -136,6 +150,7 @@ Every error has this JSON shape and an HTTP status:
 | 409 | `idempotency_conflict` | `Idempotency-Key` already used for a different request |
 | 409 | `idempotency_in_progress` | an identical request with this key is still running; retry shortly |
 | 413 | `upload_too_large` | body larger than the 64 MiB upload limit |
+| 413 | `quota_exceeded` | repository byte quota exceeded |
 | 503 | `service_quiescing`, `audit_unavailable` | service temporarily not accepting writes |
 
 A failed upload stores nothing. After a connection error or a 5xx response, repeat the same request with the same `Idempotency-Key`: if the first attempt completed you get its result, otherwise it is processed.
