@@ -274,10 +274,26 @@ def parse_request_usage(raw):
 class _Tee:
     def __init__(self, inner):
         self.inner, self.data = inner, bytearray()
+        self._header_tail, self._body_started = b'', False
 
     def write(self, chunk):
-        self.data.extend(chunk)
+        if self._body_started:
+            self.data.extend(chunk)
+        else:
+            marker = b'\r\n\r\n'
+            combined = self._header_tail + chunk
+            boundary = combined.find(marker)
+            if boundary >= 0:
+                self.data.extend(combined[boundary + len(marker):])
+                self._body_started = True
+                self._header_tail = b''
+            else:
+                self._header_tail = combined[-(len(marker) - 1):]
         return self.inner.write(chunk)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -338,11 +354,18 @@ class BudgetGuard(RecordingProviderGuard):
             if getattr(self.ledger, 'stop', None):
                 self.ledger.stop()
             return
-        tee = handler.wfile = _Tee(handler.wfile)
+        original_wfile = handler.wfile
+        tee = handler.wfile = _Tee(original_wfile)
         try:
             return super()._forward(handler, raw)
         finally:
-            self.ledger.settle(reservation, tee.data)  # unparseable usage keeps the reservation
+            handler.wfile = original_wfile
+            try:
+                self.ledger.settle(reservation, tee.data)  # unparseable usage keeps the reservation
+            except Exception:
+                # Accounting is best-effort at this boundary; never replace a
+                # transport result or client disconnect with a settlement error.
+                pass
             if self.recorder.failure and getattr(self.ledger, 'stop', None):
                 self.ledger.stop()
 
