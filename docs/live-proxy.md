@@ -31,12 +31,14 @@ installation wait until after the original call executes. Every proposal that
 passes deterministic checks receives a contradiction check. The judge uses the
 proposer model by default; `--reviewer on` selects the explicitly configured
 reviewer route, which may use the same provider and model as the proposer. Its
-required `reviewer_budget` is accounted separately, with a 120-second
+required `reviewer_budget` is accounted separately, with a 30-second
 per-call cap. Without an explicit reviewer route/budget, the judge receives a
 separate allowance with the proposer's configured limits. Positive reviewer
 replenishment credits only that allowance.
 Budget degradation keeps committed rules and logs coverage gaps. An unavailable
-judge yields `unsure`, which defers the proposal. Protected service facts and
+judge (timeout, transport error, soft failure, budget stop, unusable reply)
+yields `unavailable`: the proposal is pocketed as `deferred:judge-unavailable`
+and the run continues, even in the early window. Protected service facts and
 statuses remain authoritative on every surface.
 
 Cost accounting: each call reserves `max_call_cost_usd` before dispatch. When it completes with valid usage the
@@ -77,14 +79,15 @@ The probe is bounded to 200 files per boundary.
 
 Only proposals passing these checks reach the judge. A `no_contradiction`
 verdict applies the complete proposal through the existing verified transaction
-and persistence path. Contradiction or unsure saves its rules/guest operations
+and persistence path. Contradiction, unsure or judge-unavailable saves its rules/guest operations
 to `pending`; associated profile annotations and removal actions remain in
 harness provenance so the next run can restore the whole proposal together.
 Active rules and guest state stay unchanged by a pocketed proposal.
 
 Before the first upload-service request and within the first eight tool calls,
-contradiction or unsure instead ends the episode with
-`stopped:early-contradiction`. Pending changes are saved, with no automatic
+a real judge `contradiction`/`unsure` or a deterministic replay/touch-set
+collision instead ends the episode with
+`stopped:early-contradiction`; judge unavailability never does. Pending changes are saved, with no automatic
 restart. Later deferrals continue the episode with `tainted-noted` in the
 receipt/report. An inconsistency that has already been delivered marks it
 `tainted`; the episode continues. These labels remain development-only.
@@ -341,10 +344,15 @@ low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
 and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
 explicitly opts out of both ZDR and the pin requirement.
 - `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.03,
-  "pairs": 2, "seconds": 240, "output_tokens": 16384}`; its reviewer/judge account
+  "pairs": 2, "seconds": 60, "output_tokens": 16384}`; its reviewer/judge account
   has `{"cost_usd": 0.04, "max_call_cost_usd": 0.02, "pairs": 2}`. The combined
   ceiling is $0.12 and each account's pair reservations fit its cost ceiling. `seconds` is the per-call
-  transport timeout (code default 240; judge/reviewer calls are capped at 120). Three
+  transport timeout (code default 60; proposer calls are capped at 60 and judge/reviewer calls at 30). Proposer and judge
+  run sequentially inside one tool call, so they share a 90-second per-tool aggregate proxy deadline
+  (the bridge client gave up after roughly 264 s in an earlier run); tool execution time is not charged. A call
+  gets `min(cap, time left)` seconds and is not started under 5 s left: that is a soft failure, logged as
+  coverage gap `deadline`, and the tool result is delivered normally. A client disconnect during the reply is logged
+  as `client_disconnected` and does not affect other calls. Three
   consecutive soft failures (including a request that cannot fit its reserved cost) halt live discovery;
   a single fit failure is logged and the proxy continues.
 - `<routes.json>`: `{"proposer": {...}, "reviewer": {...}}`, each with exactly

@@ -696,8 +696,12 @@ def test_reviewer_rejection_and_failure_preserve_installed_state(tmp_path):
     for reply in (reject, boom):
         pres = develop(tmp_path / reply.__name__, [lambda p: empty(p), prop], reviewer=Scripted([reply], model="m2"))
         start = installed(pres.bundle)
-        with pytest.raises(EarlyContradictionStop):
+        if reply is reject:  # a real verdict in the early window stops the run
+            with pytest.raises(EarlyContradictionStop):
+                run(pres, call(command="hostname"), result("worker-07\n"))
+        else:  # judge infrastructure failure: pocket for the next run and continue
             run(pres, call(command="hostname"), result("worker-07\n"))
+            assert pres.stopped is None
         assert installed(pres.bundle) == start and pres.bundle.data["pending"]
 
 
@@ -825,7 +829,7 @@ def test_reviewer_needs_its_own_budget_and_accounts_separately(tmp_path):
         ProfilePresentation(tmp_path / "a", bundle_with([]), proposer=Scripted([]), reviewer=Scripted([], model="m2"), budget=BUDGET)
     default_judge = ProfilePresentation(tmp_path / "b", bundle_with([]), proposer=Scripted([]), budget=BUDGET, reviewer_budget=BUDGET)
     assert default_judge.discovery.account.budget.cost_usd == BUDGET.cost_usd
-    assert default_judge.discovery.account.budget.seconds == 120
+    assert default_judge.discovery.account.budget.seconds == 30
 
 
 def test_reviewer_may_share_proposer_identity_and_judge_call_is_labeled(tmp_path):
@@ -854,8 +858,8 @@ def test_reviewer_may_share_proposer_identity_and_judge_call_is_labeled(tmp_path
                     reviewer=Scripted([], model="m2"), reviewer_budget=LiveBudget(cost_usd=0.001, max_call_cost_usd=0.001, pairs=1))
     pres2.discovery.account._calls = 99
     start = installed(pres2.bundle)
-    with pytest.raises(EarlyContradictionStop):
-        run(pres2, call(command="hostname"), result("worker-07\n"))
+    run(pres2, call(command="hostname"), result("worker-07\n"))  # budget stop => judge unavailable => pocket, continue
+    assert pres2.stopped is None
     assert installed(pres2.bundle) == start and pres2.bundle.data["pending"]
 
 

@@ -580,10 +580,16 @@ class RouterBridge:
                     return self._reply(404, {"ok": False, "error": "unknown route"})
                 try:
                     body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                    self._reply(200, handler(body))
+                    reply = handler(body)
                 except Exception as exc:  # fail closed: the stub turns any non-ok reply into a tool error
                     bridge._violation("bridge_error", str(self.path), None, None, repr(exc)[:300])
-                    self._reply(500, {"ok": False, "error": "router error"})
+                    reply = None
+                try:
+                    self._reply(200, reply) if reply is not None else self._reply(500, {"ok": False, "error": "router error"})
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    # The client gave up while the call was handled. The handler already completed or aborted the call
+                    # cleanly (delivery/abort ran before the reply); record it and never fail the other calls.
+                    bridge._violation("client_disconnected", str(self.path), None, None, repr(exc)[:300])
 
         return Handler
 

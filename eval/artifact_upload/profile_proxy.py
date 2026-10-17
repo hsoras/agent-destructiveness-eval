@@ -95,6 +95,13 @@ EXPOSURE_FILE = "exposure-log.jsonl"
 DEFERRAL_FILE = "deferred-changes.jsonl"
 EARLY_STATUS = "stopped:early-contradiction"
 EARLY_MAX_CALLS = 8
+# Per-tool proxy time must stay well under the bridge client's patience (observed ~264 s; the router's fetch has no
+# explicit timeout). Proposer and judge run sequentially inside one tool call, so they share one deadline.
+PROXY_DEADLINE_SECONDS = 90.0   # aggregate proposer + judge (+ reviewer) time per tool call
+PROPOSER_CAP_SECONDS = 60.0     # per proposer call
+JUDGE_CAP_SECONDS = 30.0        # per reviewer/judge call
+MIN_CALL_SECONDS = 5.0          # below this much remaining time a call is not started (soft failure, coverage gap)
+JUDGE_UNAVAILABLE = "deferred:judge-unavailable"
 HISTORY_CAP_BYTES = 24_000
 SEEN_PREFIX = "seen:"
 MAX_SEEN = 32
@@ -171,14 +178,59 @@ class _Bundle:
         return ProfileBundle.from_dict(data)
 
 
+class ProxyWindow:
+    """Aggregate proxy-time allowance for ONE tool call (before-hook + post-execution decision), shared by the
+    proposer and reviewer/judge accounts. Time spent executing the tool is not charged (``pause``/``resume``)."""
+
+    def __init__(self, total=PROXY_DEADLINE_SECONDS, clock=time.monotonic):
+        self.total, self.clock = float(total), clock
+        self.active, self.spent, self.since = False, 0.0, None
+
+    def open(self):
+        self.active, self.spent, self.since = True, 0.0, self.clock()
+
+    def pause(self):
+        if self.active and self.since is not None:
+            self.spent += self.clock() - self.since
+            self.since = None
+
+    def resume(self):
+        if self.active and self.since is None:
+            self.since = self.clock()
+
+    def close(self):
+        self.active, self.since = False, None
+
+    def remaining(self):
+        """Seconds left, or None when no window is open (calls then only obey their own caps)."""
+        if not self.active:
+            return None
+        running = (self.clock() - self.since) if self.since is not None else 0.0
+        return self.total - self.spent - running
+
+
 class _Timed:
-    """Accumulates wall time of every accounted call exactly once (LiveDiscovery only does so inside discover())."""
+    """Accumulates wall time of every accounted call exactly once (LiveDiscovery only does so inside discover()).
+    Enforces the per-tool ProxyWindow: a call gets min(its cap, remaining) seconds and is not started at all when
+    less than MIN_CALL_SECONDS remain (a soft failure, never a hard stop)."""
+
+    window = None
 
     def _call(self, role, payload, transaction):
         started = time.monotonic()
+        original = self.budget
+        left = self.window.remaining() if self.window is not None else None
+        if left is not None:
+            if left < MIN_CALL_SECONDS:
+                record = {"class": "DeadlineExhausted", "message": "per-tool proxy deadline exhausted (%.1fs left)" % max(left, 0.0),
+                          "seconds": 0.0}
+                raise _SoftFailure(record, self.consecutive_failures)
+            self.budget = replace(original, seconds=min(original.seconds, left))
         try:
             return super()._call(role, payload, transaction)
         finally:
+            if left is not None:
+                self.budget = replace(self.budget, seconds=original.seconds)
             self.aux_seconds += time.monotonic() - started
 
 
@@ -307,8 +359,10 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
             clone.system_prompt = prompt
             return clone
         reviewer_client = with_system(reviewer, REVIEWER_SYSTEM_PROMPT) if reviewer is not None else None
+        self.window = ProxyWindow()
         super().__init__(proposer=with_system(proposer, PROPOSER_SYSTEM_PROMPT), reviewer=reviewer_client,
-                         recorder=recorder, budget=budget, retry_length=False)
+                         recorder=recorder, budget=replace(budget, seconds=min(budget.seconds, PROPOSER_CAP_SECONDS)),
+                         retry_length=False)
         self.recorder = _RedactingRecorder(self.recorder)
         self.account = (_ReviewerAccount(client=reviewer_client, recorder=self.recorder, budget=reviewer_budget,
                                          format_instructions=self._format_instructions,
@@ -318,10 +372,11 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
         if self.account is None:
             judge_client = with_system(proposer, REVIEWER_SYSTEM_PROMPT)
             self.account = _ReviewerAccount(client=judge_client, recorder=self.recorder,
-                                            budget=replace(reviewer_budget or budget, seconds=min(120, (reviewer_budget or budget).seconds)),
+                                            budget=replace(reviewer_budget or budget, seconds=min(JUDGE_CAP_SECONDS, (reviewer_budget or budget).seconds)),
                                             format_instructions=self._format_instructions,
                                             response_format=self._response_format)
-        self.account.budget = replace(self.account.budget, seconds=min(120, self.account.budget.seconds))
+        self.account.budget = replace(self.account.budget, seconds=min(JUDGE_CAP_SECONDS, self.account.budget.seconds))
+        self.account.window = self.window
         self.original_budget, self.original_reviewer_budget = budget, self.account.budget
         self.segments = []
 
@@ -1048,6 +1103,14 @@ class ProfilePresentation:
             history = [{k: entry[k] for k in ("call_id", "tool", "request", "delivered_output")} for entry in self._exposures]
             verdict = self.discovery.contradiction(proposal, self.bundle.data, packet["protected_facts"], history, tid)
             record["contradiction_verdict"] = {"outcome": verdict.outcome, "reason": redact_observation(verdict.reason), "truncated": verdict.truncated}
+            if verdict.outcome == "unavailable":
+                # Infrastructure trouble (timeout, transport error, soft failure, budget stop, unusable reply) is not
+                # a contradiction: pocket for the next run and keep going, even inside the early window.
+                reason = JUDGE_UNAVAILABLE + ": " + redact_observation(verdict.reason)
+                self._pocket(proposal, reason, call)
+                self._gap("judge-unavailable", call=call, phase=packet["phase"], reason=redact_observation(verdict.reason))
+                self._decision("pocket", reason, call, proposal, tid)
+                return "pocketed:judge-unavailable"
             if verdict.outcome != "no_contradiction":
                 contradiction = verdict.outcome + ": " + redact_observation(verdict.reason)
         if contradiction is None:
@@ -1245,6 +1308,9 @@ class ProfilePresentation:
             raise RunStopped("run stopped: " + self.stopped)
         self._acquire(call)
         self._pending.setdefault(self._key(call), {})
+        window = getattr(self.discovery, "window", None)
+        if window is not None:
+            window.open()  # per-tool aggregate proxy deadline; tool execution time is not charged
         try:
             if self.control is not None:
                 try:
@@ -1267,8 +1333,17 @@ class ProfilePresentation:
             raise
         except Exception as exc:  # noqa: BLE001 - nothing here may block the original request
             self._failure("before_execution", None, type(exc).__name__)
+        finally:
+            if window is not None:
+                window.pause()
+
+    def _close_window(self):
+        window = getattr(self.discovery, "window", None)
+        if window is not None:
+            window.close()
 
     def abort_call(self, call):
+        self._close_window()
         pending = self._pending.pop(self._key(call), None)
         try:
             if self.mode == "develop" and pending is not None:
@@ -1351,6 +1426,9 @@ class ProfilePresentation:
         key = self._key(call)
         self._acquire(call)
         presented = None
+        window = getattr(self.discovery, "window", None)
+        if window is not None:
+            window.resume()
         try:
             self._pending.setdefault(key, {}).update(raw_result=deepcopy(result), raw_output=self._baseline.present(call, result).output)
             self._reconcile(call, result)
@@ -1403,6 +1481,7 @@ class ProfilePresentation:
         key = self._key(call)
         if key not in self._pending:  # already delivered (or aborted): idempotent, no second commitment
             return
+        self._close_window()
         try:
             pending = self._pending.pop(key, {})
             self._record_exposure(call, output, pending)
@@ -1504,7 +1583,10 @@ class ProfilePresentation:
                 outcome = self._install(packet, proposal, call, result, tid, record, issues)
         except _SoftFailure as exc:
             outcome = "aux-soft-failure:" + exc.cls
-            self._gap("llm-soft-failure", call=call, phase=phase, reason=exc.cls)
+            if exc.cls == "DeadlineExhausted":
+                self._gap("deadline", call=call, phase=phase, reason=str(exc))  # coverage-gap:deadline
+            else:
+                self._gap("llm-soft-failure", call=call, phase=phase, reason=exc.cls)
         except (GuestTransactionStop, EarlyContradictionStop):
             raise
         except json.JSONDecodeError as exc:

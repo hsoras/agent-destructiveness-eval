@@ -50,7 +50,7 @@ class Client:
 
     def __init__(self):
         self.config = {"propose": lambda p: proposal(p), "verdict": "no_contradiction", "judge_error": None}
-        self.payloads = []
+        self.payloads, self.limits = [], []
         self.judge_error = None
 
     @property
@@ -68,6 +68,7 @@ class Client:
 
     def complete(self, payload, **limits):
         self.payloads.append(copy.deepcopy(payload))
+        self.limits.append(limits.get('seconds'))
         if payload.get("schema") == "contradiction-check.v1":
             if self.judge_error:
                 raise self.judge_error
@@ -594,3 +595,96 @@ def test_replace_text_on_agent_modified_file_is_dropped(tmp_path, repo):
     pres.present(c, result("done"))
     assert pres._deferrals[-1]["decision"] == "drop"
     assert "eval harness" in (repo / "notes.md").read_text()
+
+
+@pytest.mark.parametrize("error", [TimeoutError("judge timed out"), ConnectionError("reset"), RuntimeError("boom")])
+def test_judge_unavailable_in_early_window_pockets_and_continues(tmp_path, error):
+    pres, client = presentation(tmp_path)
+    client.judge_error = error
+    client.propose = lambda p: proposal(p, rules=[rule()])
+    run(pres, call(command="hostname"), result("worker"))
+    assert pres.stopped is None
+    assert pres._deferrals[-1]["decision"] == "pocket"
+    assert "deferred:judge-unavailable" in pres._deferrals[-1]["reason"]
+    assert pres.bundle.ruleset.get("host") is None
+    assert pres.bundle.data["pending"]
+    assert pres.receipt()["taint"] != "tainted-noted"
+    client.propose = lambda p: proposal(p)
+    run(pres, call("c2", command="true"), result("ok"))  # the run keeps accepting calls
+    assert pres.stopped is None
+
+
+def test_real_contradiction_in_early_window_still_stops(tmp_path):
+    pres, client = presentation(tmp_path)
+    client.verdict = "contradiction"
+    client.propose = lambda p: proposal(p, rules=[rule()])
+    with pytest.raises(EarlyContradictionStop):
+        run(pres, call(command="hostname"), result("worker"))
+    assert pres.stopped == EARLY_STATUS
+
+
+def test_exhausted_judge_budget_is_unavailable_not_a_stop(tmp_path):
+    pres, client = presentation(tmp_path)
+    pres.discovery.account._halted = True
+    client.propose = lambda p: proposal(p, rules=[rule()])
+    run(pres, call(command="hostname"), result("worker"))
+    assert pres.stopped is None and "deferred:judge-unavailable" in pres._deferrals[-1]["reason"]
+
+
+class FakeClock:
+    def __init__(self): self.now = 0.0
+    def __call__(self): return self.now
+
+
+def test_proxy_window_budgets_proposer_plus_judge_and_excludes_execution():
+    from eval.artifact_upload.profile_proxy import ProxyWindow
+    clock = FakeClock()
+    window = ProxyWindow(90, clock)
+    assert window.remaining() is None
+    window.open()
+    clock.now = 50
+    window.pause()
+    clock.now = 500  # tool execution is not charged
+    window.resume()
+    clock.now = 540
+    assert window.remaining() == pytest.approx(0)
+    window.close()
+    assert window.remaining() is None
+
+
+def test_deadline_exhaustion_is_soft_gap_and_result_is_delivered(tmp_path):
+    from eval.artifact_upload.profile_proxy import ProxyWindow
+    pres, client = presentation(tmp_path)
+    clock = FakeClock()
+    pres.discovery.window = pres.discovery.account.window = ProxyWindow(90, clock)
+
+    def slow(p):
+        clock.now += 88  # a proposer that eats nearly the whole allowance
+        return proposal(p, rules=[rule()])
+    client.propose = slow
+    c = call(command="hostname")
+    pres.before_execute(c)
+    presented = pres.present(c, result("worker"))
+    assert presented.output  # delivered, never abandoned
+    assert pres.stopped is None
+    assert any(g["kind"] == "deadline" or g["kind"] == "judge-unavailable" for g in pres._gaps)
+    assert not any(p.get("schema") == "contradiction-check.v1" for p in client.payloads)
+    assert pres._deferrals[-1]["decision"] == "pocket"
+
+
+def test_call_gets_min_of_cap_and_remaining_time(tmp_path):
+    from eval.artifact_upload.profile_proxy import ProxyWindow
+    pres, client = presentation(tmp_path)
+    clock = FakeClock()
+    window = pres.discovery.window = pres.discovery.account.window = ProxyWindow(90, clock)
+    assert pres.discovery.budget.seconds <= 60 and pres.discovery.account.budget.seconds <= 30
+    window.open()
+    clock.now = 70  # 20 s left: below the 30 s judge cap
+    pres.discovery.account._call("reviewer", {"schema": "contradiction-check.v1"}, "t")
+    assert client.limits[-1] == pytest.approx(20)
+    clock.now = 87  # under MIN_CALL_SECONDS: not started
+    from eval.artifact_upload.live import _SoftFailure
+    with pytest.raises(_SoftFailure) as info:
+        pres.discovery.account._call("reviewer", {"schema": "contradiction-check.v1"}, "t")
+    assert info.value.cls == "DeadlineExhausted"
+    assert pres.discovery.account.budget.seconds <= 30

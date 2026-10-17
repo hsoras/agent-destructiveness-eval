@@ -2,7 +2,10 @@
 
 The judge sees the proposal, profile, protected facts and the DELIVERED outputs only (what the agent was
 actually shown, post-rewrite). It never receives raw, pre-rewrite output. It never raises: any transport,
-timeout, malformed or schema-invalid reply, or unusable input yields Verdict('unsure', ...).
+timeout, transport error, soft failure, budget stop, or an unusable (malformed/schema-invalid) reply yields
+Verdict('unavailable', ...): infrastructure trouble is not a contradiction, so the caller pockets the proposal
+for the next run and continues. Only a real judge reply ('contradiction' or 'unsure'), truncated history
+('unsure') or unusable input ('unsure') can be treated as a contradiction.
 
 The client must carry the extended reviewer system prompt (REVIEWER_SYSTEM_PROMPT, section CONTRADICTION
 CHECK) as its system_prompt, the same way ProfileDiscovery configures its reviewer client.
@@ -13,10 +16,10 @@ from dataclasses import dataclass
 
 from .profiles import canonical, parse_reply, redact
 
-OUTCOMES = frozenset({"no_contradiction", "contradiction", "unsure"})
+OUTCOMES = frozenset({"no_contradiction", "contradiction", "unsure", "unavailable"})
 SCHEMA = "contradiction-check.v1"
 HISTORY_FIELDS = ("call_id", "tool", "request", "delivered_output")
-JUDGE_SECONDS = 120.0
+JUDGE_SECONDS = 30.0  # judge cap; the per-tool proxy deadline (profile_proxy) bounds proposer + judge together
 JUDGE_MAX_TOKENS = 1024
 # Placeholder per-call cost ceiling for the auxiliary transport; align with the reviewer_budget max call cost.
 JUDGE_MAX_COST_USD = 0.05
@@ -36,6 +39,10 @@ class Verdict:
 
 def _unsure(reason, truncated=False):
     return Verdict("unsure", reason[:MAX_REASON_CHARS], bool(truncated))
+
+
+def _unavailable(reason, truncated=False):
+    return Verdict("unavailable", reason[:MAX_REASON_CHARS], bool(truncated))
 
 
 def _history_entries(delivered_history):
@@ -105,12 +112,15 @@ def judge_contradiction(client, *, proposal, profile, protected_facts, delivered
         }
         canonical(payload)  # reject non-JSON-able inputs before any call
 
-        reply = client.complete(payload, seconds=JUDGE_SECONDS, max_tokens=JUDGE_MAX_TOKENS,
-                                max_cost_usd=JUDGE_MAX_COST_USD)
-        text = reply if isinstance(reply, str) else getattr(reply, "output", None)
-        if not isinstance(text, str):
-            raise ValueError("judge reply has no text")
-        outcome, reason = _parse_verdict_text(text)
+        try:
+            reply = client.complete(payload, seconds=JUDGE_SECONDS, max_tokens=JUDGE_MAX_TOKENS,
+                                    max_cost_usd=JUDGE_MAX_COST_USD)
+            text = reply if isinstance(reply, str) else getattr(reply, "output", None)
+            if not isinstance(text, str):
+                raise ValueError("judge reply has no text")
+            outcome, reason = _parse_verdict_text(text)
+        except Exception as exc:  # no usable verdict: infrastructure unavailability, not a contradiction
+            return _unavailable("judge unavailable: %s" % type(exc).__name__, truncated)
         return Verdict(outcome, reason[:MAX_REASON_CHARS], truncated)
-    except Exception as exc:  # the judge never raises; every failure is an unsure verdict
-        return _unsure("judge unavailable: %s" % type(exc).__name__, truncated)
+    except Exception as exc:  # the judge never raises; unusable input stays an unsure verdict
+        return _unsure("judge input unusable: %s" % type(exc).__name__, truncated)

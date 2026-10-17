@@ -77,9 +77,9 @@ def test_unsure_reply_passes_through():
 
 @pytest.mark.parametrize("error", [TimeoutError("deadline"), ConnectionError("reset"), RuntimeError("boom"),
                                    ValueError("auxiliary reply lacks usage")])
-def test_client_exceptions_become_unsure_without_raising(error):
+def test_client_exceptions_become_unavailable_without_raising(error):
     v = run(FakeClient(error=error), [entry(1)])
-    assert v.outcome == "unsure" and v.truncated is False
+    assert v.outcome == "unavailable" and v.truncated is False
     assert type(error).__name__ in v.reason
 
 
@@ -95,17 +95,17 @@ def test_client_exceptions_become_unsure_without_raising(error):
     '{"schema": "profile-review.v1", "outcome": "contradiction", "reason": "cut',
     None,
 ])
-def test_malformed_or_schema_invalid_reply_is_unsure(text):
+def test_malformed_or_schema_invalid_reply_is_unavailable(text):
     v = run(FakeClient(reply=text), [entry(1)])
-    assert v.outcome == "unsure"
+    assert v.outcome == "unavailable"
 
 
-def test_reply_object_without_output_text_is_unsure():
+def test_reply_object_without_output_text_is_unavailable():
     class NoText:
         def complete(self, payload, **limits):
             return types.SimpleNamespace(output=None)
 
-    assert run(NoText(), [entry(1)]).outcome == "unsure"
+    assert run(NoText(), [entry(1)]).outcome == "unavailable"
 
 
 def test_malformed_history_is_unsure_and_not_sent():
@@ -129,7 +129,7 @@ def test_history_is_sent_newest_first():
     ids = [e["call_id"] for e in payload["delivered_history_newest_first"]]
     assert ids == ["call-3", "call-2", "call-1"]
     assert payload["history_truncation"] == {"truncated": False, "dropped_count": 0, "dropped_call_ids": []}
-    assert limits["seconds"] == cj.JUDGE_SECONDS == 120.0
+    assert limits["seconds"] == cj.JUDGE_SECONDS == 30.0
 
 
 def test_oldest_calls_are_dropped_first_and_judge_is_told():
@@ -195,7 +195,7 @@ def test_raw_output_is_not_sent_even_when_dropped_or_timed_out():
     assert SENTINEL_RAW not in sent_text(client)
     failing = FakeClient(error=TimeoutError(SENTINEL_RAW))
     v = run(failing, history)
-    assert v.outcome == "unsure" and SENTINEL_RAW not in v.reason
+    assert v.outcome == "unavailable" and SENTINEL_RAW not in v.reason
 
 
 def test_secrets_in_delivered_output_are_redacted_before_sending():
