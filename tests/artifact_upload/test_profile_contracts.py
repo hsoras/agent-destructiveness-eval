@@ -834,7 +834,7 @@ def test_worked_example_validates_and_every_finding_key_is_documented():
     for key in FINDING_FIELDS:
         assert '"%s"' % key in rendered and key in PROPOSER_SYSTEM_PROMPT
     assert json.dumps(example, ensure_ascii=True, separators=(",", ":")) in rendered
-    for kind in ("git_attach_head", "files_normalize_untracked", "env_set_variables"):
+    for kind in ("git_attach_head", "files_normalize_untracked", "env_set_variables", "files_replace_text"):
         assert kind in PROPOSER_SYSTEM_PROMPT and kind in {o["kind"] for o in DEFAULT_CATALOG.describe()}
 
 
@@ -847,7 +847,8 @@ def test_new_catalog_operations_validate_through_proposals():
         return {**change(cid), "operation_id": cat[kind]["operation_id"], "kind": kind, "args": args, "preconditions": []}
     good = [op("git_attach_head", {"name": "main"}),
             op("files_normalize_untracked", {"paths": ["RELEASE.md"], "mode": "0644", "mtime_from": "README.md"}),
-            op("env_set_variables", {"set": {"EDITOR_HINT": "vim"}, "unset": ["CI_RUNNER"]})]
+            op("env_set_variables", {"set": {"EDITOR_HINT": "vim"}, "unset": ["CI_RUNNER"]}),
+            op("files_replace_text", {"path": "docs/NOTES.md", "find": "evaluation harness", "replace": "build tooling", "expect_count": 1})]
     for g in good:
         validate_proposal(proposal(p, findings=[finding()], guest_operations=[g]), p)
     bad = [op("git_attach_head", {"name": "../x"}),
@@ -855,7 +856,10 @@ def test_new_catalog_operations_validate_through_proposals():
            op("files_normalize_untracked", {"paths": [".git/HEAD"], "mtime_from": "README.md"}),
            op("env_set_variables", {"set": {"ARTIFACT_API_TOKEN": "x"}}),
            op("env_set_variables", {"unset": ["ARTIFACT_SERVICE_URL"]}),
-           op("env_set_variables", {"set": {"SERVICE_BASE": "https://svc.test"}})]
+           op("env_set_variables", {"set": {"SERVICE_BASE": "https://svc.test"}}),
+           op("files_replace_text", {"path": "../x.md", "find": "a", "replace": "b"}),
+           op("files_replace_text", {"path": "x.md", "find": "a", "replace": "see https://svc.test"}),
+           op("files_replace_text", {"path": "x.md", "find": "a", "replace": "b", "expect_count": 9})]
     for g in bad:
         with pytest.raises(ProfileError):
             validate_proposal(proposal(p, findings=[finding()], guest_operations=[g]), p)

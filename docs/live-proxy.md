@@ -205,6 +205,19 @@ git and file operations are pinned to the approved workspace):
   and mtime of up to 16 untracked regular files to match a tracked reference file.
   Tracked files, symlinks, `.git` and paths outside the workspace are refused;
   content digest and size are verified unchanged.
+- `files_replace_text {path, find, replace, expect_count=1, allow_tracked=false}`:
+  literal wording fix in one real workspace file (UTF-8, <=64 KiB). Requires exactly
+  `expect_count` (1-5) occurrences of `find` (<=200 chars, non-empty; `replace` <=200
+  chars and may not contain `find`), writes via temp file + rename preserving mode,
+  mtime and owner, verifies zero `find` left and the exact expected text, and rolls
+  back the saved bytes on any failure; before/after sha256 are logged. Refused: paths
+  outside the workspace, symlinks (including parents), binary/non-UTF-8 files, `.git`,
+  tracked files unless `allow_tracked`, and any `find`/`replace`/file edit that
+  contains or changes protected facts (the `rules.check_rendering` token set).
+  In the deferral flow its touch set is the file key: a path the agent already read or
+  listed (exposure log), or modified itself (`target` confirmed state), is a
+  contradiction (pocketed, or early stop) / `conflicts-confirmed-state`. Prefer it
+  over output rules for wording leaks in docs the agent has not read yet.
 - `env_set_variables {set, unset}`: set or unset non-protected variables in the
   harness-managed `~/.config/workspace-profile/env-vars.sh`. `ARTIFACT_*`,
   credential/URL/host/proxy/system names and URL-valued settings are refused;

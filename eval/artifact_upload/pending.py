@@ -67,7 +67,7 @@ def _touches_confirmed(item, keys):
         return bool(keys & {"env_" + name for name in names})
     if op in ("env_set_workspace", "system_set_hostname"):
         return any(k.startswith("env_") or k == "hostname" for k in keys)
-    if op == "files_install_preset":
+    if op in ("files_install_preset", "files_replace_text"):
         return "file:" + args.get("path", "") in keys
     return False
 

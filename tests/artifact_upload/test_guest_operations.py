@@ -326,3 +326,128 @@ def test_env_variables_refuse_url_values_and_conflicts(world):
     repo, guest, log, _ = world
     for req in (vars_req({"FOO": "http://x.test"}), vars_req({"FOO": "1"}, ["FOO"]), vars_req(), vars_req({"FOO": "a b"})):
         assert run_transaction(guest, [req], log).failed_phase == "proposal_validation"
+
+
+# ---------------------------------------------------------------- files_replace_text
+import hashlib
+import os
+
+
+def rt_req(path="notes.md", find="eval harness", repl="build tooling", count=1, oid="files_replace_text", **extra):
+    return {"operation_id": oid, "kind": "files_replace_text",
+            "args": {"path": path, "find": find, "replace": repl, "expect_count": count, **extra}}
+
+
+@pytest.fixture
+def rt(world):
+    repo, guest, log, home = world
+    (repo / "notes.md").write_text("This is an eval harness note.\n")
+    os.utime(repo / "notes.md", ns=(10**18, 10**18))
+    (repo / "notes.md").chmod(0o640)
+    return repo, LocalGuest(repo, home), log
+
+
+def rt_catalog(repo):
+    return DEFAULT_CATALOG.with_workspace(str(repo.resolve()))
+
+
+def rt_run(rt, request, **kw):
+    repo, guest, log = rt
+    return run_transaction(guest, [request], log, catalog=rt_catalog(repo), **kw)
+
+
+def test_replace_text_success_preserves_mode_mtime_and_logs_hashes(rt):
+    repo = rt[0]
+    before = (repo / "notes.md").stat()
+    res = rt_run(rt, rt_req())
+    assert res.ok, res
+    assert (repo / "notes.md").read_text() == "This is an build tooling note.\n"
+    after = (repo / "notes.md").stat()
+    assert (after.st_mode, after.st_mtime_ns, after.st_uid) == (before.st_mode, before.st_mtime_ns, before.st_uid)
+    assert not list(repo.glob(".notes.md.*"))
+    assert git(repo, "status", "--short").count("notes.md") == 1
+    new_hash = hashlib.sha256((repo / "notes.md").read_bytes()).hexdigest()
+    old_hash = hashlib.sha256(b"This is an eval harness note.\n").hexdigest()
+    assert old_hash in str(res.operations) and new_hash in str(res.operations)
+
+
+def test_replace_text_absolute_path_inside_workspace(rt):
+    repo = rt[0]
+    assert rt_run(rt, rt_req(path=str(repo.resolve() / "notes.md"))).ok
+    assert "build tooling" in (repo / "notes.md").read_text()
+
+
+def test_replace_text_count_mismatch_refused(rt):
+    repo = rt[0]
+    res = rt_run(rt, rt_req(count=2))
+    assert not res.ok and res.failed_phase == "precondition" and "occurs 1 time" in res.error
+    assert (repo / "notes.md").read_text() == "This is an eval harness note.\n"
+    assert not rt_run(rt, rt_req(find="absent words", oid="files_replace_text:2")).ok
+
+
+@pytest.mark.parametrize("phase", ["execution", "verification", "persistence"])
+def test_replace_text_rolls_back(rt, phase):
+    repo = rt[0]
+    before = (repo / "notes.md").stat()
+
+    def fault(p, op):
+        if p == phase:
+            if p == "execution":
+                (repo / "notes.md").write_text("partial garbage")
+            raise RuntimeError("injected")
+    res = rt_run(rt, rt_req(), fault_hook=fault)
+    assert not res.ok and res.status == "rolled_back"
+    assert (repo / "notes.md").read_text() == "This is an eval harness note.\n"
+    after = (repo / "notes.md").stat()
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+
+
+def test_replace_text_path_refusals(rt, tmp_path):
+    repo = rt[0]
+    outside = tmp_path / "outside.md"
+    outside.write_text("eval harness")
+    (repo / "link.md").symlink_to(repo / "notes.md")
+    (repo / "dirlink").symlink_to(tmp_path, target_is_directory=True)
+    (repo / "bin.dat").write_bytes(b"eval harness\x00\xff")
+    (repo / "latin.txt").write_bytes(b"eval harness \xe9")
+    (repo / ".git" / "x.txt").write_text("eval harness")
+    for i, path in enumerate([str(outside), "../outside.md", "link.md", "dirlink/outside.md", "bin.dat", "latin.txt", ".git/x.txt",
+                              "missing.md"]):
+        res = rt_run(rt, rt_req(path=path))
+        assert not res.ok, path
+    assert outside.read_text() == "eval harness" and (repo / "notes.md").read_text().count("eval harness") == 1
+    assert (repo / ".git" / "x.txt").read_text() == "eval harness"
+
+
+def test_replace_text_tracked_file_refused_unless_allowed(rt):
+    repo = rt[0]
+    (repo / "t.md").write_text("an eval harness here\n")
+    git(repo, "add", "t.md")
+    git(repo, "commit", "-qm", "t")
+    res = rt_run(rt, rt_req(path="t.md"))
+    assert not res.ok and res.failed_phase == "precondition" and (repo / "t.md").read_text() == "an eval harness here\n"
+    assert rt_run(rt, rt_req(path="t.md", allow_tracked=True)).ok
+
+
+def test_replace_text_protected_fact_refusals(rt):
+    repo = rt[0]
+    for args in [dict(find="eval 7", repl="build"), dict(find="eval", repl="see https://x.test"),
+                 dict(find="eval", repl="obj_12"), dict(find="eval", repl="eval harness"), dict(find="eval", repl="eval"),
+                 dict(find="x" * 201, repl="y"), dict(find="", repl="y"), dict(count=6), dict(count=0), dict(count=True)]:
+        req = rt_req(find=args.get("find", "eval"), repl=args.get("repl", "build"), count=args.get("count", 1))
+        with pytest.raises(Exception):
+            rt_catalog(repo).validate_request(req)
+
+
+def test_replace_text_file_protected_token_edit_refused(rt):
+    repo = rt[0]
+    (repo / "n2.md").write_text("quota 12 megabytes at http://svc.test/a\n")
+    res = rt_run(rt, rt_req(path="n2.md", find="://svc.test/a", repl="://svc.test/b"))
+    assert not res.ok and res.failed_phase == "precondition" and "protected" in res.error
+    assert (repo / "n2.md").read_text() == "quota 12 megabytes at http://svc.test/a\n"
+    ok = rt_run(rt, rt_req(path="n2.md", find="megabytes at", repl="megabytes of", oid="files_replace_text:2"))
+    assert ok.ok
+
+
+def test_replace_text_catalog_entry():
+    assert any(o["kind"] == "files_replace_text" for o in DEFAULT_CATALOG.describe())

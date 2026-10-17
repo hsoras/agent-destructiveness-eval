@@ -38,6 +38,7 @@ ENV_KEYS = ("DISPLAY", "TERM", "COLORTERM", "LANG", "LC_ALL", "TZ", "EDITOR", "V
 ENV_VALUE = re.compile(r"[A-Za-z0-9_.:/+@=,-]{0,200}")
 FILE_ROOTS = (".config/workspace-profile/", ".config/workspace-dotfiles/", ".local/share/backgrounds/")
 MAX_FILE_BYTES = 64 * 1024
+REPO_KINDS = ("git_create_branch", "git_attach_head", "files_normalize_untracked", "files_replace_text")  # get args["repo"]
 GIT_REPO_KINDS = ("git_create_branch", "git_attach_head", "files_normalize_untracked")  # pinned to the approved workspace
 
 
@@ -571,6 +572,157 @@ def _no_check(args, obs):
     return None
 
 
+# ---- files_replace_text: literal wording fix inside one real workspace text file
+MAX_REPLACE_TEXT = 200
+MAX_REPLACE_FILE = 64 * 1024
+_RT_GUEST = _GIT + '''import hashlib, base64
+root = os.path.realpath(P.get("repo") or os.getcwd())
+def resolve(path):
+    full = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
+    rel = os.path.relpath(full, root)
+    if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+        return full, None, "path is outside the guest workspace"
+    if rel.split(os.sep)[0] == ".git":
+        return full, rel, "files under .git are refused"
+    cur = root
+    for part in rel.split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return full, rel, "path contains a symlink"
+    return full, rel, None
+'''
+_RT_OBSERVE = _RT_GUEST + '''
+full, rel, bad = resolve(P["path"])
+out = {"state": "refused", "reason": bad} if bad else None
+if out is None and not os.path.lexists(full):
+    out = {"state": "absent"}
+if out is None and not os.path.isfile(full):
+    out = {"state": "refused", "reason": "not a regular file"}
+if out is None:
+    st = os.stat(full)
+    data = open(full, "rb").read()
+    if len(data) > P["max_bytes"]:
+        out = {"state": "refused", "reason": "file is larger than %d bytes" % P["max_bytes"]}
+    else:
+        try:
+            if b"\\0" in data:
+                raise ValueError
+            data.decode("utf-8")
+        except ValueError:
+            out = {"state": "refused", "reason": "file is binary or not UTF-8 text"}
+if out is None:
+    tracked = git("ls-files", "--error-unmatch", "--", rel, ok=(0, 1)).returncode == 0
+    out = {"state": "file", "rel": rel, "tracked": tracked, "mode": "%04o" % (st.st_mode & 0o7777), "mtime_ns": st.st_mtime_ns,
+           "uid": st.st_uid, "gid": st.st_gid, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+           "b64": base64.b64encode(data).decode()}
+print(json.dumps(out))
+'''
+_RT_WRITE = _RT_GUEST + '''
+full, rel, bad = resolve(P["path"])
+if bad:
+    raise RuntimeError(bad)
+st = os.stat(full)
+if P.get("expect_sha256") and hashlib.sha256(open(full, "rb").read()).hexdigest() != P["expect_sha256"]:
+    raise RuntimeError("file changed since it was observed")
+tmp = os.path.join(os.path.dirname(full), ".%s.%s.tmp" % (os.path.basename(full), os.getpid()))
+try:
+    with open(tmp, "wb") as f:
+        f.write(base64.b64decode(P["content_b64"]))
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, int(P["mode"], 8))
+    if (os.stat(tmp).st_uid, os.stat(tmp).st_gid) != (P["uid"], P["gid"]):
+        os.chown(tmp, P["uid"], P["gid"])
+    os.utime(tmp, ns=(st.st_atime_ns, P["mtime_ns"]))
+    os.replace(tmp, full)
+finally:
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+print(json.dumps({"ok": True}))
+'''
+
+
+def _rt_validate(args):
+    _only(args, ("path", "find", "replace", "expect_count", "allow_tracked"), ("path", "find", "replace"))
+    path, find, repl = args["path"], args["find"], args["replace"]
+    count, tracked = args.get("expect_count", 1), args.get("allow_tracked", False)
+    if (not isinstance(path, str) or not 0 < len(path) <= 300 or "\0" in path or path.endswith("/")
+            or ".." in path.split("/") or "//" in path):
+        _bad("path must be a normalized workspace file path")
+    if not isinstance(find, str) or not 0 < len(find) <= MAX_REPLACE_TEXT or not isinstance(repl, str) or len(repl) > MAX_REPLACE_TEXT:
+        _bad("find must be 1-%d and replace at most %d characters" % (MAX_REPLACE_TEXT, MAX_REPLACE_TEXT))
+    if type(count) is not int or not 1 <= count <= 5:
+        _bad("expect_count must be an integer 1-5")
+    if type(tracked) is not bool:
+        _bad("allow_tracked must be boolean")
+    if find == repl or find in repl:
+        _bad("replace must differ from find and must not contain it")
+    from .rules import protected_facts
+    if protected_facts(find) or protected_facts(repl):
+        _bad("find/replace may not contain protected facts (numbers, sizes, hashes, ids, URLs, HTTP responses)")
+    return {"path": path, "find": find, "replace": repl, "expect_count": count, "allow_tracked": tracked}
+
+
+def _rt_observe(guest, args):
+    return _run(guest, _RT_OBSERVE, {"repo": args.get("repo"), "path": args["path"], "max_bytes": MAX_REPLACE_FILE})
+
+
+def _rt_text(obs):
+    return base64.b64decode(obs["b64"]).decode("utf-8")
+
+
+def _rt_check(args, obs):
+    if obs["state"] == "absent":
+        raise OperationError("precondition", "file does not exist")
+    if obs["state"] != "file":
+        raise OperationError("precondition", obs.get("reason", "file is not editable"))
+    if obs["tracked"] and not args["allow_tracked"]:
+        raise OperationError("precondition", "file is tracked by git; tracked files are refused unless allow_tracked is true")
+    text = _rt_text(obs)
+    found = text.count(args["find"])
+    if found != args["expect_count"]:
+        raise OperationError("precondition", "find text occurs %d time(s), expected %d" % (found, args["expect_count"]))
+    from .rules import check_rendering
+    ok, why = check_rendering(text, text.replace(args["find"], args["replace"]))
+    if not ok:
+        raise OperationError("precondition", "edit would alter protected facts in the file (%s)" % why)
+
+
+def _rt_execute(guest, args, obs):
+    new = _rt_text(obs).replace(args["find"], args["replace"]).encode("utf-8")
+    _run(guest, _RT_WRITE, {"repo": args.get("repo"), "path": args["path"], "expect_sha256": obs["sha256"],
+                            "content_b64": base64.b64encode(new).decode(), "mode": obs["mode"], "uid": obs["uid"],
+                            "gid": obs["gid"], "mtime_ns": obs["mtime_ns"]})
+
+
+def _rt_verify(args, before, after):
+    if after.get("state") != "file":
+        raise OperationError("verification", "file is no longer an editable regular file")
+    text = _rt_text(after)
+    if text.count(args["find"]) != 0 or text != _rt_text(before).replace(args["find"], args["replace"]):
+        raise OperationError("verification", "post-edit content differs from the requested replacement")
+    if args["replace"] and args["replace"] not in text:
+        raise OperationError("verification", "replacement text not present")
+    for key in ("mode", "mtime_ns", "uid", "gid", "tracked"):
+        if after[key] != before[key]:
+            raise OperationError("verification", "file %s was not preserved" % key)
+
+
+def _rt_rollback(guest, args, before):
+    if before.get("state") != "file":
+        return
+    _run(guest, _RT_WRITE, {"repo": args.get("repo"), "path": args["path"], "expect_sha256": None,
+                            "content_b64": before["b64"], "mode": before["mode"], "uid": before["uid"],
+                            "gid": before["gid"], "mtime_ns": before["mtime_ns"]})
+
+
+def _rt_satisfied(args, obs):
+    if obs.get("state") != "file":
+        return False
+    text = _rt_text(obs)
+    return args["find"] not in text and (not args["replace"] or args["replace"] in text)
+
+
 SPECS = (
     OperationSpec("git_create_branch", "Create a named branch at the verified current commit; optionally attach HEAD.",
                   "git refs in the guest worktree (refs/heads/<name>, HEAD); commits and working tree are preserved",
@@ -603,6 +755,16 @@ SPECS = (
                   lambda args, obs: obs["sha256"] == hashlib.sha256(_vars_render(args)).hexdigest(),
                   ("path is not a symlink", "existing file, if any, is harness-managed"),
                   "file digest equals the rendered request", "restore previous file bytes or remove the new file"),
+    OperationSpec("files_replace_text", "Replace a literal wording fragment inside one untracked UTF-8 workspace text file.",
+                  "one existing untracked regular UTF-8 file (<=64 KiB) inside the workspace; mode, mtime and owner preserved; never .git, symlinks or binaries",
+                  {"path": {"type": "string", "required": True, "max_length": 300}, "find": {"type": "string", "required": True, "max_length": MAX_REPLACE_TEXT},
+                   "replace": {"type": "string", "required": True, "max_length": MAX_REPLACE_TEXT},
+                   "expect_count": {"type": "integer", "min": 1, "max": 5}, "allow_tracked": {"type": "boolean"}},
+                  _rt_validate, _rt_observe, _rt_check, _rt_execute, _rt_verify, _rt_rollback, _rt_satisfied,
+                  ("file is an existing non-symlink UTF-8 text file in the workspace", "file is untracked unless allow_tracked", "find occurs exactly expect_count times",
+                   "find/replace and the file text carry no protected-fact change"),
+                  "find occurs 0 times; file equals the pre-state text with every find replaced; mode, mtime, owner preserved; before/after sha256 logged",
+                  "rewrite the saved original bytes atomically and restore mode and mtime"),
     OperationSpec("system_set_hostname", "Set the guest hostname to the profile value; service DNS is untouched.",
                   "the guest UTS hostname only", {"hostname": {"type": "hostname", "required": True}},
                   _host_validate, _host_observe, _no_check, _host_execute,
@@ -675,7 +837,7 @@ class Catalog:
         if not isinstance(oid, str) or oid not in self.operation_ids(spec.kind):
             _bad("operation_id is not a catalog entry for this kind")
         args = spec.validate(deepcopy(request["args"]))
-        if spec.kind in GIT_REPO_KINDS and self.workspace is not None:
+        if spec.kind in REPO_KINDS and self.workspace is not None:
             args["repo"] = self.workspace  # never caller-chosen; the guest re-verifies the real path
         return {**{k: deepcopy(v) for k, v in request.items() if k != "args"}, "args": args}
 

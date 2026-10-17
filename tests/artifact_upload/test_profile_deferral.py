@@ -537,3 +537,60 @@ def test_judge_reason_is_redacted_before_pending_persistence(tmp_path):
     run(pres, call(command="hostname"), result("worker"))
     assert pres.bundle.data["pending"]
     assert secret not in pres.bundle.dumps() and secret not in pres.write_report().read_text()
+
+
+# ---------------------------------------------------------------- files_replace_text
+def replace_op(path="notes.md", find="eval harness", repl="build tooling"):
+    return {"operation_id": "files_replace_text", "kind": "files_replace_text",
+            "args": {"path": path, "find": find, "replace": repl, "expect_count": 1},
+            "preconditions": list(Catalog().spec("files_replace_text").preconditions)}
+
+
+def test_replace_text_touch_set_reports_file_key(tmp_path, repo):
+    pres, _ = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    keys = pres._touches(replace_op("notes.md"))
+    assert keys == {pres._file_key("notes.md")}
+    assert pres._touches(replace_op(str(repo / "notes.md"))) == {pres._file_key(str(repo / "notes.md"))}
+
+
+@pytest.mark.parametrize("seen", ["read", "grep", "list"])
+def test_replace_text_on_shown_path_is_contradiction(tmp_path, repo, seen):
+    (repo / "notes.md").write_text("an eval harness note\n")
+    pres, client = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    if seen == "read":
+        run(pres, call("c1", "read", filePath="notes.md"), result("an eval harness note\n"))
+    elif seen == "grep":
+        run(pres, call("c1", command="grep -r harness ."), result("./notes.md:an eval harness note"))
+    else:
+        run(pres, call("c1", command="ls"), result("f\nnotes.md"))
+    pres._call_count = 8
+    client.propose = lambda p: proposal(p, ops=[replace_op()])
+    run(pres, call("c9", command="true"), result("ok"))
+    assert pres._deferrals[-1]["decision"] == "pocket"
+    assert (repo / "notes.md").read_text() == "an eval harness note\n"
+    assert pres.bundle.data["pending"][0]["change"]["kind"] == "files_replace_text"
+
+
+def test_replace_text_unseen_path_applies_and_edits_real_file(tmp_path, repo):
+    (repo / "notes.md").write_text("an eval harness note\n")
+    pres, client = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    client.propose = lambda p: proposal(p, ops=[replace_op()])
+    run(pres, call("c1", command="true"), result("ok"))
+    assert pres._deferrals[-1]["decision"] != "pocket"
+    assert (repo / "notes.md").read_text() == "an build tooling note\n"
+
+
+def test_replace_text_on_agent_modified_file_is_dropped(tmp_path, repo):
+    (repo / "notes.md").write_text("an eval harness note\n")
+    pres, client = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    c = call(command="edit notes")
+    pres.before_execute(c)
+    (repo / "notes.md").write_text("agent wrote an eval harness note\n")
+    client.propose = lambda p: proposal(p, ops=[replace_op()])
+    pres.present(c, result("done"))
+    assert pres._deferrals[-1]["decision"] == "drop"
+    assert "eval harness" in (repo / "notes.md").read_text()

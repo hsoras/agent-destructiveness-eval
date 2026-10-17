@@ -862,7 +862,7 @@ class ProfilePresentation:
             keys |= {self._fact_key("env_", n) for n in args}
         elif kind == "system_set_hostname":
             keys |= {"hostname", "identity_hostname"}
-        elif kind == "files_install_preset":
+        elif kind in ("files_install_preset", "files_replace_text"):
             keys.add(self._file_key(args.get("path", "")))
         return keys
 
