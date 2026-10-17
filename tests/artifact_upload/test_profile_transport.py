@@ -93,7 +93,7 @@ def test_profile_length_truncation_is_one_accounted_request_without_retry(role):
         assert len(requests) == 1
         assert requests[0]['max_tokens'] == 4096
         assert account['calls'] == 1
-        assert account['reserved_cost_usd'] == pytest.approx(.0036)
+        assert account['reserved_cost_usd'] == pytest.approx(100 * 9e-8 + 4096 * 1.8e-7)  # trued-up to reported
         assert account['reported_cost_usd'] == pytest.approx(100 * 9e-8 + 4096 * 1.8e-7)
         assert account['unaccounted_calls'] == 0
         assert account['aux_soft_failures'] == 1

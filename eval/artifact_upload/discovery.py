@@ -396,6 +396,7 @@ class DevelopmentDiscovery:
         self._calls += 1
         self._reserved += cap  # failed/unknown calls retain the full reservation
         started, reply, status, failure = time.monotonic(), None, "failed", None
+        settled = None  # reported cost of THIS call once known; replaces its reservation
         try:
             client = self.proposer if role == "proposer" else self.reviewer
             format_role = "reviewer" if role == "contradiction_judge" else role
@@ -421,6 +422,7 @@ class DevelopmentDiscovery:
                 self._halted = True
                 raise ValueError("auxiliary response exceeds bounds or lacks usage")
             status = "completed"
+            settled = reply.cost_usd  # within bounds: true-up. Out-of-bounds replies halt and keep the cap.
             return self._parse(reply.output)
         except Exception as exc:
             # An unknown charge or transport failure cannot trigger retries; an unusable reply with
@@ -428,6 +430,7 @@ class DevelopmentDiscovery:
             known = getattr(exc, "cost_usd", None) if isinstance(exc, AuxiliaryError) else None
             if known is not None and reply is None:
                 self._actual += known
+                settled = known
                 failure = {"error": type(exc).__name__ + ": " + str(exc)[:200], "usage": exc.usage,
                            "cost_usd": known, "request_bytes": exc.request_bytes}
             elif reply is None:
@@ -440,6 +443,8 @@ class DevelopmentDiscovery:
                         failure["upstream_error"] = exc.upstream_error
             raise
         finally:
+            if settled is not None:  # true-up: reservation -> reported cost; unaccounted calls keep the cap
+                self._reserved = max(0.0, round(self._reserved + settled - cap, 12))
             receipt = None
             if isinstance(reply, Reply):
                 receipt = {key: (None if isinstance(value, float) and not math.isfinite(value) else value)

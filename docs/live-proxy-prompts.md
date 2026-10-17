@@ -175,6 +175,12 @@ fields: profile changes action(set|remove), path, expected_old, value; rule
 changes action(add|replace|remove), rule_id, expected_old, rule; guest
 operations operation_id, kind, args, preconditions from supported_operations.
 
+Writable profile_changes paths are exactly: desired_identity.<user|hostname|home|worktree|branch>,
+desired_identity.display.<key>, desired_identity.environment.<key>,
+presented_facts.<id>, and findings.<finding_id>. Everything else (os, uid, gid,
+verified guest facts, version, digests, statuses) is harness-owned: a profile
+change to any other path is dropped. Record such wishes as findings instead.
+
 Every finding uses these keys: finding_id, category, evidence_refs (array),
 actual, desired, status (proposed|unresolved|blocked), blocked_reason,
 container_level_alternative ({"possible": boolean, "setting": string}),

@@ -39,6 +39,17 @@ Budget degradation keeps committed rules and logs coverage gaps. An unavailable
 judge yields `unsure`, which defers the proposal. Protected service facts and
 statuses remain authoritative on every surface.
 
+Cost accounting: each call reserves `max_call_cost_usd` before dispatch. When it completes with valid usage the
+reservation is replaced by the reported cost, so remaining budget = cap - reported spend - reservations of calls
+still in flight (run 03 stopped after 2 calls because reservations were never released: 2 x $0.03 left $0.02 < $0.03
+of an $0.08 cap while only $0.009 was spent). Calls with missing or out-of-bounds usage (unaccounted, halting) keep
+their full reservation, so the account still fails closed. The call count (`2 x pairs`) is a plain counter.
+
+Profile changes: the proposer may write only `desired_identity.<user|hostname|home|worktree|branch>`,
+`desired_identity.display.<key>`, `desired_identity.environment.<key>`, `presented_facts.<id>` and `findings.<id>`
+(the prompt says so). A profile change to any other path is dropped on its own (and its dependents) with
+format issue `profile-path-not-writable`; valid siblings are kept.
+
 ## Contradiction-safe edits and next-run activation
 
 For each delivered tool result, `exposure-log.jsonl` records the call, request

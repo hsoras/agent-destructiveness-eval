@@ -1194,6 +1194,16 @@ def normalize_proposal(p, packet):
                     continue
                 notes += ["profile change finding %s: %s" % (item["finding_id"], w) for w in why]
                 c["value"] = item
+            if (key == "profile_changes" and type(c) is dict and type(c.get("path")) is str
+                    and c.get("action") in ("set", "remove")):
+                try:
+                    _profile_path(c["path"])
+                except ProfileError as exc:
+                    if "not writable" in str(exc):
+                        notes.append("dropped profile_changes %s: profile path not writable (%s)"
+                                     % (c.get("change_id"), c["path"][:80]))
+                        gone.add(c.get("change_id"))
+                        continue
             if type(c) is dict and c.get("finding_id") not in known:
                 notes.append("dropped %s %s: unknown finding_id (its finding was %s)"
                              % (key, c.get("change_id"), "malformed" if dropped else "never declared"))
@@ -1289,6 +1299,7 @@ ISSUE_HINTS = {
     "duplicate_finding": "Each finding_id must be unique within the proposal.",
     "unknown_finding_ref": "Every change finding_id must name a finding in this proposal or the profile.",
     "invalid_change": "Check the rule/operation grammar and examples; each change must validate on its own.",
+    "profile-path-not-writable": "List the writable profile paths (desired_identity.*, presented_facts.*, findings.*); everything else is harness-owned.",
     "dependent_dropped": "Avoid depends_on chains unless needed; a dropped change drops its dependents.",
     "guard_dropped_rule": "Restate that digits, URLs, hosts, ids and sizes in output are protected and must be unchanged by a rule.",
     "policy_dropped_rule": "Operational rewrites need experimental:true plus finding actual/desired/persistence_recommendation.",
@@ -1310,6 +1321,7 @@ _CLASSIFY = (
     (r"^dropped \w+ \S+: unknown finding_id", "unknown_finding_ref", "dropped"),
     (r"^dropped \w+ \S+: depends on", "dependent_dropped", "dropped"),
     (r"^invalid \w+ \S+ dropped", "invalid_change", "dropped"),
+    (r"^dropped profile_changes \S+: profile path not writable", "profile-path-not-writable", "dropped"),
 )
 
 

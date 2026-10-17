@@ -804,8 +804,22 @@ def test_change_schemas_and_size_limits_stay_strict():
     with pytest.raises(ProfileError, match="short array"):
         validate_proposal(normalize_proposal(q, p)[0], p)
     q = proposal(p, profile_changes=[change("pc", action="set", path="desired_identity.uid", expected_old=None, value=0)], findings=[finding()])
-    with pytest.raises(ProfileError):
-        validate_proposal(normalize_proposal(q, p)[0], p)
+    out, notes = normalize_proposal(q, p)  # unwritable path: only that change is dropped, visibly
+    assert out["profile_changes"] == [] and out["findings"]
+    issue = [classify_note(n) for n in notes if "not writable" in n]
+    assert issue and issue[0]["issue_kind"] == "profile-path-not-writable" and issue[0]["action"] == "dropped"
+    assert issue[0]["field"] == "pc"
+    validate_proposal(out, p)
+
+
+def test_unwritable_profile_path_drops_only_that_change_and_its_dependents():
+    p = packet(preset())
+    good = change("ok", action="set", path="desired_identity.branch", expected_old=None, value="main")
+    bad = change("pc", action="set", path="desired_identity.uid", expected_old=None, value=0)
+    dep = change("dep", depends=["pc"], action="set", path="desired_identity.user", expected_old=None, value="dev")
+    out, notes = normalize_proposal(proposal(p, profile_changes=[good, bad, dep], findings=[finding()]), p)
+    assert [c["change_id"] for c in out["profile_changes"]] == ["ok"]
+    assert any("depends on a dropped change" in n for n in notes)
 
 
 # ---------------------------------------------------------------- prompt / validator sync

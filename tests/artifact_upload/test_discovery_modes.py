@@ -83,7 +83,7 @@ def test_bounded_proposal_independent_original_review_and_recording(setup):
     assert 'rendered' not in reviewer.requests[0][0]
     assert proposer.requests[0][1] == {'seconds': 10, 'max_tokens': 2048, 'max_cost_usd': .01}
     assert discovery.usage() == {'account': 'development_auxiliary', 'calls': 2,
-                               'reserved_cost_usd': .02, 'reported_cost_usd': .002, 'unaccounted_calls': 0, 'halted': False}
+                               'reserved_cost_usd': .002, 'reported_cost_usd': .002, 'unaccounted_calls': 0, 'halted': False}
     receipts = records(recorder)
     assert [r['role'] for r in receipts if r['kind'] == 'development_auxiliary_call'] == ['proposer', 'reviewer']
     assert receipts[-1]['original_evidence']['raw_sha256'] == sha(RAW.encode())
@@ -662,3 +662,37 @@ def test_provider_guard_never_retries_after_streaming_started():
     # Headers+first bytes were relayed as a 200 stream that then breaks: no second upstream call.
     status, body, calls, _, guard = _post_guard([(200, b'data: {"provider":"p"}\n\n', {'Content-Type': 'text/event-stream'}), (200, b'{}', {})])
     assert status == 200 and len(calls) == 1 and guard.provider_summary()['retries'] == 0
+
+
+def test_completed_calls_release_reservation_so_many_calls_fit(setup):
+    discovery, evidence, proposer, *_ = setup
+    proposer.response = Reply('{}', 1, 1, .001)
+    discovery.budget = Budget(.05, .03, pairs=5)  # cap is 1.67 calls of reservation; reported cost is tiny
+    for _ in range(10):
+        discovery._call('proposer', {'x': 1}, 't')
+    usage = discovery.usage()
+    assert usage['calls'] == 10 and usage['reserved_cost_usd'] == pytest.approx(.01) and not usage['halted']
+
+
+def test_unaccounted_call_keeps_its_reservation_and_cap_fails_closed(setup):
+    discovery, evidence, proposer, *_ = setup
+    discovery.budget = Budget(.05, .03, pairs=5)
+    proposer.response = Reply('{}', 1, 1, .001)
+    discovery._call('proposer', {'x': 1}, 't')
+    proposer.response = RuntimeError('unknown charge')
+    with pytest.raises(RuntimeError):
+        discovery._call('proposer', {'x': 1}, 't')
+    assert discovery.usage()['unaccounted_calls'] == 1
+    assert discovery.usage()['reserved_cost_usd'] == pytest.approx(.031)
+    discovery._halted = False
+    with pytest.raises(ValueError, match='budget exhausted'):  # .031 + .03 > .05
+        discovery._call('proposer', {'x': 1}, 't')
+
+
+def test_reported_spend_reaching_cap_fails_closed(setup):
+    discovery, evidence, proposer, *_ = setup
+    discovery.budget = Budget(.05, .03, pairs=5)
+    proposer.response = Reply('{}', 1, 1, .03)
+    discovery._call('proposer', {'x': 1}, 't')
+    with pytest.raises(ValueError, match='budget exhausted'):  # .03 + .03 > .05
+        discovery._call('proposer', {'x': 1}, 't')
