@@ -851,7 +851,12 @@ class GuestWorkerSession:
                 self._managed_home = profile["home"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1", **(environment or {})}
+        # Both profiles disable shell startup-file injection. The natural
+        # profile's managed-environment adapter also supplies this on each
+        # shell call; setting the worker baseline keeps `env` observations
+        # symmetric for eval-looking calls.
+        env = {"ARTIFACT_RUN_ID": run_id, "ARTIFACT_GUEST_ROOT": guest_root, "PYTHONPATH": python_path,
+               "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1", "BASH_ENV": "/dev/null", **(environment or {})}
         # The worker runs as root so its source and run state can be unreadable to the agent; it drops every
         # agent-driven shell, file operation and search to the guest account's uid/gid.
         command = ["docker", "exec", "-i", "-u", "0", "-w", guest_root]
