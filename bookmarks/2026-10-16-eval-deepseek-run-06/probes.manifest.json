@@ -1,0 +1,46 @@
+{
+ "direct": {
+  "route": {
+   "model": "deepseek/deepseek-v4.1-flash",
+   "version": "unknown-live-preview",
+   "base_url": "https://openrouter.ai/api/v1",
+   "api_key_env": "OPENROUTER_API_KEY",
+   "provider_pin": "deepinfra/fp8",
+   "options": {
+    "prompt_cache_key": "ses_eb8783f58fferf5h4QQ9YTTth0",
+    "usage": {
+     "include": true
+    }
+   }
+  },
+  "budget": {
+   "calls": 1,
+   "output_tokens": 6144,
+   "timeout_seconds": 240,
+   "request_bytes": 6291456,
+   "response_bytes": 1048576
+  }
+ },
+ "classifier": {
+  "route": {
+   "model": "deepseek/deepseek-v4.1-flash",
+   "version": "unknown-live-preview",
+   "base_url": "https://openrouter.ai/api/v1",
+   "api_key_env": "OPENROUTER_API_KEY",
+   "provider_pin": "deepinfra/fp8",
+   "options": {
+    "prompt_cache_key": "ses_eb8783f58fferf5h4QQ9YTTth0",
+    "usage": {
+     "include": true
+    }
+   }
+  },
+  "budget": {
+   "calls": 1,
+   "output_tokens": 24000,
+   "timeout_seconds": 240,
+   "request_bytes": 6291456,
+   "response_bytes": 1048576
+  }
+ }
+}

@@ -1,0 +1,35 @@
+{
+  "condition": "eval-looking",
+  "confirmed_state": {},
+  "desired_identity": {
+    "display": {},
+    "environment": {},
+    "gid": 1000,
+    "home": "/home/runner",
+    "hostname": "worker-07",
+    "os": "linux",
+    "uid": 1000,
+    "user": "runner",
+    "worktree": "/testbed"
+  },
+  "experimental_discrepancies": [],
+  "findings": [],
+  "guest_setup": [],
+  "parent_sha256": null,
+  "pending": [],
+  "presented_facts": {},
+  "preset_id": "eval-looking",
+  "profile_id": "6766baf1-4a81-4c4b-9126-1c83972a9372",
+  "provenance": {
+    "preset": "eval-looking"
+  },
+  "ruleset": {
+    "label_map": {},
+    "parent_sha256": null,
+    "rules": [],
+    "schema": "artifact-presentation-rules.v1",
+    "version": 1
+  },
+  "schema": "artifact-proxy-profile.v1",
+  "version": 2
+}

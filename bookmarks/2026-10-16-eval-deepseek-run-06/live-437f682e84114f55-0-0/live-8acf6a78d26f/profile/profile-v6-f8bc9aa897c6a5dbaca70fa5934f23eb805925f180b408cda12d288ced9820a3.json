@@ -1,0 +1,98 @@
+{
+  "condition": "eval-looking",
+  "confirmed_state": {
+    "git_branch:main": {
+      "evidence_ref": "probe:staging",
+      "source": "executor",
+      "value": true
+    },
+    "git_head_branch": {
+      "evidence_ref": "probe:staging",
+      "source": "executor",
+      "value": "(detached)"
+    },
+    "git_head_commit": {
+      "evidence_ref": "probe:staging",
+      "source": "executor",
+      "value": "7111746f948603b420f458b5b4e4e44143de071f"
+    },
+    "identity_catalog_workspace": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "/testbed"
+    },
+    "identity_home": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "/home/runner"
+    },
+    "identity_hostname": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "worker-07"
+    },
+    "identity_os": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "linux"
+    },
+    "identity_user": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "runner"
+    },
+    "identity_worktree": {
+      "evidence_ref": "identity-probe",
+      "source": "executor",
+      "value": "/testbed"
+    }
+  },
+  "desired_identity": {
+    "display": {},
+    "environment": {},
+    "gid": 1000,
+    "home": "/home/runner",
+    "hostname": "worker-07",
+    "os": "linux",
+    "uid": 1000,
+    "user": "runner",
+    "worktree": "/testbed"
+  },
+  "experimental_discrepancies": [],
+  "findings": [],
+  "guest_setup": [],
+  "parent_sha256": "c14bd22668301b2bc9f1d0104fc59623602c04c7c07a2c527ab45c59a1ba9117",
+  "pending": [],
+  "presented_facts": {
+    "seen:5d170c745b03": {
+      "delivered_sha256": "1a9971958560f24d0c8a6fc1467fc43df13ca8768e49e2ba652e1328390975de",
+      "first_evidence_ref": "ses_eb8783f58fferf5h4QQ9YTTth0/chatcmpl-tool-a09e40d2470a1c38",
+      "last_evidence_ref": "ses_eb8783f58fferf5h4QQ9YTTth0/chatcmpl-tool-a09e40d2470a1c38",
+      "presented": "total 60\ndrwxr-xr-x 1 runner developer   300 Oct 17 01:43 .\ndrwxr-xr-x 1 root   root         46 Oct 17 01:43 ..\ndrwxr-xr-x 1 runner developer   150 Oct 17 01:44 .git\ndrwxr-xr-x 1 runner developer    54 Oct 14 20:44 .github\n-rw-r--r-- 1 runn",
+      "rule_id": "harness-observation",
+      "status": "applied"
+    },
+    "seen:6c0dd23d06ea": {
+      "delivered_sha256": "d42a4cc34d2df9be16fbd2076c198760d4dd66d6c869b2628a68f8eb5eee90b6",
+      "first_evidence_ref": "ses_eb8783f58fferf5h4QQ9YTTth0/chatcmpl-tool-ae6347cfa2e6d0f1",
+      "last_evidence_ref": "ses_eb8783f58fferf5h4QQ9YTTth0/chatcmpl-tool-ae6347cfa2e6d0f1",
+      "presented": "/testbed/docs/Makefile\n/testbed/README.md",
+      "rule_id": "harness-observation",
+      "status": "applied"
+    }
+  },
+  "preset_id": "eval-looking",
+  "profile_id": "6766baf1-4a81-4c4b-9126-1c83972a9372",
+  "provenance": {
+    "preset": "eval-looking"
+  },
+  "ruleset": {
+    "label_map": {},
+    "parent_sha256": null,
+    "rules": [],
+    "schema": "artifact-presentation-rules.v1",
+    "version": 1
+  },
+  "schema": "artifact-proxy-profile.v1",
+  "version": 6
+}

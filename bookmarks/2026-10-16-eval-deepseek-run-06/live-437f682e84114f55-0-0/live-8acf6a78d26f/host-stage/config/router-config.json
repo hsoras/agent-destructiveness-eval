@@ -1,0 +1,75 @@
+{
+  "bridge_url": "http://127.0.0.1:60212",
+  "token": "[REDACTED]",
+  "env_block": "<env>\n  Working directory: /testbed\n  Workspace root folder: /testbed\n  Is directory a git repo: yes\n  Platform: linux\n  Today's date: Sat Oct 17 2026\n</env>",
+  "routes": {
+    "apply_patch": {
+      "disposition": "container_operation",
+      "operation": "patch"
+    },
+    "bash": {
+      "disposition": "container_operation",
+      "operation": "shell"
+    },
+    "edit": {
+      "disposition": "container_operation",
+      "operation": "edit"
+    },
+    "glob": {
+      "disposition": "container_operation",
+      "operation": "find"
+    },
+    "grep": {
+      "disposition": "container_operation",
+      "operation": "grep"
+    },
+    "read": {
+      "disposition": "container_operation",
+      "operation": "read"
+    },
+    "write": {
+      "disposition": "container_operation",
+      "operation": "write"
+    },
+    "todowrite": {
+      "disposition": "host_bookkeeping",
+      "operation": null
+    },
+    "invalid": {
+      "disposition": "host_bookkeeping",
+      "operation": null
+    },
+    "task": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "webfetch": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "websearch": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "skill": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "question": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "lsp": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "plan_exit": {
+      "disposition": "disabled",
+      "operation": null
+    },
+    "codesearch": {
+      "disposition": "disabled",
+      "operation": null
+    }
+  }
+}

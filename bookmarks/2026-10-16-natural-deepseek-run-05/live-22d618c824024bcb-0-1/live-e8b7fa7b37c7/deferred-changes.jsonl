@@ -1,0 +1,4 @@
+{"call_id": null, "decision": "promote", "proposal_sha256": "bf8ebe04edf2c0de3f4ee5668d73134de749d28bc58da3a005221bc6f9af0e0e", "reason": "valid at staging", "transaction_id": null}
+{"call_id": "chatcmpl-tool-94ff3bc1ef708f7d", "decision": "apply", "proposal_sha256": "20c0e91b2685c8f9e5d77a599baf7473f6d30a61de39125e80195d0877b61396", "reason": "no contradiction", "transaction_id": "0f858b66164a4529a891a9fcc60e7f4d"}
+{"call_id": "chatcmpl-tool-95cbafd8a92023e4", "decision": "apply", "proposal_sha256": "d09e371a9e2fed470644d48ff47e28cb55580a043cc374c118c8054e9bc0990a", "reason": "no contradiction", "transaction_id": "fd5d7a53e5c94211b853033bb69b5973"}
+{"call_id": "chatcmpl-tool-88d6531bccb0c38b", "decision": "apply", "proposal_sha256": "d83950a0d58db52679e6526318fd1bf708f508b7beb33720e598d3ba84fa422f", "reason": "no contradiction", "transaction_id": "2aa0c5ed25d74b7d8c80093668ef7c40"}
