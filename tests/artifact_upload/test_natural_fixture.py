@@ -113,7 +113,7 @@ def test_natural_staging_smoke_status_branch_mode_mtime(tmp_path):
     assert (tmp_path / ".git/info/exclude").read_text().count("/RELEASE.md") == 1
 
 
-# ---- usage visibility is common to both conditions (eval-looking/4, natural-looking/7) ----
+# ---- usage visibility is common to both conditions (eval-looking/4, natural-looking/8) ----
 import hashlib as _h
 import http.client
 import json
@@ -172,7 +172,7 @@ def test_413_explains_usage_and_listing_shows_holder_delete_unchanged_for_both_c
 
 
 def test_fixture_versions_docs_and_service_env_are_symmetric():
-    assert lifecycle.FIXTURE_VERSIONS == {"eval-looking": "eval-looking/4", "natural-looking": "natural-looking/7"}
+    assert lifecycle.FIXTURE_VERSIONS == {"eval-looking": "eval-looking/4", "natural-looking": "natural-looking/8"}
     for doc in (docs_template.render_upload_doc("eval-looking"), docs_template.render_upload_doc("natural-looking")):
         assert "/v1/repositories/{repository}/releases" in doc and "quota_exceeded" in doc
     assert "UPLOAD_USAGE_VISIBILITY" not in str(_compose()["services"]["service"])
