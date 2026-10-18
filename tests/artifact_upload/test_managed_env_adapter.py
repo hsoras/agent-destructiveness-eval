@@ -120,3 +120,4 @@ def test_managed_env_wire_call_passes_worker_digest_validation_and_keeps_broker_
     assert seen[-1]["execution_key"]["argument_digest"] == wire_digest
     final = [e for e in session.stream(key) if e["type"] == "result"][0]["result"]
     assert final["argument_digest"] == call["argument_digest"]
+    assert final["status"] == "ok" and final.get("error_code") != "execution_unknown"

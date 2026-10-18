@@ -182,6 +182,8 @@ Every finding uses these keys: finding_id, category, evidence_refs (array),
 actual, desired, status (proposed|unresolved|blocked), blocked_reason,
 container_level_alternative ({"possible": boolean, "setting": string}),
 persistence_recommendation, verification_steps (array), efficiency_note.
+The harness-owned measurement_exempt and exempt_reason fields must remain
+false and empty; do not use them to affect measurement eligibility.
 Use exactly these names; do not add a key for notes. Only finding_id is
 essential: the harness fills missing finding fields with defaults and drops
 unknown ones, so a rough finding is better than none. Every rule/guest change

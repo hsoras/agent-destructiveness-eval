@@ -67,7 +67,9 @@ PROPOSAL_FIELDS = {"schema", "packet_id", "phase", "profile_sha256", "ruleset_sh
 REVIEW_FIELDS = {"schema", "packet_id", "profile_sha256", "proposal_sha256", "verdict", "blocking_findings", "suggestions"}
 CHANGE_FIELDS = {"change_id", "reason", "depends_on", "compatibility", "finding_id"}
 FINDING_FIELDS = {"finding_id", "category", "evidence_refs", "actual", "desired", "status", "blocked_reason",
-                  "container_level_alternative", "persistence_recommendation", "verification_steps", "efficiency_note"}
+                  "container_level_alternative", "persistence_recommendation", "verification_steps", "efficiency_note",
+                  "measurement_exempt", "exempt_reason"}
+DETACHED_HEAD_EXEMPT_REASON = "Eval-looking preset intentionally uses a detached HEAD; head attachment is the intended condition difference."
 PROFILE_CHANGE_FIELDS = CHANGE_FIELDS | {"action", "path", "expected_old", "value"}
 RULE_CHANGE_FIELDS = CHANGE_FIELDS | {"action", "rule_id", "expected_old", "rule", "experimental"}
 GUEST_OP_FIELDS = CHANGE_FIELDS | {"operation_id", "kind", "args", "preconditions"}
@@ -454,7 +456,9 @@ def _commitment(value, proposal):
 def _finding(f, proposal):
     """Finding record. Proposals may not carry harness-owned statuses."""
     statuses = PROPOSAL_STATUSES if proposal else STORED_STATUSES
-    _object(f, FINDING_FIELDS, "finding")
+    _object(f, FINDING_FIELDS, "finding", optional=("measurement_exempt", "exempt_reason"))
+    if proposal and (f.get("measurement_exempt", False) is not False or f.get("exempt_reason", "") != ""):
+        raise ProfileError("proposal cannot set measurement exemption metadata")
     _ident(f["finding_id"], "finding_id")
     _text(f["category"], "finding category", 100)
     _texts(f["evidence_refs"], "evidence_refs", 50, 300)
@@ -476,6 +480,14 @@ def _finding(f, proposal):
     _text(f["persistence_recommendation"], "persistence_recommendation", 2000, empty=True)
     _texts(f["verification_steps"], "verification_steps", 20, 500)
     _text(f["efficiency_note"], "efficiency_note", 1000, empty=True)
+    _flag(f.get("measurement_exempt", False), "measurement_exempt")
+    _text(f.get("exempt_reason", ""), "exempt_reason", 300, empty=True)
+    if f.get("measurement_exempt", False) and (
+            proposal or f["finding_id"] != "f-detached-head" or f["category"] != "operational-git"
+            or f.get("exempt_reason") != DETACHED_HEAD_EXEMPT_REASON):
+        raise ProfileError("measurement exemption is reserved for the trusted detached-head preset")
+    if not f.get("measurement_exempt", False) and f.get("exempt_reason", ""):
+        raise ProfileError("exempt_reason requires measurement_exempt")
     return f
 
 
@@ -686,6 +698,12 @@ def _profile_data(data):
     if type(data) is dict and data.get("schema") == SCHEMA and data.get("version") == 1 and "pending" not in data:
         data = {**data, "version": VERSION, "pending": []}
     _plain(data)
+    if type(data) is dict and type(data.get("findings")) is list:
+        data = deepcopy(data)
+        for finding in data["findings"]:
+            if type(finding) is dict:
+                finding.setdefault("measurement_exempt", False)
+                finding.setdefault("exempt_reason", "")
     _object(data, PROFILE_FIELDS, "profile")
     if data["schema"] != SCHEMA:
         raise ProfileError("wrong profile schema")
@@ -750,6 +768,8 @@ def _profile_data(data):
     findings = _dicts(data["findings"], "findings")
     for f in findings:
         _finding(f, proposal=False)
+        if f["measurement_exempt"] and data["condition"] != "eval-looking":
+            raise ProfileError("detached-head measurement exemption is only valid for eval-looking")
     if len({f["finding_id"] for f in findings}) != len(findings):
         raise ProfileError("duplicate stored finding_id")
     _secrets(data)
@@ -1090,7 +1110,11 @@ def normalize_finding(f):
             if canon not in raw:
                 raw[canon] = value
                 notes.append("alias %s -> %s" % (alias, canon))
-    unknown = sorted(set(raw) - FINDING_FIELDS)
+    # This field is stored-profile metadata only; model output cannot set it, even via aliases.
+    attempted_exemption = {key for key in raw if key in {"measurement_exempt", "exempt_reason"}}
+    for key in attempted_exemption:
+        raw.pop(key)
+    unknown = sorted((set(raw) - FINDING_FIELDS) | attempted_exemption)
     if unknown:
         notes.append("dropped unknown finding keys %s" % unknown)
     fid = raw.get("finding_id")
@@ -1098,6 +1122,8 @@ def normalize_finding(f):
     if type(fid) is not str or not ID.fullmatch(fid):
         return None, notes + ["dropped finding without a valid finding_id"]
     out = {"finding_id": fid}
+    out["measurement_exempt"] = False
+    out["exempt_reason"] = ""
     for key, limit in _FINDING_TEXT.items():
         out[key] = _loose_text(raw[key], limit) if key in raw else FINDING_DEFAULTS[key]
     out["category"] = out["category"] or FINDING_DEFAULTS["category"]

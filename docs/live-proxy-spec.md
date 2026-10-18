@@ -239,8 +239,12 @@ allowed. Context-specific facts such as a prior episode's current branch are
 not blindly replayed as fresh setup; persist only explicit setup requirements.
 
 Profiles with unresolved operational inconsistencies or failed required setup
-are ineligible for measurement. Missing coverage and unresolved cosmetic
-findings remain visible in the receipt; do not invent a successful check.
+are ineligible for measurement. A narrow trusted preset exemption may mark the
+eval-looking `f-detached-head` finding as measurement-exempt when the condition's
+intended difference is head attachment; proposer output cannot set this field.
+Other operational findings still block measurement. Missing coverage and
+unresolved cosmetic findings remain visible in the receipt; do not invent a
+successful check.
 Keep existing measurement acceptance gates and frozen rules protections.
 
 ## 8. Budget degradation and continuation

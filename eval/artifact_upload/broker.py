@@ -64,12 +64,14 @@ class ExecutionBroker:
             self._cancel_intent.discard(intent)
             return True
 
-    def _event(self, call: dict[str, Any], kind: str, status: str, raw: Any, presented: Any) -> None:
+    def _event(self, call: dict[str, Any], kind: str, status: str, raw: Any, presented: Any,
+               metadata: dict[str, Any] | None = None) -> None:
         event = {"event_id": uuid.uuid4().hex,
                             "event_type": kind, "occurred_at": datetime.now(timezone.utc).isoformat(),
                             "run_id": call["run_id"], "session_id": call["session_id"], "call_id": call["call_id"],
                             "actor": "broker", "status": status, "raw_digest": _digest(raw),
-                            "presented_digest": _digest(presented), "metadata": {"operation": call["operation"]}}
+                            "presented_digest": _digest(presented),
+                            "metadata": {"operation": call["operation"], **(metadata or {})}}
         validate("event", event)
         self.journal.append_event(event)
         self.events.append(event)
@@ -146,7 +148,7 @@ class ExecutionBroker:
                             self.journal.put(key, "running", process=process)
                             recovered = None
                         else:
-                            recovered = self.reconcile(call)
+                            recovered = self.reconcile(call, cause=exc)
                         # Recovery to a live execution carries the dispatch
                         # owner's accepted cancellation; a terminal outcome
                         # settles it; unavailable evidence leaves it pending.
@@ -156,12 +158,13 @@ class ExecutionBroker:
                             self._take_intent(key)
                     if cancel_now:
                         return self.cancel(call)
-                    return recovered or self.reconcile(call)
+                    return recovered or self.reconcile(call, cause=exc)
                 except Exception:
                     pass
                 result = self._unknown(call, "worker_outcome_unknown", str(exc))
                 self.journal.put(key, state, process=process, result=result)
-                self._event(call, "tool.unknown", "unknown", {"error": str(exc)}, result)
+                self._event(call, "tool.unknown", "unknown", {"error": str(exc)}, result,
+                            {"exception_type": type(exc).__name__, "exception": str(exc)})
                 return result
             result = self._unknown(call, "worker_dispatch_failed", str(exc), status="error")
             self.journal.put(key, "failed", result=result)
@@ -193,7 +196,7 @@ class ExecutionBroker:
                 "output_uri": None, "display_fields": {"aliases": {}, "changed_fields": []},
                 "worker_digest": getattr(self.worker, "digest", "0" * 64)}
 
-    def reconcile(self, call: dict[str, Any]) -> dict[str, Any]:
+    def reconcile(self, call: dict[str, Any], *, cause: Exception | None = None) -> dict[str, Any]:
         """Query worker evidence after a broker/connection interruption; never redispatch."""
         key = self._validate_call(call)
         with self._lock:
@@ -209,12 +212,16 @@ class ExecutionBroker:
                 else:
                     process = status.get("process", entry["process"])
                     return self.journal.put(key, "running", process=process)["result"] or self._unknown(call, "execution_running", "execution remains active")
-            except Exception:
+            except Exception as exc:
                 if entry["state"] == "unknown" and entry["result"] is not None:
                     return entry["result"]
                 result = self._unknown(call, "execution_unknown", "worker has no authoritative outcome for this handle")
                 self.journal.put(key, "unknown", process=entry["process"], result=result)
-                self._event(call, "tool.unknown", "unknown", {"state": "unavailable"}, result)
+                metadata = {"exception_type": type(cause or exc).__name__, "exception": str(cause or exc)}
+                if cause is not None:
+                    metadata.update({"reconciliation_exception_type": type(exc).__name__,
+                                     "reconciliation_exception": str(exc)})
+                self._event(call, "tool.unknown", "unknown", {"state": "unavailable"}, result, metadata)
                 return result
             validate_result_for_call(call, result)
             state = {"ok": "completed", "cancelled": "cancelled", "unknown": "unknown"}.get(result["status"], "failed")

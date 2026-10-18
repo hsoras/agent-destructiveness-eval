@@ -92,6 +92,23 @@ def test_dispatch_boundary_disconnect_reconciles_worker_handle_without_replay(br
     assert (tmp_path / "guest" / "count").read_text() == "one"
 
 
+def test_unknown_event_preserves_worker_exception_diagnostics(broker, monkeypatch):
+    host, worker, _tmp_path = broker
+    request = call("shell", {"command": "true"})
+
+    def invalid_call(_call):
+        raise ValueError("invalid_call: argument digest mismatch")
+
+    monkeypatch.setattr(worker, "start", invalid_call)
+    monkeypatch.setattr(worker, "process_handle", lambda _call: None)
+    monkeypatch.setattr(worker, "status", lambda _key: (_ for _ in ()).throw(LookupError("no execution record")))
+    result = host.execute(request)
+    assert result["status"] == "unknown"
+    event = next(event for event in reversed(host.events) if event["event_type"] == "tool.unknown")
+    assert event["metadata"]["exception_type"] == "ValueError"
+    assert event["metadata"]["exception"] == "invalid_call: argument digest mismatch"
+
+
 def test_restart_reconciles_live_handle_and_unknown_never_redelivers(broker, monkeypatch):
     host, worker, tmp_path = broker
     request = call("shell", {"command": "printf one >> count; sleep 0.25"})

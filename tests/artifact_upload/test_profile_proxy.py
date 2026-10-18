@@ -14,7 +14,8 @@ from eval.artifact_upload.live import LiveBudget
 from eval.artifact_upload.profile_prompts import PROPOSER_PROMPT_SHA256
 from eval.artifact_upload.profile_proxy import EarlyContradictionStop, ProfileDiscovery, ProfilePresentation
 from eval.artifact_upload.profiles import (PROPOSAL_FIELDS, PROPOSAL_SCHEMA, REVIEW_FIELDS, REVIEW_SCHEMA,
-                                            ProfileBundle, ProfileError, digest, validate_packet, validate_proposal)
+                                            DETACHED_HEAD_EXEMPT_REASON, ProfileBundle, ProfileError, digest,
+                                            normalize_finding, validate_packet, validate_proposal)
 from eval.artifact_upload.rules import RuleSet, check_surface, holds
 
 
@@ -720,6 +721,27 @@ def test_unmarked_operational_rule_rejected_and_experimental_blocks_measurement(
     eligible, reasons = pres.measurement_eligibility()
     assert not eligible and pres.receipt()["measurement_eligible"] is False
     assert "Experimental discrepancies" in pres.write_report().read_text()
+
+
+def test_trusted_detached_head_measurement_exemption_is_narrow(tmp_path):
+    detached = finding("f-detached-head", "operational-git", "blocked", blocked_reason="intentional",
+                       measurement_exempt=True, exempt_reason=DETACHED_HEAD_EXEMPT_REASON)
+    data = ProfileBundle.preset("eval-looking").data
+    data["findings"] = [detached]
+    pres = ProfilePresentation(tmp_path / "out", ProfileBundle.from_dict(data))
+    pres._setup = type("Setup", (), {"ok": True, "failed_required": []})()
+    assert pres.measurement_eligibility() == (True, [])
+
+    other = ProfileBundle.preset("eval-looking").data
+    other["findings"] = [finding("f-other", "operational-git", "blocked", blocked_reason="real issue")]
+    blocked = ProfilePresentation(tmp_path / "other", ProfileBundle.from_dict(other))
+    blocked._setup = pres._setup
+    eligible, reasons = blocked.measurement_eligibility()
+    assert not eligible and "f-other" in " ".join(reasons)
+
+    normalized, notes = normalize_finding({**detached, "finding_id": "f-detached-head"})
+    assert normalized["measurement_exempt"] is False and normalized["exempt_reason"] == ""
+    assert any("measurement_exempt" in note or "exempt_reason" in note for note in notes)
 
 
 # ------------------------------------------------------------------ guest operations through the proxy

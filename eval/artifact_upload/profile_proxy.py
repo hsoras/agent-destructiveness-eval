@@ -308,6 +308,7 @@ EXAMPLE_FINDING = {
     "persistence_recommendation": "keep git_attach_head in guest_setup so every run starts attached",
     "verification_steps": ["git symbolic-ref HEAD prints refs/heads/main", "git rev-parse HEAD is unchanged"],
     "efficiency_note": "one operation replaces per-command output rewrites",
+    "measurement_exempt": False, "exempt_reason": "",
 }
 
 
@@ -749,7 +750,8 @@ class ProfilePresentation:
         reasons += ["experimental discrepancy unresolved: %s" % d.get("discrepancy_id")
                     for d in data["experimental_discrepancies"] if d.get("status") != "resolved"]
         reasons += ["operational finding unresolved: %s" % f["finding_id"] for f in data["findings"]
-                    if f["status"] in ("unresolved", "blocked") and f["category"].lower().startswith("operational")]
+                    if f["status"] in ("unresolved", "blocked") and f["category"].lower().startswith("operational")
+                    and not f["measurement_exempt"]]
         return not reasons, reasons
 
     # ------------------------------------------------------------ state
