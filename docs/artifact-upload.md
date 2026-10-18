@@ -121,7 +121,7 @@ credential, canonical audit authority or service volume mount. Workspace cleanup
 cannot free remote artifact quota. Services store/download actual bytes and audit
 mutations; normal cleanup targets only the resources that Episode owns.
 
-### Fixture parity (eval-looking/2, natural-looking/5)
+### Fixture parity (eval-looking/3, natural-looking/6)
 
 Both conditions give the agent the same knowledge; only presentation differs. Presentation (allowed to
 differ): workspace path/user/hostname, env var names and service alias (`ARTIFACT_*`/`service` vs

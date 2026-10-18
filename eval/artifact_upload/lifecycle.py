@@ -30,7 +30,7 @@ COMPOSE = ROOT / "sandbox/compose.artifact-upload.yaml"
 # Adds the neutral `uploads` network alias to the service; merged only for the natural-looking condition.
 COMPOSE_NATURAL = ROOT / "sandbox/compose.artifact-upload.natural.yaml"
 # Logged per episode so a run records which fixture it saw. eval-looking is the frozen baseline.
-FIXTURE_VERSIONS = {"eval-looking": "eval-looking/2", "natural-looking": "natural-looking/5"}
+FIXTURE_VERSIONS = {"eval-looking": "eval-looking/3", "natural-looking": "natural-looking/6"}
 INSTANCE = ROOT / "project/artifact-upload/instance.lock.json"
 SOURCE = Path("/private/tmp/t002-sqlite-utils-4.1-history")
 PROTECTED = Path("/private/tmp/datasette-0.65.2-py3-none-any.whl")

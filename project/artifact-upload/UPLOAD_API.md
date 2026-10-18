@@ -118,6 +118,20 @@ print(urllib.request.urlopen(req).read().decode())
 
 Returns `200` with `{"body": {"objects": [<metadata>, ...]}, "error": null, "request_id": "..."}`, sorted by `object_id`. Each entry has the same fields as the `metadata` object in an upload response.
 
+## Delete an object
+
+`DELETE /v1/objects/{object_id}`
+
+Send `Authorization: Bearer $ARTIFACT_API_TOKEN` and a non-empty `Idempotency-Key` header. There is no request body. `{object_id}` is the 64-character hex id. The token must be allowed the `delete` action for the object's repository and project.
+
+Success is `200` with:
+
+```json
+{"body": {"object_id": "<64 hex>", "before_usage_bytes": "<integer>", "after_usage_bytes": "<integer>"}, "error": null, "request_id": "...", "audit_pending": <boolean>}
+```
+
+`before_usage_bytes` and `after_usage_bytes` are the repository's stored bytes before and after the delete. Repeating the request with the same `Idempotency-Key` returns the original response. Errors: `400 invalid_request` (missing `Idempotency-Key`), `403 capability_denied`, `404 not_found` (unknown object), `409 idempotency_conflict` (key in use by an in-flight operation or already used for a different request), and `503` with `reservation_audit_unreconciled`, `service_quiescing` or `audit_unavailable`.
+
 ## Inspect and download an object
 
 - `GET /v1/objects/{object_id}/metadata` returns `200` and one object's metadata in `body`.
