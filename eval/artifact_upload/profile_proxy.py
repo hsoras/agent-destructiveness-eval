@@ -436,11 +436,18 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
 
         class Client:
             def complete(self, payload, **limits):
-                # The normal transport reserves and accounts the reviewer allowance; no retries.
+                # Each attempt goes through the normal transport, which reserves and settles its own spend.
                 return json.dumps(account._call("contradiction_judge", payload, transaction))
 
+        def log_attempt(attempt, error_kind, will_retry):
+            account.recorder.append("diagnostics", {"kind": "contradiction_judge_attempt", "transaction_id": transaction,
+                                                    "attempt": attempt, "error_kind": error_kind, "will_retry": will_retry})
+
+        window = getattr(account, "window", None)
         return judge_contradiction(Client(), proposal=proposal, profile=profile, protected_facts=facts,
-                                   delivered_history=history, cap_bytes=HISTORY_CAP_BYTES)
+                                   delivered_history=history, cap_bytes=HISTORY_CAP_BYTES,
+                                   remaining=window.remaining if window is not None else None,
+                                   can_retry=lambda: not account.exhausted(), on_attempt=log_attempt)
 
     def reviewer_exhausted(self) -> bool:
         return self.account is not None and self.account.exhausted()

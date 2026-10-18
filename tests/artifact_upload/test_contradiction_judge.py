@@ -217,3 +217,76 @@ def test_reviewer_prompt_has_contradiction_section_and_keeps_review_contract():
     assert '{"outcome": "no_contradiction" | "contradiction" | "unsure", "reason": ' in text
     assert "return\nexactly one JSON object conforming to profile-review.v1" in text
     assert "Unless the packet is a contradiction check" in text
+
+
+class SeqClient:
+    """Scripted attempts: exception instances are raised, strings returned; counts spend per attempt."""
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+        self.spend = 0.0
+
+    def complete(self, payload, **limits):
+        self.calls += 1
+        self.spend += 0.01  # each attempt settles its own spend
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def run_retry(client, **kw):
+    sleeps = []
+    attempts = []
+    v = judge_contradiction(client, proposal=PROPOSAL, profile=PROFILE, protected_facts=FACTS,
+                            delivered_history=[entry(1)], cap_bytes=10_000, sleep=sleeps.append,
+                            on_attempt=lambda *a: attempts.append(a), **kw)
+    return v, sleeps, attempts
+
+
+def test_retry_succeeds_on_second_attempt():
+    client = SeqClient([TimeoutError("t"), reply("no_contradiction")])
+    v, sleeps, attempts = run_retry(client)
+    assert v.outcome == "no_contradiction" and client.calls == 2
+    assert sleeps == [1.0] and attempts == [(1, "TimeoutError", True)]
+
+
+def test_retries_exhausted_returns_unavailable():
+    client = SeqClient([TimeoutError("a"), OSError("b"), ValueError("c")])
+    v, sleeps, attempts = run_retry(client)
+    assert v.outcome == "unavailable" and client.calls == 3
+    assert sleeps == [1.0, 2.0]
+    assert attempts == [(1, "TimeoutError", True), (2, "OSError", True), (3, "ValueError", False)]
+
+
+def test_retry_skipped_when_deadline_cannot_fit_backoff_plus_min_call():
+    client = SeqClient([TimeoutError("a"), reply("no_contradiction")])
+    v, sleeps, attempts = run_retry(client, remaining=lambda: 5.5)  # < 1.0 backoff + 5.0 minimum
+    assert v.outcome == "unavailable" and client.calls == 1 and sleeps == []
+    assert attempts == [(1, "TimeoutError", False)]
+
+
+def test_deadline_shrinks_between_attempts():
+    left = iter([60.0, 3.0])
+    client = SeqClient([TimeoutError("a"), TimeoutError("b"), reply("no_contradiction")])
+    v, sleeps, _ = run_retry(client, remaining=lambda: next(left))
+    assert v.outcome == "unavailable" and client.calls == 2 and sleeps == [1.0]
+
+
+def test_retry_blocked_when_budget_exhausted():
+    client = SeqClient([TimeoutError("a"), reply("no_contradiction")])
+    v, _, _ = run_retry(client, can_retry=lambda: False)
+    assert v.outcome == "unavailable" and client.calls == 1
+
+
+def test_spend_settled_per_attempt_and_bounded():
+    client = SeqClient([TimeoutError("a"), TimeoutError("b"), TimeoutError("c")])
+    run_retry(client)
+    assert client.calls == 3 and client.spend == pytest.approx(0.03)
+    assert client.spend <= 3 * cj.JUDGE_MAX_COST_USD
+
+
+def test_real_verdict_is_not_retried():
+    client = SeqClient([reply("contradiction")])
+    v, sleeps, attempts = run_retry(client)
+    assert v.outcome == "contradiction" and client.calls == 1 and not sleeps and not attempts

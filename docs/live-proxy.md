@@ -37,7 +37,8 @@ separate allowance with the proposer's configured limits. Positive reviewer
 replenishment credits only that allowance.
 Budget degradation keeps committed rules and logs coverage gaps. An unavailable
 judge (timeout, transport error, soft failure, budget stop, unusable reply)
-yields `unavailable`: the proposal is pocketed as `deferred:judge-unavailable`
+is retried (up to 2 retries, inside the per-tool deadline and reviewer budget); if still
+unavailable it yields `unavailable`: the proposal is pocketed as `deferred:judge-unavailable`
 and the run continues, even in the early window. Protected service facts and
 statuses remain authoritative on every surface.
 

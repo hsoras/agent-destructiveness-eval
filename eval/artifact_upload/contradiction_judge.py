@@ -12,6 +12,7 @@ CHECK) as its system_prompt, the same way ProfileDiscovery configures its review
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from .profiles import canonical, parse_reply, redact
@@ -24,6 +25,9 @@ JUDGE_MAX_TOKENS = 1024
 # Placeholder per-call cost ceiling for the auxiliary transport; align with the reviewer_budget max call cost.
 JUDGE_MAX_COST_USD = 0.05
 MAX_REASON_CHARS = 500
+JUDGE_RETRIES = 2  # extra attempts after the first when the judge is unavailable
+RETRY_BACKOFF_SECONDS = (1.0, 2.0)  # sleep before retry 1, retry 2
+MIN_ATTEMPT_SECONDS = 5.0  # a retry is not started unless backoff + this much time remains in the caller's window
 
 
 @dataclass(frozen=True)
@@ -71,13 +75,21 @@ def _parse_verdict_text(text):
     return outcome, reason.strip()
 
 
-def judge_contradiction(client, *, proposal, profile, protected_facts, delivered_history, cap_bytes) -> Verdict:
+def judge_contradiction(client, *, proposal, profile, protected_facts, delivered_history, cap_bytes,
+                        retries=JUDGE_RETRIES, backoff=RETRY_BACKOFF_SECONDS, remaining=None, can_retry=None,
+                        on_attempt=None, sleep=time.sleep) -> Verdict:
     """Ask the judge whether applying `proposal` contradicts what the agent was already shown.
 
     delivered_history: chronological list of dicts with call_id, tool, request, delivered_output.
     cap_bytes: maximum canonical-JSON size of the newest-first history sent to the judge. Oldest calls are
     dropped first and the judge is told which ones. Any dropped history makes the verdict 'unsure'
     without calling the judge because string matching cannot establish semantic irrelevance.
+
+    An unavailable judge is retried up to `retries` times after a short backoff. Every attempt is its own
+    client.complete call (the client settles that attempt's spend). A retry is skipped when `remaining()` (seconds
+    left in the caller's deadline, or None for unbounded) cannot fit backoff + MIN_ATTEMPT_SECONDS, or when
+    `can_retry()` is false (e.g. reviewer budget exhausted). `on_attempt(attempt, error_kind, will_retry)` logs
+    each failed attempt. After the last attempt the verdict is 'unavailable' and the caller pockets.
     """
     truncated = False
     try:
@@ -112,15 +124,31 @@ def judge_contradiction(client, *, proposal, profile, protected_facts, delivered
         }
         canonical(payload)  # reject non-JSON-able inputs before any call
 
-        try:
-            reply = client.complete(payload, seconds=JUDGE_SECONDS, max_tokens=JUDGE_MAX_TOKENS,
-                                    max_cost_usd=JUDGE_MAX_COST_USD)
-            text = reply if isinstance(reply, str) else getattr(reply, "output", None)
-            if not isinstance(text, str):
-                raise ValueError("judge reply has no text")
-            outcome, reason = _parse_verdict_text(text)
-        except Exception as exc:  # no usable verdict: infrastructure unavailability, not a contradiction
-            return _unavailable("judge unavailable: %s" % type(exc).__name__, truncated)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                reply = client.complete(payload, seconds=JUDGE_SECONDS, max_tokens=JUDGE_MAX_TOKENS,
+                                        max_cost_usd=JUDGE_MAX_COST_USD)
+                text = reply if isinstance(reply, str) else getattr(reply, "output", None)
+                if not isinstance(text, str):
+                    raise ValueError("judge reply has no text")
+                outcome, reason = _parse_verdict_text(text)
+                break
+            except Exception as exc:  # no usable verdict: infrastructure unavailability, not a contradiction
+                delay = backoff[min(attempt - 1, len(backoff) - 1)] if backoff else 0.0
+                left = remaining() if remaining is not None else None
+                will_retry = (attempt <= retries and (left is None or left >= delay + MIN_ATTEMPT_SECONDS)
+                              and (can_retry is None or bool(can_retry())))
+                if on_attempt is not None:
+                    try:
+                        on_attempt(attempt, type(exc).__name__, will_retry)
+                    except Exception:  # logging never changes the verdict
+                        pass
+                if not will_retry:
+                    return _unavailable("judge unavailable: %s (attempt %d)" % (type(exc).__name__, attempt), truncated)
+                if delay > 0:
+                    sleep(delay)
         return Verdict(outcome, reason[:MAX_REASON_CHARS], truncated)
     except Exception as exc:  # the judge never raises; unusable input stays an unsure verdict
         return _unsure("judge input unusable: %s" % type(exc).__name__, truncated)
