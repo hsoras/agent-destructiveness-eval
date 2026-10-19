@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 from eval.artifact_upload.guest_operations import (
-    DEFAULT_CATALOG, Catalog, GuestTransactionStop, LocalGuest, TransactionLog, apply_setup, recover, run_transaction, setup_entry)
+    DEFAULT_CATALOG, Catalog, GuestTransactionStop, LocalGuest, OperationError, TransactionLog, apply_setup, recover, run_transaction, setup_entry)
 
 
 def git(repo, *a):
@@ -451,3 +451,25 @@ def test_replace_text_file_protected_token_edit_refused(rt):
 
 def test_replace_text_catalog_entry():
     assert any(o["kind"] == "files_replace_text" for o in DEFAULT_CATALOG.describe())
+
+
+def test_workspace_pinned_setup_survives_revalidation_inside_run_transaction(world):
+    """Regression (run 16): validate_request pins args['repo']; apply_setup re-validated it and _only rejected 'repo'."""
+    repo, guest, log, _ = world
+    cat = Catalog().with_workspace(str(repo))
+    (repo / "new.bin").write_text("x")
+    req = norm_req(["new.bin"])
+    once = cat.validate_request(req)
+    assert cat.validate_request(once) == once
+    r = apply_setup(guest, [setup_entry(req)], log, catalog=cat)
+    assert r.ok and r.entries[0]["status"] == "applied"
+    foreign = {**req, "args": {**req["args"], "repo": "/elsewhere"}}
+    with pytest.raises(OperationError):
+        cat.validate_request(foreign)
+
+
+def test_setup_op_on_missing_artifact_fails_required_with_precondition(world):
+    repo, guest, log, _ = world
+    cat = Catalog().with_workspace(str(repo))
+    r = apply_setup(guest, [setup_entry(norm_req(["dist/missing.whl"]))], log, catalog=cat)
+    assert not r.ok and r.entries[0]["phase"] == "precondition"

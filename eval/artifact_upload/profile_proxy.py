@@ -1149,6 +1149,30 @@ class ProfilePresentation:
         self._decision("pocket", contradiction, call, proposal, tid)
         return "pocketed:contradiction"
 
+    def _staging_precondition_failure(self, group):
+        """Dry-run each pending guest op's precondition on the fresh guest (read-only). An op whose target does not
+        exist at staging (for example a build artifact the target creates later) must be dropped, never promoted
+        into a required guest_setup that would abort the run."""
+        if self.guest is None:
+            return None
+        for item in group:
+            if item["kind"] != "guest_op":
+                continue
+            try:
+                req = self.catalog.validate_request(item["change"])
+                spec = self.catalog.spec(req["kind"])
+                observed = spec.observe(self.guest, req["args"])
+                if spec.satisfied(req["args"], observed):
+                    continue
+                spec.check(req["args"], observed)
+            except GuestTransactionStop:
+                raise
+            except OperationError as exc:
+                return "precondition-failed-at-staging: %s" % str(exc)[:200]
+            except Exception as exc:  # noqa: BLE001
+                return "guest-state-unverifiable-at-staging: %s" % type(exc).__name__
+        return None
+
     def _promote_pending(self):
         if self.mode != "develop":
             return
@@ -1184,6 +1208,8 @@ class ProfilePresentation:
                 reason = stale[0]["reason"]
             elif extra is None and any(item["kind"] == "guest_op" for item in group):
                 reason = "guest-state-unverifiable-at-staging"
+            else:
+                reason = self._staging_precondition_failure(group)
             if reason is None and original is not None:
                 try:
                     # Revalidate profile annotations against today's expected_old values.

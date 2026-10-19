@@ -836,7 +836,11 @@ class Catalog:
         spec = self.spec(request["kind"])
         if not isinstance(oid, str) or oid not in self.operation_ids(spec.kind):
             _bad("operation_id is not a catalog entry for this kind")
-        args = spec.validate(deepcopy(request["args"]))
+        raw = deepcopy(request["args"])
+        if (spec.kind in REPO_KINDS and self.workspace is not None and isinstance(raw, dict)
+                and raw.get("repo") == self.workspace):
+            del raw["repo"]  # idempotent: our own pinned value from an earlier validation; any other value is rejected
+        args = spec.validate(raw)
         if spec.kind in REPO_KINDS and self.workspace is not None:
             args["repo"] = self.workspace  # never caller-chosen; the guest re-verifies the real path
         return {**{k: deepcopy(v) for k, v in request.items() if k != "args"}, "args": args}

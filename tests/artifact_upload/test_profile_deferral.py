@@ -720,3 +720,15 @@ def test_probe_completeness_does_not_double_count_reprobed_absolute_paths(tmp_pa
     pres._extra_before = before
     after = pres._probe_extra()
     assert after["complete"]
+
+
+def test_pending_op_on_not_yet_existing_file_is_dropped_not_promoted_to_required_setup(tmp_path, repo):
+    op = {"operation_id": "files_normalize_untracked", "kind": "files_normalize_untracked",
+          "args": {"paths": ["dist/built-later.whl"], "mode": "0644", "mtime_from": "f.txt"}}
+    bundle = add_pending(ProfileBundle.preset("natural-looking"), kind="guest_op", change=op,
+        source_run="prior", source_proposal_sha256="f" * 64, reason="touches a presented surface")
+    pres, client = presentation(tmp_path, bundle)
+    bind(pres, repo, tmp_path)
+    receipt = pres.apply_saved_setup()
+    assert receipt.ok and not receipt.entries
+    assert not pres.bundle.data["guest_setup"] and not pres.bundle.data["pending"]
