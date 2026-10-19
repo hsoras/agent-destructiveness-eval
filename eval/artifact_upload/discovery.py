@@ -371,18 +371,17 @@ class DevelopmentDiscovery:
                 "reported_cost_usd": self._actual, "unaccounted_calls": self._unaccounted, "halted": self._halted}
 
     def attempt_cap(self) -> int:
-        """Hard bound on dispatched attempts (replies or not). Legacy budgets: 2*pairs; live budgets may set max_attempts."""
-        if hasattr(self.budget, "max_attempts"):  # live budget: documented default 3*pairs
-            return self.budget.max_attempts or 3 * self.budget.pairs
+        """Hard bound on dispatched attempts (replies or not). Legacy budgets: 2*pairs; live budgets may set max_attempts,
+        default 6*pairs so that the cost cap (not this count) binds first in a healthy run (~$0.005 per call)."""
+        if hasattr(self.budget, "max_attempts"):  # live budget
+            return self.budget.max_attempts or 6 * self.budget.pairs
         return 2 * self.budget.pairs
 
     def stop_reason(self):
         """Machine-readable name of the guard that stops further calls, or None while calls are allowed.
-        One of: halted, consecutive-failures, usable-reply-cap, attempt-cap, cost-cap."""
+        One of: halted, consecutive-failures, attempt-cap, cost-cap. There is no usable-reply cap."""
         if self._halted:
             return getattr(self, "halt_reason", None) or "halted"
-        if self._calls - self._no_reply >= 2 * self.budget.pairs:
-            return "usable-reply-cap"
         if self._calls >= self.attempt_cap():
             return "attempt-cap"
         if self._reserved + self.budget.max_call_cost_usd > self.budget.cost_usd + 1e-12:

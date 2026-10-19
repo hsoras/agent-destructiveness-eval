@@ -350,15 +350,16 @@ explicitly opts out of both ZDR and the pin requirement.
 - `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.02,
   "pairs": 4, "seconds": 240, "output_tokens": 16384}`; its reviewer/judge account
   has `{"cost_usd": 0.04, "max_call_cost_usd": 0.02, "pairs": 2}`. The combined
-  ceiling stays $0.12 (run hard cap unchanged: target $0.45 + $0.12). `pairs` bounds USABLE replies (2*pairs = 8 here).
-  A call that returns no reply (timeout/transport failure) does not use that allowance; independent guards bound it:
-  `max_attempts` (optional; default 3*pairs = 12 dispatched calls), three consecutive soft failures, the
-  cost cap (`cost_usd`; a call is refused unless `reserved + max_call_cost_usd <= cost_usd`, so with realized
-  ~$0.005-0.01/call the cost cap binds first, near 8-10 attempts), and the per-tool deadline. `max_call_cost_usd` is
+  ceiling stays $0.12 (run hard cap unchanged: target $0.45 + $0.12). There is no usable-reply cap: run 21 hit the
+  former `2*pairs = 8` usable-reply cap after 8 calls with later tool calls uncovered, so it was removed. `pairs` now
+  only sizes the attempt cap. Guards: `max_attempts` (optional; default 6*pairs = 24 dispatched calls for the
+  proposer, 12 for the reviewer/judge), three consecutive soft failures, the cost cap (`cost_usd`; a call is refused
+  unless `reserved + max_call_cost_usd <= cost_usd`, so with realized ~$0.005/call the cost cap binds first, near
+  12-16 calls; the attempt cap is a backstop only if calls cost under ~$0.0025), and the per-tool deadline. `max_call_cost_usd` is
   only the pre-dispatch reservation (the largest request, ~55 KB in + 16384 out, prices at ~$0.015), so it is
   $0.02 rather than $0.03 to leave room for more calls inside $0.08; no spend limit was raised.
   When discovery stops, the coverage gap `llm-coverage-stopped` carries a machine-readable `stop_reason`
-  (`usable-reply-cap`, `attempt-cap`, `cost-cap`, `consecutive-failures`, `halted`); the same value is
+  (`attempt-cap`, `cost-cap`, `consecutive-failures`, `halted`); the same value is
   `usage.stop_reason` along with `no_reply_calls` / `usable_reply_calls`. `seconds` is the per-call
   transport timeout (code default 240; proposer calls are capped at 240 and judge/reviewer calls at 30 per attempt).
   Proposer and judge run sequentially inside one tool call, so they share a 300-second per-tool aggregate proxy

@@ -1600,7 +1600,7 @@ class ProfilePresentation:
         if not ok:
             return self._gap("observation-excluded", call=call, phase=phase, reason=why)
         if staged is None and self.discovery.exhausted():
-            stop = self.discovery.stop_reason() or "halted"  # usable-reply-cap | attempt-cap | cost-cap | consecutive-failures | halted
+            stop = self.discovery.stop_reason() or "halted"  # attempt-cap | cost-cap | consecutive-failures | halted
             return self._gap("llm-coverage-stopped", call=call, phase=phase, reason="auxiliary stopped: " + stop, stop_reason=stop)
         rendered = None
         if result is not None:

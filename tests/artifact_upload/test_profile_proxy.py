@@ -829,7 +829,7 @@ def test_exhaustion_keeps_deterministic_rules_and_replenish_resumes_without_rewr
     assert first.output == "worker-07\n"
     assert run(pres, call(command="pwd", cid="c2"), result("/home/alex\n")).output == "/home/alex/\n"  # installed rules still apply
     stopped = [g for g in pres._gaps if g["kind"] == "llm-coverage-stopped"]
-    assert stopped and stopped[0]["stop_reason"] in {"cost-cap", "usable-reply-cap"}
+    assert stopped and stopped[0]["stop_reason"] == "cost-cap"
     assert stopped[0]["reason"] == "auxiliary stopped: " + stopped[0]["stop_reason"]
     gaps = len(pres._gaps)
 

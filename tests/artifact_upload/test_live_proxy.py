@@ -171,7 +171,7 @@ def test_ineligible_outputs_never_call_llm(tmp_path):
 
 
 def test_budget_halt_goes_raw_and_stops_calls(tmp_path):
-    live, _ = build(tmp_path, proposing(), pairs=1)  # 2 aux calls max; proposer-only uses 1 per discover
+    live, _ = build(tmp_path, proposing(), budget=LiveBudget(1.0, .1, pairs=1, max_attempts=2, seconds=5))  # 2 aux calls max
     outs = [live.present(call(cid=str(i)), result(RAW.replace('100', str(100 + i)))) for i in range(4)]
     assert all(o.output.startswith('Filesystem') for o in outs)
     assert live.usage()['calls'] == 2
@@ -179,7 +179,7 @@ def test_budget_halt_goes_raw_and_stops_calls(tmp_path):
 
 
 def test_degraded_rules_mode_keeps_applying_snapshot(tmp_path):
-    live, _ = build(tmp_path, proposing(change()), pairs=1, degraded_output='rules')
+    live, _ = build(tmp_path, proposing(change()), budget=LiveBudget(1.0, .1, pairs=1, max_attempts=2, seconds=5), degraded_output='rules')
     live.present(call(), result())
     live.present(call(cid='b'), result(RAW.replace('100', '101')))
     out = live.present(call(cid='c'), result(RAW.replace('100', '102')))
@@ -695,15 +695,26 @@ def test_proposer_not_started_when_aggregate_deadline_nearly_spent(tmp_path):
     assert window.remaining() == pytest.approx(2)
 
 
-def test_no_reply_attempts_do_not_consume_usable_reply_allowance(tmp_path):
+def test_no_reply_attempts_are_bounded_by_attempt_cap_only(tmp_path):
     live = _timeout_live(tmp_path, fn=lambda p: TimeoutError('timed out'))
     d = live.discovery
-    d.budget = replace(d.budget, pairs=1, max_attempts=6, cost_usd=1.0)  # 2 usable replies allowed
+    d.budget = replace(d.budget, pairs=1, max_attempts=6, cost_usd=1.0)
     for i in range(2):  # two timeouts in a row (below SOFT_HALT_AFTER)
         live.present(call(cid=str(i)), result(RAW.replace('100', '10%d' % i)))
     assert d._calls == 2 and d._no_reply == 2 and d.stop_reason() is None and not d.exhausted()
     u = d.usage()
     assert u['no_reply_calls'] == 2 and u['usable_reply_calls'] == 0 and u['stop_reason'] is None
+
+
+def test_usable_replies_are_not_capped(tmp_path):
+    # Regression for run 21: 8 usable replies (2*pairs) stopped discovery with later tool calls uncovered.
+    live = _timeout_live(tmp_path, fn=lambda p: pytest.fail('must not be called'))
+    d = live.discovery
+    d.budget = replace(d.budget, pairs=4, cost_usd=1.0, max_call_cost_usd=0.02)
+    d._calls = 20  # 20 usable replies: no usable-reply cap; cost cap far away
+    assert d.attempt_cap() == 24 and d.stop_reason() is None
+    d._calls = 24
+    assert d.stop_reason() == 'attempt-cap'
 
 
 def test_stop_reasons_are_exact(tmp_path):
@@ -712,7 +723,7 @@ def test_stop_reasons_are_exact(tmp_path):
     base = d.budget
     d.budget = replace(base, pairs=1, max_attempts=2, cost_usd=1.0)
     d._calls, d._no_reply = 2, 0
-    assert d.stop_reason() == 'usable-reply-cap'
+    assert d.stop_reason() == 'attempt-cap'
     d._calls, d._no_reply = 2, 1
     assert d.stop_reason() == 'attempt-cap'
     d.budget = replace(base, pairs=5, max_attempts=50, cost_usd=base.max_call_cost_usd)

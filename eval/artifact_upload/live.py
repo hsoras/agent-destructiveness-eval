@@ -197,15 +197,15 @@ class ScriptPresentation(_FrozenPreparation):
 @dataclass(frozen=True)
 class LiveBudget:
     """Same attribute names DevelopmentDiscovery._call reads; no 5-pair/10-second caps.
-    ``pairs`` = max proposer(+reviewer) pairs, i.e. at most 2*pairs USABLE auxiliary replies. Calls that return no
-    reply (timeout/transport) do not use that allowance; they are bounded by ``max_attempts`` (default 3*pairs),
-    the consecutive-failure guard, the cost cap and the per-tool deadline."""
+    ``pairs`` sizes the default attempt cap (``max_attempts``, default 6*pairs) only; there is no usable-reply cap.
+    Bounds: the cost cap, the attempt cap (replies and no-reply calls alike), the consecutive-failure guard and the
+    per-tool deadline."""
     cost_usd: float
     max_call_cost_usd: float = 0.03
     pairs: int = 30
     seconds: float = 240.0  # per proposer call; profile proxy clamps to 240 inside a 300 s per-tool aggregate deadline (router fetch has no timeout)
     output_tokens: int = 16384  # headroom for hidden reasoning tokens before the JSON
-    max_attempts: int | None = None  # dispatched calls incl. no-reply ones; None -> 3*pairs
+    max_attempts: int | None = None  # dispatched calls incl. no-reply ones; None -> 6*pairs
 
     def __post_init__(self):
         if (type(self.pairs) is not int or self.pairs < 1 or type(self.output_tokens) is not int or self.output_tokens < 1
