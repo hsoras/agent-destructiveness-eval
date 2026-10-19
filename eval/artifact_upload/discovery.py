@@ -362,6 +362,7 @@ class DevelopmentDiscovery:
         self.source_batch_id = source_batch_id
         self._calls, self._reserved, self._actual, self._halted = 0, 0.0, 0.0, False
         self._unaccounted = 0
+        self._estimated_calls = 0  # timeouts settled to an input-only estimate instead of the full reservation
         self._decisions, self._reviews, self._promoted = {}, {}, set()
 
     def usage(self):
@@ -371,6 +372,19 @@ class DevelopmentDiscovery:
     def _transport_halts(self, exc) -> bool:
         """Whether a failure with no reply stops discovery. Development: always (no retries, unknown charge)."""
         return True
+
+    def _timeout_estimate(self, client, payload, limits):
+        """Bounded cost (USD) of a call that timed out with no reported usage: the request's input tokens at the
+        model's input price (the same conservative byte bound ``complete`` uses), never the output reservation.
+        None when the price is unknown (the full reservation is then kept)."""
+        price = getattr(getattr(client, "_c", client), "input_price", None)
+        if type(price) not in (int, float) or not math.isfinite(price) or price < 0:
+            return None
+        size = len(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()) + 1024
+        for key in ("format_instructions", "response_format"):
+            if limits.get(key):
+                size += len(json.dumps(limits[key], sort_keys=True).encode())
+        return min(size * price, limits["max_cost_usd"])
 
     def _format_instructions(self, role, payload):
         """Optional per-call output contract; legacy discovery leaves its user payload unchanged."""
@@ -397,6 +411,7 @@ class DevelopmentDiscovery:
         self._reserved += cap  # failed/unknown calls retain the full reservation
         started, reply, status, failure = time.monotonic(), None, "failed", None
         settled = None  # reported cost of THIS call once known; replaces its reservation
+        limits, client = {}, None
         try:
             client = self.proposer if role == "proposer" else self.reviewer
             format_role = "reviewer" if role == "contradiction_judge" else role
@@ -437,6 +452,13 @@ class DevelopmentDiscovery:
                 self._unaccounted += 1
                 self._halted = self._halted or self._transport_halts(exc)
                 failure = {"error": type(exc).__name__ + ": " + str(exc)[:200]}
+                if isinstance(exc, TimeoutError) and client is not None and limits:
+                    estimate = self._timeout_estimate(client, payload, limits)
+                    if estimate is not None:  # release the unused output reservation; hard cap stays enforced
+                        settled = estimate
+                        self._actual += estimate
+                        self._estimated_calls += 1
+                        failure.update(cost_usd=estimate, cost_estimated=True, unaccounted=True)
                 if isinstance(exc, AuxiliaryHTTPError):
                     failure["http_status"] = exc.status
                     if exc.upstream_error is not None:

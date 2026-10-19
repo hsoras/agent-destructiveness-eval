@@ -677,7 +677,7 @@ def test_call_gets_min_of_cap_and_remaining_time(tmp_path):
     pres, client = presentation(tmp_path)
     clock = FakeClock()
     window = pres.discovery.window = pres.discovery.account.window = ProxyWindow(90, clock)
-    assert pres.discovery.budget.seconds <= 60 and pres.discovery.account.budget.seconds <= 30
+    assert pres.discovery.budget.seconds <= 120 and pres.discovery.account.budget.seconds <= 30
     window.open()
     clock.now = 70  # 20 s left: below the 30 s judge cap
     pres.discovery.account._call("reviewer", {"schema": "contradiction-check.v1"}, "t")

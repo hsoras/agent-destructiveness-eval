@@ -345,12 +345,14 @@ low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
 and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
 explicitly opts out of both ZDR and the pin requirement.
 - `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.03,
-  "pairs": 2, "seconds": 60, "output_tokens": 16384}`; its reviewer/judge account
+  "pairs": 2, "seconds": 120, "output_tokens": 16384}`; its reviewer/judge account
   has `{"cost_usd": 0.04, "max_call_cost_usd": 0.02, "pairs": 2}`. The combined
   ceiling is $0.12 and each account's pair reservations fit its cost ceiling. `seconds` is the per-call
-  transport timeout (code default 60; proposer calls are capped at 60 and judge/reviewer calls at 30). Proposer and judge
-  run sequentially inside one tool call, so they share a 90-second per-tool aggregate proxy deadline
-  (the bridge client gave up after roughly 264 s in an earlier run); tool execution time is not charged. A call
+  transport timeout (code default 120; proposer calls are capped at 120 and judge/reviewer calls at 30 per attempt). Proposer and judge
+  run sequentially inside one tool call, so they share a 150-second per-tool aggregate proxy deadline
+  (one 120 s proposer call plus a 30 s judge call; the bridge client gave up after roughly 264 s in an earlier run); tool execution time is not charged. A proposer call that times out with no reported usage is settled to an
+  input-only estimate (request bytes + 1024 at the model's input price, capped at the per-call reservation), not the
+  full reservation; the diagnostics record carries `cost_estimated`/`unaccounted` and usage reports `estimated_calls`. A call
   gets `min(cap, time left)` seconds and is not started under 5 s left: that is a soft failure, logged as
   coverage gap `deadline`, and the tool result is delivered normally. A client disconnect during the reply is logged
   as `client_disconnected` and does not affect other calls. Three

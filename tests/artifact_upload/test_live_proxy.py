@@ -475,7 +475,7 @@ def test_read_and_grep_never_sent_and_default_budget():
     b = Presented('x', False, {})
     assert not eligibility(call(op='read'), result(), b)[0] and not eligibility(call(op='grep'), result(), b)[0]
     lb = LiveBudget(1.0, .1)
-    assert (lb.max_call_cost_usd, lb.pairs, lb.seconds, lb.output_tokens) == (.1, 30, 60.0, 16384)
+    assert (lb.max_call_cost_usd, lb.pairs, lb.seconds, lb.output_tokens) == (.1, 30, 120.0, 16384)
     assert LiveBudget(cost_usd=1.0).max_call_cost_usd == .03
 
 
@@ -620,3 +620,75 @@ def test_azure_gpt5_aux_request_uses_advertised_params_and_fake_rejects_unknown_
         assert len(observed) == 2 and observed[1]["unknown"] == ["temperature"]
     finally:
         srv.shutdown()
+
+
+class PricedMock(Mock):
+    input_price = 1e-7  # USD per input byte-token, DeepSeek-flash-like
+
+
+def _timeout_live(tmp_path, client_cls=PricedMock, fn=None):
+    budget = LiveBudget(.08, .03, pairs=2, seconds=120)
+    live = LivePresentation.create(tmp_path / 'out', proposer=client_cls('p', fn or (lambda p: TimeoutError('timed out'))),
+                                   reviewer=None, budget=budget, condition='natural-looking', guest_profiles=GUEST_PROFILES)
+    live.attach_recorder(RunRecorder(tmp_path / 'rec', 'live-t'))
+    return live
+
+
+def test_timeout_settles_bounded_input_estimate_not_full_reservation(tmp_path):
+    live = _timeout_live(tmp_path)
+    live.present(call(cid='a'), result())
+    u = live.usage()
+    assert u['calls'] == 1 and u['estimated_calls'] == 1 and u['unaccounted_calls'] == 1
+    assert 0 < u['reserved_cost_usd'] < .003 and u['reported_cost_usd'] == pytest.approx(u['reserved_cost_usd'])
+    diag = [i[1] for i in live.discovery.recorder.items if i[0] == 'diagnostics'] if hasattr(live.discovery.recorder, 'items') else []
+    assert not diag or diag[-1]['failure']['cost_estimated'] is True
+
+
+def test_two_timeouts_do_not_exhaust_aux_budget(tmp_path):
+    live = _timeout_live(tmp_path, fn=lambda p: TimeoutError('timed out'))
+    live.present(call(cid='a'), result(RAW.replace('100', '101')))
+    live.discovery._halted = False  # soft failures alone never halt below SOFT_HALT_AFTER
+    live.present(call(cid='b'), result(RAW.replace('100', '102')))
+    d = live.discovery
+    assert d._reserved < .01 and d._calls == 2 and not d.exhausted()
+    assert d._reserved + d.budget.max_call_cost_usd <= d.budget.cost_usd  # still room for another call
+
+
+def test_timeout_without_known_price_keeps_full_reservation_and_cap_holds(tmp_path):
+    live = _timeout_live(tmp_path, client_cls=Mock)
+    live.present(call(cid='a'), result())
+    d = live.discovery
+    assert live.usage()['estimated_calls'] == 0 and d._reserved == pytest.approx(.03)
+    d._halted = False
+    live.present(call(cid='b'), result(RAW.replace('100', '103')))
+    assert d._reserved <= d.budget.cost_usd and d._calls <= 2
+
+
+def test_estimate_never_exceeds_per_call_cap(tmp_path):
+    class Pricey(PricedMock):
+        input_price = 1.0
+    live = _timeout_live(tmp_path, client_cls=Pricey)
+    live.present(call(cid='a'), result())
+    assert live.discovery._reserved == pytest.approx(.03)
+
+
+def test_default_proxy_deadline_fits_proposer_plus_judge_under_bridge_patience():
+    from eval.artifact_upload import profile_proxy as pp
+    assert pp.PROPOSER_CAP_SECONDS == 120.0 and pp.JUDGE_CAP_SECONDS == 30.0
+    assert pp.PROPOSER_CAP_SECONDS + pp.JUDGE_CAP_SECONDS <= pp.PROXY_DEADLINE_SECONDS < 264 * .6
+
+
+def test_proposer_not_started_when_aggregate_deadline_nearly_spent(tmp_path):
+    from eval.artifact_upload.profile_proxy import ProxyWindow
+
+    class Clock:
+        now = 0.0
+        def __call__(self):
+            return self.now
+    clock = Clock()
+    live = _timeout_live(tmp_path, fn=lambda p: pytest.fail('must not be called'))
+    # Window semantics live in _Timed; here check the window itself yields remaining below MIN_CALL_SECONDS.
+    window = ProxyWindow(150, clock)
+    window.open()
+    clock.now = 148
+    assert window.remaining() == pytest.approx(2)

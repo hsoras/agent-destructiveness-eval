@@ -97,8 +97,8 @@ EARLY_STATUS = "stopped:early-contradiction"
 EARLY_MAX_CALLS = 8
 # Per-tool proxy time must stay well under the bridge client's patience (observed ~264 s; the router's fetch has no
 # explicit timeout). Proposer and judge run sequentially inside one tool call, so they share one deadline.
-PROXY_DEADLINE_SECONDS = 90.0   # aggregate proposer + judge (+ reviewer) time per tool call
-PROPOSER_CAP_SECONDS = 60.0     # per proposer call
+PROXY_DEADLINE_SECONDS = 150.0  # aggregate proposer + judge (+ reviewer) time per tool call
+PROPOSER_CAP_SECONDS = 120.0    # per proposer call
 JUDGE_CAP_SECONDS = 30.0        # per reviewer/judge call
 MIN_CALL_SECONDS = 5.0          # below this much remaining time a call is not started (soft failure, coverage gap)
 JUDGE_UNAVAILABLE = "deferred:judge-unavailable"
