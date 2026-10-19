@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from eval.artifact_upload.diagnostics import (
+    EMPTY_REPLY_NUDGE,
     Budget, CLASSIFIER_PROMPT, DIRECT_PROMPT, Diagnostics, Route, SavedView,
     checkpoint_view, classification, digest, encoded, retrospective_view, visible_transcript,
 )
@@ -527,3 +528,84 @@ def test_declared_secret_in_linked_context_refuses_zero_dispatch(tmp_path):
         record = diagnostics.measure(view, kind)
         assert record["status"] == "unavailable" and "declared credentials" in record["reason"]
     assert diagnostics.used == {"direct": 0, "classifier": 0}
+
+
+def reasoning_only(**extra):
+    reply = response(None, reasoning="Let me check the repo before answering.")
+    return {**reply, **extra}
+
+
+def test_empty_content_retried_then_completed(tmp_path, capture):
+    replies = [reasoning_only(), response("recovered answer")]
+    diagnostics = runner(tmp_path, capture, lambda *args: replies.pop(0),
+                         direct_budget=Budget(calls=3, retries=2))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert record["status"] == "completed" and record["answer"] == "recovered answer"
+    assert [a["status"] for a in record["attempts"]] == ["invalid", "completed"]
+    assert record["attempts"][0]["reason"] == "missing text response" and record["attempts"][0]["reasoning_chars"] > 0
+    assert record["usage_total"]["completion_tokens"] == 10 and "reason" not in record
+
+
+def test_empty_content_exhausts_retries_keeps_reasoning_as_labeled_evidence(tmp_path, capture):
+    calls = []
+    diagnostics = runner(tmp_path, capture, lambda *args: calls.append(1) or reasoning_only(),
+                         direct_budget=Budget(calls=3, retries=2))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert len(calls) == 3 and record["status"] == "invalid" and record["reason"] == "missing text response"
+    assert "answer" not in record and "check the repo" in record["reasoning_only_not_answer"]
+
+
+@pytest.mark.parametrize("reply,retries", [
+    (reasoning_only(), 0),
+    ({**response("cut"), "choices": [{"finish_reason": "length", "message": {"content": "cut"}}]}, 2),
+    (response("x", model="other"), 2),
+])
+def test_no_retry_by_default_or_for_truncation_and_model_mismatch(tmp_path, capture, reply, retries):
+    calls = []
+    diagnostics = runner(tmp_path, capture, lambda *args: calls.append(1) or reply,
+                         direct_budget=Budget(calls=3, retries=retries))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert record["status"] == "invalid" and len(calls) == 1
+
+
+def test_non_json_provider_body_retried(tmp_path, capture):
+    replies = [json.JSONDecodeError("Expecting value", "", 0), response("ok")]
+    def request(*args):
+        item = replies.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    diagnostics = runner(tmp_path, capture, request, direct_budget=Budget(calls=2, retries=1))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert record["status"] == "completed" and record["attempts"][0]["error_type"] == "JSONDecodeError"
+
+
+def test_budget_retries_bounded_by_calls(tmp_path, capture):
+    calls = []
+    diagnostics = runner(tmp_path, capture, lambda *args: calls.append(1) or reasoning_only(),
+                         direct_budget=Budget(calls=2, retries=5))
+    diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert len(calls) == 2
+
+
+def test_final_attempt_nudged_only_after_all_empty_and_recorded(tmp_path, capture):
+    seen = []
+    replies = [reasoning_only(), reasoning_only(), response("plain answer")]
+    def request(route, body, budget):
+        seen.append(body["messages"][-1]["content"])
+        return replies.pop(0)
+    diagnostics = runner(tmp_path, capture, request, direct_budget=Budget(calls=3, retries=2, nudge_empty=True))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert record["status"] == "completed" and record["nudged"] is True
+    assert [a["nudged"] for a in record["attempts"]] == [False, False, True]
+    assert seen[0] == seen[1] == record["prompt"] and seen[2] == EMPTY_REPLY_NUDGE
+
+
+def test_no_nudge_unless_enabled_or_when_an_attempt_succeeds(tmp_path, capture):
+    seen = []
+    def request(route, body, budget):
+        seen.append(body["messages"][-1]["content"])
+        return reasoning_only()
+    diagnostics = runner(tmp_path, capture, request, direct_budget=Budget(calls=3, retries=2))
+    record = diagnostics.measure(retrospective_view(capture[0].root, capture[1]), "direct")
+    assert EMPTY_REPLY_NUDGE not in seen and "nudged" not in record

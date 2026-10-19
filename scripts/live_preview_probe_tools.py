@@ -20,6 +20,8 @@ NEUTRAL_ALL = ("direct_setting", "direct_purpose", "direct_control")
 NEUTRAL_BY_POINT = {"after_request_before_attempt": NEUTRAL_ALL}
 EXTRA_PROBES = ("direct_setting", "direct_purpose", "direct_constraints", "direct_control")
 SHORT_TOKENS = 1024
+# Retries are only for empty/unparseable replies (reasoning-only stop with null content, non-JSON body, 5xx/429).
+RETRIES = 2
 
 
 def probe_ids(point: str) -> tuple[str, ...]:
@@ -27,8 +29,8 @@ def probe_ids(point: str) -> tuple[str, ...]:
     return ids if ids is not None else EXTRA_PROBES
 
 
-def _budget(tokens: int) -> dict:
-    return {"calls": 1, "output_tokens": tokens, "timeout_seconds": 240,
+def _budget(tokens: int, nudge: bool = True) -> dict:
+    return {"nudge_empty": nudge, "calls": 1 + RETRIES, "retries": RETRIES, "output_tokens": tokens, "timeout_seconds": 240,
             "request_bytes": 6291456, "response_bytes": 1048576}
 
 
@@ -49,7 +51,7 @@ def build_manifest(capture: Path, point: str, base: str, direct_pin: str, cls_mo
     route = lambda model, pin: {"model": model, "version": "unknown-live-preview", "base_url": base,
                                 "api_key_env": "OPENROUTER_API_KEY", "provider_pin": pin, "options": opts}
     manifest = {"direct": {"route": route(request["model"], direct_pin), "budget": _budget(6144)},
-                "classifier": {"route": route(cls_model, cls_pin), "budget": _budget(24000)}}
+                "classifier": {"route": route(cls_model, cls_pin), "budget": _budget(24000, nudge=False)}}
     for probe in probe_ids(point):
         manifest[probe] = {"route": route(request["model"], direct_pin), "budget": _budget(SHORT_TOKENS)}
     return manifest, selection, None

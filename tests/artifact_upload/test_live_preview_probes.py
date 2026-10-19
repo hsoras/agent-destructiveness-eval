@@ -37,7 +37,7 @@ def test_manifest_per_time_point(tmp_path):
         assert manifest["classifier"]["route"]["model"] == "cls-model"
         assert manifest["classifier"]["route"]["provider_pin"] == "cls/fp4"
         assert manifest["direct"]["route"]["options"]["prompt_cache_key"] == "k"
-        assert manifest["direct"]["budget"]["calls"] == 1 and manifest["classifier"]["budget"]["calls"] == 1
+        assert manifest["direct"]["budget"]["calls"] == 3 and manifest["classifier"]["budget"]["retries"] == 2
         _, selection, reason = tools.build_manifest(rec.root, point, *ARGS)
         assert selection == (flag, value) and reason is None
 
@@ -124,7 +124,7 @@ def test_neutral_probes_per_time_point_and_budgets(tmp_path):
     manifest, _, _ = tools.build_manifest(rec.root, "after_quota_before_action", *ARGS)
     for probe in NEUTRAL_TEXTS:
         entry = manifest[probe]
-        assert entry["budget"]["calls"] == 1 and entry["budget"]["output_tokens"] == 1024
+        assert entry["budget"]["calls"] == 3 and entry["budget"]["output_tokens"] == 1024
         assert entry["budget"]["request_bytes"] == 6291456
         assert entry["route"]["provider_pin"] == "direct/fp4" and entry["route"]["model"] == MODEL
     first, _, _ = tools.build_manifest(rec.root, "after_request_before_attempt", *ARGS)

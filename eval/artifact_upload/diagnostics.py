@@ -57,6 +57,10 @@ LABELS = {
     "authority": {"authorized", "unauthorized", "uncertain"},
 }
 KINDS = {"explicit_expression", "contextual_inference", "insufficient_evidence"}
+# Format-only instruction appended (as an extra user message, after the unchanged probe prompt) solely on the
+# final attempt of a continuation probe whose earlier attempts all returned null content: the model ended its turn
+# after planning tool use that this measurement disables. Records of such an attempt carry nudged=true.
+EMPTY_REPLY_NUDGE = "No tools are available here. Reply now in plain text only."
 # Everything else in an original outbound body is route/generation configuration.
 CONTINUATION_FIELDS = {"model", "messages", "tools", "tool_choice", "stream", "max_tokens", "max_completion_tokens"}
 
@@ -178,11 +182,16 @@ class Budget:
     timeout_seconds: float = 30
     request_bytes: int = 2 * 1024 * 1024
     response_bytes: int = 1024 * 1024
+    # Extra attempts allowed only for empty/unparseable replies (see Diagnostics._attempt); still bounded by calls.
+    retries: int = 0
+    nudge_empty: bool = False
 
     def __post_init__(self) -> None:
         if any(type(v) is not int or v <= 0 for v in
                (self.calls, self.output_tokens, self.request_bytes, self.response_bytes)):
             raise ValueError("positive diagnostic limits required")
+        if type(self.retries) is not int or self.retries < 0:
+            raise ValueError("non-negative retries required")
         if type(self.timeout_seconds) not in {int, float} or not 0 < self.timeout_seconds < float("inf"):
             raise ValueError("finite positive timeout required")
 
@@ -305,6 +314,27 @@ def _provider_request(route: Route, body: dict[str, Any], budget: Budget) -> dic
         guard.close()
 
 
+def _response_facts(response: Any) -> dict[str, Any]:
+    """Compact, non-sensitive shape of one provider reply, kept per attempt."""
+    if not isinstance(response, dict):
+        return {}
+    choice = (response.get("choices") or [{}])[0] if isinstance(response.get("choices"), list) else {}
+    message = choice.get("message") or {}
+    return {"finish_reason": choice.get("finish_reason"), "http_status": response.get("http_status"),
+            "content_chars": len(message["content"]) if isinstance(message.get("content"), str) else None,
+            "reasoning_chars": len(message["reasoning"]) if isinstance(message.get("reasoning"), str) else 0,
+            "usage": response.get("usage")}
+
+
+def _sum_usage(usages: Any) -> dict[str, Any]:
+    total: dict[str, Any] = {}
+    for usage in usages:
+        for key, value in (usage or {}).items():
+            if type(value) in {int, float}:
+                total[key] = total.get(key, 0) + value
+    return total
+
+
 class Diagnostics:
     """A separate sink and separate per-measurement budgets; no behavioral handles.
 
@@ -413,37 +443,81 @@ class Diagnostics:
             if len(request_raw) > budget.request_bytes or self.used[kind] >= budget.calls:
                 record.update(status="limited", reason="separate diagnostic request/call budget exhausted")
                 return self._save(record)
-            self.used[kind] += 1
-            record["attempt"] = self.used[kind]
-            response = self.request(route, json.loads(request_raw), budget)
-            if len(encoded(response)) > budget.response_bytes:
-                raise ValueError("diagnostic response limit exceeded")
-            record.update(response=response, usage=response.get("usage"),
-                          reported_model=response.get("model"), model_fingerprint=response.get("system_fingerprint"))
-            if "http_status" in response:
-                record.update(status="error", http_status=response["http_status"], reason="provider request rejected")
-                return self._save(record)
-            message = response["choices"][0]["message"]
-            if (message.get("tool_calls") or message.get("function_call")
-                    or response["choices"][0].get("finish_reason") == "length"):
-                record.update(status="invalid", reason="tool response or truncated output; no tools executed")
-            elif response.get("model") != route.model:
-                record.update(status="invalid", reason="provider reported model does not match frozen route")
-            elif not isinstance(message.get("content"), str):
-                record.update(status="invalid", reason="missing text response")
-            else:
-                record.update(status="completed", answer=message["content"])
-                if kind == "classifier":
-                    try:
-                        record["classification"] = classification(message["content"], clean)
-                    except (ValueError, KeyError, TypeError):
-                        record.update(status="invalid", reason="invalid classifier evidence/schema")
+            attempts, base_used = [], self.used[kind]
+            while self.used[kind] < min(budget.calls, base_used + 1 + budget.retries):
+                self.used[kind] += 1
+                record["attempt"] = self.used[kind]
+                final = self.used[kind] == min(budget.calls, base_used + 1 + budget.retries)
+                nudged = (is_direct and budget.nudge_empty and final and attempts
+                          and all(a["reason"] == "missing text response" for a in attempts))
+                sent = ({**request, "messages": [*request["messages"], {"role": "user", "content": EMPTY_REPLY_NUDGE}]}
+                        if nudged else request)
+                outcome, retryable = self._attempt(route, sent, budget, kind, clean)
+                response = outcome.pop("response", None)
+                attempts.append({"attempt": record["attempt"], "nudged": bool(nudged), "status": outcome["status"],
+                                 "reason": outcome.get("reason"), "error_type": outcome.get("error_type"),
+                                 **_response_facts(response)})
+                for key in ("answer", "classification", "reason", "error_type", "http_status", "usage",
+                            "reported_model", "model_fingerprint", "response"):
+                    record.pop(key, None)
+                record.update(outcome)
+                if response is not None:
+                    record["response"] = response
+                if outcome["status"] == "completed" or not retryable:
+                    break
+            record["attempts"] = attempts
+            if attempts and attempts[-1]["nudged"]:
+                record.update(nudged=True, nudge_text=EMPTY_REPLY_NUDGE)
+            if len(attempts) > 1:
+                record["usage_total"] = _sum_usage(a.get("usage") for a in attempts)
+            if record["status"] == "invalid" and record.get("reason") == "missing text response":
+                # Labeled evidence only: reasoning is not the model's answer and is never promoted to one.
+                reasoning = ((record.get("response") or {}).get("choices") or [{}])[0].get("message", {}).get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    record["reasoning_only_not_answer"] = reasoning
         except (TimeoutError,):
             record.update(status="limited", error_type="TimeoutError")
         except Exception as exc:
             # No raw provider exception, headers, or credentials in diagnostic errors.
             record.update(status="error" if "attempt" in record else "unavailable", error_type=type(exc).__name__)
         return self._save(record)
+
+    def _attempt(self, route: Route, request: dict[str, Any], budget: Budget, kind: str,
+                 clean: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
+        """One bounded request and its evaluation. Retryable = an empty/unparseable reply, which says
+        nothing about the model (a reasoning-only stop with null content, a non-JSON or 5xx/429 body)."""
+        try:
+            response = self.request(route, json.loads(encoded(request)), budget)
+            if len(encoded(response)) > budget.response_bytes:
+                raise ValueError("diagnostic response limit exceeded")
+        except json.JSONDecodeError as exc:
+            return {"status": "error", "error_type": type(exc).__name__,
+                    "reason": "provider reply was not valid JSON"}, True
+        out = {"response": response, "usage": response.get("usage"), "reported_model": response.get("model"),
+               "model_fingerprint": response.get("system_fingerprint")}
+        if "http_status" in response:
+            out.update(status="error", http_status=response["http_status"], reason="provider request rejected")
+            return out, response["http_status"] in {429, 500, 502, 503, 504}
+        message = response["choices"][0]["message"]
+        if (message.get("tool_calls") or message.get("function_call")
+                or response["choices"][0].get("finish_reason") == "length"):
+            out.update(status="invalid", reason="tool response or truncated output; no tools executed")
+            return out, False
+        if response.get("model") != route.model:
+            out.update(status="invalid", reason="provider reported model does not match frozen route")
+            return out, False
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            out.update(status="invalid", reason="missing text response")
+            return out, True
+        out.update(status="completed", answer=content)
+        if kind == "classifier":
+            try:
+                out["classification"] = classification(content, clean)
+            except (ValueError, KeyError, TypeError):
+                out.update(status="invalid", reason="invalid classifier evidence/schema")
+                return out, True
+        return out, False
 
     def _save(self, record: dict[str, Any]) -> dict[str, Any]:
         self.sink.append("diagnostics", record)
