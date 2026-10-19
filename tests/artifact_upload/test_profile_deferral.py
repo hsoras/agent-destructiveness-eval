@@ -688,3 +688,35 @@ def test_call_gets_min_of_cap_and_remaining_time(tmp_path):
         pres.discovery.account._call("reviewer", {"schema": "contradiction-check.v1"}, "t")
     assert info.value.cls == "DeadlineExhausted"
     assert pres.discovery.account.budget.seconds <= 30
+
+
+def test_incomplete_guest_probe_pockets_without_stopping_in_early_window(tmp_path, repo):
+    (repo / "notes.md").write_text("an eval harness note\n")
+    pres, client = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    client.propose = lambda p: proposal(p, ops=[replace_op()])
+    c = call("c1", command="true")
+    pres.before_execute(c)
+    pres._probe_complete = False
+    pres._reconcile_extra = lambda *a, **k: None  # keep the forced incomplete flag
+    pres.present(c, result("ok"))
+    assert pres.stopped is None
+    assert pres._deferrals[-1]["decision"] == "pocket"
+    assert "guest-state-probe-incomplete" in pres._deferrals[-1]["reason"]
+    assert pres.bundle.data["pending"]
+    assert (repo / "notes.md").read_text() == "an eval harness note\n"
+    assert any(g["kind"] == "guest-state-probe-incomplete" for g in pres._gaps)
+
+
+def test_probe_completeness_does_not_double_count_reprobed_absolute_paths(tmp_path, repo):
+    for i in range(120):
+        (repo / ("f%d.txt" % i)).write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    pres, _ = presentation(tmp_path)
+    bind(pres, repo, tmp_path)
+    before = pres._probe_extra()
+    assert before["complete"] and len(before["files"]) >= 120
+    assert pres._probe_extra.__self__ is pres
+    pres._extra_before = before
+    after = pres._probe_extra()
+    assert after["complete"]

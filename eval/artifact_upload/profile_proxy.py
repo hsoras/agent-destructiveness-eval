@@ -104,6 +104,7 @@ PROPOSER_CAP_SECONDS = 240.0    # per proposer call
 JUDGE_CAP_SECONDS = 30.0        # per reviewer/judge call
 MIN_CALL_SECONDS = 5.0          # below this much remaining time a call is not started (soft failure, coverage gap)
 JUDGE_UNAVAILABLE = "deferred:judge-unavailable"
+PROBE_INCOMPLETE = "deferred:guest-state-probe-incomplete"
 HISTORY_CAP_BYTES = 24_000
 SEEN_PREFIX = "seen:"
 MAX_SEEN = 32
@@ -159,7 +160,7 @@ try:
 except OSError:
     pass
 refs = subprocess.run(["git", "for-each-ref", "--format=%(refname) %(objectname)"], cwd=repo, capture_output=True, text=True).stdout
-print(json.dumps({"files": files, "env": env, "refs": dict(line.split(" ", 1) for line in refs.splitlines()), "complete": len(set(found + P["paths"])) <= P["limit"]}))
+print(json.dumps({"files": files, "env": env, "refs": dict(line.split(" ", 1) for line in refs.splitlines()), "complete": len({os.path.normpath(os.path.join(repo, x)) for x in found + P["paths"]}) <= P["limit"]}))
 """
 
 
@@ -1110,7 +1111,12 @@ class ProfilePresentation:
                     contradiction = "guest operation touches a presented surface: " + op["kind"]
                     break
         if contradiction is None and proposal["guest_operations"] and not self._probe_complete:
-            contradiction = "unsure: guest state probe incomplete"
+            # Harness-side evidence gap, not a verdict about the proposal: pocket for the next run and keep going,
+            # even inside the early window (same as judge-unavailable).
+            self._pocket(proposal, PROBE_INCOMPLETE, call)
+            self._gap("guest-state-probe-incomplete", call=call, phase=packet["phase"])
+            self._decision("pocket", PROBE_INCOMPLETE, call, proposal, tid)
+            return "pocketed:probe-incomplete"
         if contradiction is None:
             history = [{k: entry[k] for k in ("call_id", "tool", "request", "delivered_output")} for entry in self._exposures]
             verdict = self.discovery.contradiction(proposal, self.bundle.data, packet["protected_facts"], history, tid)
