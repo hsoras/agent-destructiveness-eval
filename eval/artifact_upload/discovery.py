@@ -372,7 +372,9 @@ class DevelopmentDiscovery:
 
     def attempt_cap(self) -> int:
         """Hard bound on dispatched attempts (replies or not). Legacy budgets: 2*pairs; live budgets may set max_attempts."""
-        return getattr(self.budget, "max_attempts", None) or 2 * self.budget.pairs
+        if hasattr(self.budget, "max_attempts"):  # live budget: documented default 3*pairs
+            return self.budget.max_attempts or 3 * self.budget.pairs
+        return 2 * self.budget.pairs
 
     def stop_reason(self):
         """Machine-readable name of the guard that stops further calls, or None while calls are allowed.
