@@ -1106,7 +1106,12 @@ class ProfilePresentation:
                     contradiction = "rule replay changes delivered call " + entry["call_id"]
                     break
         if contradiction is None:
+            # An op already persisted in guest_setup was applied at staging, before the agent saw anything: it is an
+            # idempotent re-proposal that cannot change a presented surface (finalize dedupes it), so it is not a collision.
+            active = {json.dumps([e["kind"], e.get("args", {})], sort_keys=True) for e in self.bundle.data["guest_setup"]}
             for op in proposal["guest_operations"]:
+                if json.dumps([op["kind"], {k: v for k, v in op.get("args", {}).items() if k != "repo"}], sort_keys=True) in active:
+                    continue
                 if self._shown_touches(op, self._touches(op)):
                     contradiction = "guest operation touches a presented surface: " + op["kind"]
                     break

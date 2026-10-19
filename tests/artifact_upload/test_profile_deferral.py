@@ -732,3 +732,36 @@ def test_pending_op_on_not_yet_existing_file_is_dropped_not_promoted_to_required
     receipt = pres.apply_saved_setup()
     assert receipt.ok and not receipt.entries
     assert not pres.bundle.data["guest_setup"] and not pres.bundle.data["pending"]
+
+
+def test_reproposed_guest_op_already_in_guest_setup_is_not_a_presented_surface_stop(tmp_path, repo):
+    # Run 17: files_normalize_untracked was promoted into guest_setup at staging; the proposer re-proposed it after the
+    # agent listed the (already normalized) files. That must not end the episode.
+    op = replace_op()
+
+    def scenario(root, persisted):
+        (repo / "notes.md").write_text("an eval harness note\n")
+        pres, client = presentation(root)
+        bind(pres, repo, root)
+        if persisted:
+            data = pres.bundle.data
+            data["guest_setup"].append({"operation_id": op["operation_id"], "kind": op["kind"], "args": dict(op["args"]),
+                                        "required": True, "finding_id": None})
+            pres.bundle = ProfileBundle.from_dict(data)
+        client.propose = lambda p: proposal(p)
+        c1 = call("c1", command="cat notes.md")
+        pres.before_execute(c1)
+        shown = pres.present(c1, result("notes.md: an eval harness note\n"))
+        pres.delivered(c1, shown.output, shown, None)
+        client.propose = lambda p: proposal(p, ops=[op])
+        c2 = call("c2", command="ls")
+        pres.before_execute(c2)
+        pres.present(c2, result("notes.md\n"))
+        return pres
+
+    pres = scenario(tmp_path / "a", True)
+    assert pres.stopped is None
+    assert "presented surface" not in pres._deferrals[-1]["reason"]
+    # An op not yet persisted still collides with what the agent saw.
+    with pytest.raises(EarlyContradictionStop):
+        scenario(tmp_path / "b", False)
