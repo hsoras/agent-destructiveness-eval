@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from eval.artifact_upload.diagnostics import Budget, Diagnostics, Route, checkpoint_view, retrospective_view
+from eval.artifact_upload.diagnostics import NEUTRAL_PROMPTS, Budget, Diagnostics, Route, checkpoint_view, retrospective_view
 
 
 def main() -> int:
@@ -22,6 +22,8 @@ def main() -> int:
     selection.add_argument("--checkpoint")
     selection.add_argument("--retrospective-event")
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--probes", default="", help="comma-separated extra neutral probe ids "
+                        "(direct_setting,...); each is recorded, unavailable when it has no manifest route")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--no-zdr", action="store_true", help="WARNING: disable OpenRouter Zero Data Retention")
     args = parser.parse_args()
@@ -30,7 +32,10 @@ def main() -> int:
     manifest = json.loads(args.manifest.read_text()) if args.manifest else {}
     credentials = {}
     routes = {}
-    for kind in ("direct", "classifier"):
+    probes = [p for p in args.probes.split(",") if p]
+    if any(p not in NEUTRAL_PROMPTS for p in probes):
+        parser.error("unknown probe id")
+    for kind in ("direct", "classifier", *probes):
         config = manifest.get(kind, {})
         route = config.get("route")
         if route and args.execute:
@@ -51,11 +56,13 @@ def main() -> int:
     runner = Diagnostics(capture=args.capture, output=args.output, run_id=args.run_id,
         direct_route=routes["direct"], classifier_route=routes["classifier"], credentials=credentials,
         direct_budget=Budget(**manifest.get("direct", {}).get("budget", {})),
-        classifier_budget=Budget(**manifest.get("classifier", {}).get("budget", {})))
+        classifier_budget=Budget(**manifest.get("classifier", {}).get("budget", {})),
+        probe_routes={p: routes[p] for p in probes},
+        probe_budgets={p: Budget(**manifest.get(p, {}).get("budget", {})) for p in probes})
     view = (retrospective_view(args.capture, args.retrospective_event) if args.retrospective_event
             else checkpoint_view(args.capture, args.checkpoint))
-    records = [runner.measure(view, kind) for kind in ("direct", "classifier")]
-    print(json.dumps([{k: r.get(k) for k in ("measurement", "status", "reason", "error_type")} for r in records]))
+    records = [runner.measure(view, kind) for kind in ("direct", "classifier", *probes)]
+    print(json.dumps([{k: r.get(k) for k in ("measurement", "probe_id", "status", "reason", "error_type")} for r in records]))
     return 0 if all(record["status"] == "completed" for record in records) else 2
 
 

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Live-preview probes: direct answer + classifier against one saved capture, at three
+# Live-preview probes: old direct answer + classifier + neutral probes (setting, purpose,
+# constraints [not at the first point], control; each an independent single-question branch) against one saved capture, at three
 # time points: checkpoint after_request_before_attempt, checkpoint
 # after_quota_before_action, and the end (last captured model request).
 # Layout: end probe at <out> (unchanged); checkpoint probes at
@@ -71,7 +72,7 @@ for point in $POINTS; do
   # Non-zero exit just means a measurement was unavailable/limited/error; keep going.
   # shellcheck disable=SC2086
   "$PYTHON" scripts/artifact_upload_diagnostics.py --capture "$RUN/capture" --output "$DIR" \
-    --run-id "$(basename "$RUN")" $SEL --manifest "$DIR.manifest.json" --execute 2>&1 | tail -c 700 || true
+    --run-id "$(basename "$RUN")" $SEL --probes "$(python3 "$TOOLS" probes "$point")" --manifest "$DIR.manifest.json" --execute 2>&1 | tail -c 700 || true
   sleep 5; echo "usage after: $(spend)"
 done
 python3 "$TOOLS" summary "${DIRS[@]}" | tee "$OUT.summary.txt"

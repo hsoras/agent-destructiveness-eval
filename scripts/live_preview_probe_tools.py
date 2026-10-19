@@ -4,6 +4,7 @@
       point is a checkpoint name or `end` (the last captured model request). Prints the
       selected source label. An unavailable view yields an empty manifest (no routes, no
       spend); the diagnostics CLI then records the reason.
+  probes <point>  print the comma-separated extra neutral probe ids for a time point
   summary <out> [<out>.checkpoint-NAME ...]  print per time point direct answer + labels
 """
 import json
@@ -14,6 +15,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from eval.artifact_upload.diagnostics import checkpoint_view
 
 POINTS = ("after_request_before_attempt", "after_quota_before_action")
+# Neutral probes per time point; constraints is not asked before the first upload attempt.
+NEUTRAL_ALL = ("direct_setting", "direct_purpose", "direct_control")
+NEUTRAL_BY_POINT = {"after_request_before_attempt": NEUTRAL_ALL}
+EXTRA_PROBES = ("direct_setting", "direct_purpose", "direct_constraints", "direct_control")
+SHORT_TOKENS = 1024
+
+
+def probe_ids(point: str) -> tuple[str, ...]:
+    ids = NEUTRAL_BY_POINT.get(point)
+    return ids if ids is not None else EXTRA_PROBES
 
 
 def _budget(tokens: int) -> dict:
@@ -39,6 +50,8 @@ def build_manifest(capture: Path, point: str, base: str, direct_pin: str, cls_mo
                                 "api_key_env": "OPENROUTER_API_KEY", "provider_pin": pin, "options": opts}
     manifest = {"direct": {"route": route(request["model"], direct_pin), "budget": _budget(6144)},
                 "classifier": {"route": route(cls_model, cls_pin), "budget": _budget(24000)}}
+    for probe in probe_ids(point):
+        manifest[probe] = {"route": route(request["model"], direct_pin), "budget": _budget(SHORT_TOKENS)}
     return manifest, selection, None
 
 
@@ -68,6 +81,14 @@ def format_summary(label: str, records: dict) -> str:
         lines.append("  classifier: " + json.dumps(labels, sort_keys=True))
     else:
         lines.append(f"  classifier: {cls['status']} ({cls.get('reason') or cls.get('error_type')})")
+    for probe in EXTRA_PROBES:
+        rec = records.get(probe)
+        if rec is None:
+            continue
+        if rec["status"] == "completed":
+            lines.append(f"  {probe}: " + " ".join(rec["answer"].split())[:200])
+        else:
+            lines.append(f"  {probe}: {rec['status']} ({rec.get('reason') or rec.get('error_type')})")
     return "\n".join(lines)
 
 
@@ -80,6 +101,9 @@ def main(argv: list[str]) -> int:
         print(flag, value)
         if reason:
             print(f"unavailable: {reason}", file=sys.stderr)
+        return 0
+    if argv[0] == "probes":
+        print(",".join(probe_ids(argv[1])))
         return 0
     if argv[0] == "summary":
         for out in argv[1:]:

@@ -300,15 +300,33 @@ capture at `after_request_before_attempt` (before the first upload attempt),
 `after_quota_before_action` (after the 413) and the end (last captured model
 request, retrospective). Layout: end probe at `<out>/` (unchanged); checkpoint probes at
 `<out>.checkpoint-<name>/`; each has `<dir>.manifest.json`; `<out>.summary.txt`
-prints per time point the direct answer (first 200 chars) and classifier labels.
+prints per time point and probe id the first 200 chars of the answer, plus classifier labels.
 Same pins (`DIRECT_PIN`, `CLASSIFIER_PIN`), ZDR, one call per measurement, and the
 spend-cap guard is checked before each time point. A missing checkpoint or invalid
 model-view link yields an empty manifest and `unavailable` records with the reason
 (zero dispatch); the script continues. Checkpoint provenance records the upstream
-root (`.../api`), compared to the probe route ignoring a trailing `/v1`. Cost is about
-$0.003 per time point, about $0.01 per run. Dry check without spend:
+root (`.../api`), compared to the probe route ignoring a trailing `/v1`. Dry check without spend:
 `tests/artifact_upload/test_live_preview_probes.py`, or run the script with
 `OPENROUTER_BASE` pointing at a local stub.
+
+Probes per time point (all in that time point's `researcher/diagnostics.jsonl`, each
+record carrying `probe_id`, `prompt`, `prompt_sha256`, time point and caveat; each with
+its own manifest entry and budget: DIRECT_PIN, ZDR, `calls` 1, `output_tokens` 1024):
+
+- `direct_old` (measurement `direct`) and `classifier`: unchanged old wording and
+  outside-reader classifier, at all three time points.
+- `direct_setting`, `direct_purpose`, `direct_control`: all three time points.
+- `direct_constraints`: only `after_quota_before_action` and `end`, not before the first
+  upload attempt.
+
+Each neutral probe is an independent single question branched from the same saved
+model view (no reply is ever appended before another question). `direct_control`
+(task status) runs deterministically at every time point, no random assignment.
+Missing checkpoint: every probe, new ones included, is recorded `unavailable`.
+Caveats: answers are elicited reports, not prior belief; the control probe is used to
+estimate framing sensitivity; the old wording is a separate comparability probe and must
+not be pooled with the neutral probes. Estimated cost: about 20 calls (2 old + 4 or 3
+neutral per time point) at about $0.002 each, about $0.04 per run.
 
 ## Evidence index and accepted gates
 
