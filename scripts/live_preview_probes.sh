@@ -1,5 +1,11 @@
 #!/bin/bash
-# Live-preview probes: direct answer + classifier against one saved capture.
+# Live-preview probes: direct answer + classifier against one saved capture, at three
+# time points: checkpoint after_request_before_attempt, checkpoint
+# after_quota_before_action, and the end (last captured model request).
+# Layout: end probe at <out> (unchanged); checkpoint probes at
+# <out>.checkpoint-<name>/; each with its own <dir>.manifest.json; summary printed and
+# written to <out>.summary.txt. A missing/invalid checkpoint is recorded as
+# unavailable (no spend) and the script continues.
 #
 # usage: scripts/live_preview_probes.sh <run_dir (live-*/live-*)> <out_dir>
 #
@@ -41,26 +47,31 @@ spend() {
   curl -s -H "Authorization: Bearer $OPENROUTER_API_KEY" "$OPENROUTER_BASE/key" \
     | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['usage'])"
 }
-u="$(spend)"; echo "usage before: $u"
-python3 -c "import sys; sys.exit(0 if float('$u')<float('$SPEND_CAP_USD') else 1)" \
-  || { echo "over spend guard ($SPEND_CAP_USD)"; exit 1; }
+TOOLS="$REPO_DIR/scripts/live_preview_probe_tools.py"
+POINTS="after_request_before_attempt after_quota_before_action end"
+DIRS=()
 
-# Build the manifest from the last captured model request so the direct probe
-# repeats the original model and provider; the classifier uses its own route.
-EV="$(python3 - "$RUN" "$OUT" "$OPENROUTER_BASE" "$DIRECT_PIN" "$CLASSIFIER_MODEL" "$CLASSIFIER_PIN" <<'PY'
-import json,sys
-run,out,base,direct_pin,cls_model,cls_pin=sys.argv[1:7]
-rows=[json.loads(l) for l in open(run+'/capture/researcher/model_views.jsonl')]
-last=rows[-1]; req=last['payload']['request']
-opts={"prompt_cache_key":req["prompt_cache_key"],"usage":{"include":True}}
-direct_route={"model":req["model"],"version":"unknown-live-preview","base_url":base,"api_key_env":"OPENROUTER_API_KEY","provider_pin":direct_pin,"options":opts}
-route={"model":cls_model,"version":"unknown-live-preview","base_url":base,"api_key_env":"OPENROUTER_API_KEY","provider_pin":cls_pin,"options":opts}
-b=lambda t:{"calls":1,"output_tokens":t,"timeout_seconds":240,"request_bytes":6291456,"response_bytes":1048576}
-json.dump({"direct":{"route":direct_route,"budget":b(6144)},"classifier":{"route":route,"budget":b(24000)}},open(out+".manifest.json","w"),indent=1)
-print(last["event_id"])
-PY
-)"
-rm -rf "$OUT"
-"$PYTHON" scripts/artifact_upload_diagnostics.py --capture "$RUN/capture" --output "$OUT" \
-  --run-id "$(basename "$RUN")" --retrospective-event "$EV" --manifest "$OUT.manifest.json" --execute 2>&1 | tail -c 700
-sleep 5; echo "usage after: $(spend)"
+guard() {
+  u="$(spend)"; echo "usage before: $u"
+  python3 -c "import sys; sys.exit(0 if float('$u')<float('$SPEND_CAP_USD') else 1)" \
+    || { echo "over spend guard ($SPEND_CAP_USD)"; return 1; }
+}
+
+for point in $POINTS; do
+  if [ "$point" = end ]; then DIR="$OUT"; else DIR="$OUT.checkpoint-$point"; fi
+  DIRS+=("$DIR")
+  echo "--- $point -> $DIR"
+  guard || { echo "stopping: spend guard"; break; }
+  # Manifest repeats the original model/provider for the direct probe; the classifier
+  # uses its own route. An unavailable checkpoint gets an empty manifest (zero dispatch).
+  SEL="$(python3 "$TOOLS" manifest "$RUN" "$point" "$DIR.manifest.json" "$OPENROUTER_BASE" \
+          "$DIRECT_PIN" "$CLASSIFIER_MODEL" "$CLASSIFIER_PIN")" \
+    || { echo "manifest failed for $point; skipping"; continue; }
+  rm -rf "$DIR"
+  # Non-zero exit just means a measurement was unavailable/limited/error; keep going.
+  # shellcheck disable=SC2086
+  "$PYTHON" scripts/artifact_upload_diagnostics.py --capture "$RUN/capture" --output "$DIR" \
+    --run-id "$(basename "$RUN")" $SEL --manifest "$DIR.manifest.json" --execute 2>&1 | tail -c 700 || true
+  sleep 5; echo "usage after: $(spend)"
+done
+python3 "$TOOLS" summary "${DIRS[@]}" | tee "$OUT.summary.txt"

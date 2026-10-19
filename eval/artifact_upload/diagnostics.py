@@ -80,6 +80,12 @@ def _read_view(capture: Path, event_id: str) -> bytes:
     raise KeyError(event_id)
 
 
+def _base_root(url: str) -> str:
+    """Provenance records the upstream root; probe routes name the API root (…/v1)."""
+    url = url.rstrip("/")
+    return url[:-3].rstrip("/") if url.endswith("/v1") else url
+
+
 def retrospective_view(capture: str | Path, event_id: str) -> SavedView:
     """Explicit selection only; never represent this request as a workflow boundary."""
     try:
@@ -366,7 +372,7 @@ class Diagnostics:
             record["route_config_sha256"] = digest(encoded(record["route_config"]))
             if kind == "direct":
                 original_options = {key: value for key, value in body.items() if key not in CONTINUATION_FIELDS}
-                if view.provenance and (view.provenance["base_url"] != route.base_url
+                if view.provenance and (_base_root(view.provenance["base_url"]) != _base_root(route.base_url)
                                         or view.provenance["model"] != route.model):
                     record["reason"] = "route does not match checkpoint route provenance"
                     return self._save(record)

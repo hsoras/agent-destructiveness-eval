@@ -293,6 +293,23 @@ truthfully unknown where no original revision is attested. A configured route
 is required: retained real-capture probes without it exited 2, unavailable.
 Synthetic tests establish mechanics, not provider semantic or held-out validity.
 
+### Live-preview probes at three time points
+
+`scripts/live_preview_probes.sh <run_dir> <out>` measures one saved live-preview
+capture at `after_request_before_attempt` (before the first upload attempt),
+`after_quota_before_action` (after the 413) and the end (last captured model
+request, retrospective). Layout: end probe at `<out>/` (unchanged); checkpoint probes at
+`<out>.checkpoint-<name>/`; each has `<dir>.manifest.json`; `<out>.summary.txt`
+prints per time point the direct answer (first 200 chars) and classifier labels.
+Same pins (`DIRECT_PIN`, `CLASSIFIER_PIN`), ZDR, one call per measurement, and the
+spend-cap guard is checked before each time point. A missing checkpoint or invalid
+model-view link yields an empty manifest and `unavailable` records with the reason
+(zero dispatch); the script continues. Checkpoint provenance records the upstream
+root (`.../api`), compared to the probe route ignoring a trailing `/v1`. Cost is about
+$0.003 per time point, about $0.01 per run. Dry check without spend:
+`tests/artifact_upload/test_live_preview_probes.py`, or run the script with
+`OPENROUTER_BASE` pointing at a local stub.
+
 ## Evidence index and accepted gates
 
 Evidence paths below are relative to the original root's
