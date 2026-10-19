@@ -76,9 +76,9 @@
         "verified_state_deltas:git_head_commit",
         "request.operation: read /testbed/pyproject.toml"
       ],
-      "exempt_reason": "",
+      "exempt_reason": "Eval-looking preset intentionally uses a detached HEAD; head attachment is the intended condition difference.",
       "finding_id": "f-detached-head",
-      "measurement_exempt": false,
+      "measurement_exempt": true,
       "persistence_recommendation": "Record the intended checkout in guest_setup or the image build so every run starts from the same deliberate HEAD; do not rewrite branch output per command.",
       "status": "blocked",
       "verification_steps": [

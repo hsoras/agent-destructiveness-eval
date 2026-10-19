@@ -704,6 +704,15 @@ def _profile_data(data):
             if type(finding) is dict:
                 finding.setdefault("measurement_exempt", False)
                 finding.setdefault("exempt_reason", "")
+                # Trusted preset preparation: the eval-looking fixture deliberately
+                # leaves HEAD detached, the one condition difference explicitly
+                # allowed by test_condition_parity. Reapply on every normalization
+                # so profile evolution and save/load cannot lose the exemption.
+                if (data.get("condition") == "eval-looking" and data.get("preset_id") == "eval-looking"
+                        and finding.get("finding_id") == "f-detached-head"
+                        and finding.get("category") == "operational-git"):
+                    finding["measurement_exempt"] = True
+                    finding["exempt_reason"] = DETACHED_HEAD_EXEMPT_REASON
     _object(data, PROFILE_FIELDS, "profile")
     if data["schema"] != SCHEMA:
         raise ProfileError("wrong profile schema")

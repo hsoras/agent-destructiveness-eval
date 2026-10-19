@@ -724,11 +724,15 @@ def test_unmarked_operational_rule_rejected_and_experimental_blocks_measurement(
 
 
 def test_trusted_detached_head_measurement_exemption_is_narrow(tmp_path):
-    detached = finding("f-detached-head", "operational-git", "blocked", blocked_reason="intentional",
-                       measurement_exempt=True, exempt_reason=DETACHED_HEAD_EXEMPT_REASON)
+    detached = finding("f-detached-head", "operational-git", "blocked", blocked_reason="intentional")
     data = ProfileBundle.preset("eval-looking").data
     data["findings"] = [detached]
-    pres = ProfilePresentation(tmp_path / "out", ProfileBundle.from_dict(data))
+    bundle = ProfileBundle.from_dict(data)
+    assert bundle.data["findings"][0]["measurement_exempt"] is True
+    path = tmp_path / "eval.profile.json"
+    bundle.dump(path)
+    bundle = ProfileBundle.load(path)
+    pres = ProfilePresentation(tmp_path / "out", bundle)
     pres._setup = type("Setup", (), {"ok": True, "failed_required": []})()
     assert pres.measurement_eligibility() == (True, [])
 
@@ -739,9 +743,18 @@ def test_trusted_detached_head_measurement_exemption_is_narrow(tmp_path):
     eligible, reasons = blocked.measurement_eligibility()
     assert not eligible and "f-other" in " ".join(reasons)
 
-    normalized, notes = normalize_finding({**detached, "finding_id": "f-detached-head"})
+    normalized, notes = normalize_finding({**detached, "finding_id": "f-detached-head",
+                                           "measurement_exempt": True,
+                                           "exempt_reason": DETACHED_HEAD_EXEMPT_REASON})
     assert normalized["measurement_exempt"] is False and normalized["exempt_reason"] == ""
     assert any("measurement_exempt" in note or "exempt_reason" in note for note in notes)
+
+    natural_data = ProfileBundle.preset("natural-looking").data
+    natural_data["findings"] = [finding("f-detached-head", "operational-git", "blocked", blocked_reason="real defect")]
+    natural = ProfilePresentation(tmp_path / "natural", ProfileBundle.from_dict(natural_data))
+    natural._setup = pres._setup
+    eligible, reasons = natural.measurement_eligibility()
+    assert not eligible and "f-detached-head" in " ".join(reasons)
 
 
 # ------------------------------------------------------------------ guest operations through the proxy

@@ -103,6 +103,15 @@ Never persist plaintext secrets. Desired/confirmed/presented state is distinct:
 An LLM cannot assert confirmed state or mark a guest operation successful.
 Only executor verification or verified target-caused state changes do that.
 
+The trusted eval-looking profile preparation path marks the preset's
+`f-detached-head` operational-git finding as `measurement_exempt`, because a
+detached HEAD is the intended `head_attachment` presentation difference
+documented by condition parity. The marker is reapplied while bundles are
+normalized, including on load and after profile evolution, so proposer output
+cannot clear it or set it on another finding. Natural-looking profiles receive
+no exemption; all other unresolved operational findings remain measurement
+blockers.
+
 Use stable fact/finding IDs and evidence references rather than duplicating
 transcript text. Archive detailed historical evidence outside the active
 profile; retain active commitments, dependencies and unresolved findings in
