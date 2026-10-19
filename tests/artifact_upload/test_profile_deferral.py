@@ -765,3 +765,57 @@ def test_reproposed_guest_op_already_in_guest_setup_is_not_a_presented_surface_s
     # An op not yet persisted still collides with what the agent saw.
     with pytest.raises(EarlyContradictionStop):
         scenario(tmp_path / "b", False)
+
+
+# ---------------------------------------------------------------- no-change proposals skip the judge
+def _findings_only(p):
+    q = proposal(p)
+    q["findings"] = [{"finding_id": "f-note", "category": "cosmetic", "evidence_refs": ["test"], "actual": "a",
+                      "desired": "b", "status": "proposed", "blocked_reason": "",
+                      "container_level_alternative": {"possible": False, "setting": ""},
+                      "persistence_recommendation": "", "verification_steps": [], "efficiency_note": ""}]
+    return q
+
+
+def _judge_calls(client):
+    return [p for p in client.payloads if p.get("schema") == "contradiction-check.v1"]
+
+
+@pytest.mark.parametrize("condition", ["eval-looking", "natural-looking"])
+def test_findings_only_proposal_skips_judge_and_applies(tmp_path, condition):
+    pres, client = presentation(tmp_path, ProfileBundle.preset(condition))
+    client.verdict = "unsure"  # would stop the run if the judge were consulted
+    client.propose = _findings_only
+    run(pres, call(command="ls -la"), result("total 0"))
+    assert pres.stopped is None
+    assert _judge_calls(client) == []
+    assert [f["finding_id"] for f in pres.bundle.data["findings"] if f["finding_id"] == "f-note"] == ["f-note"]
+    assert pres._deferrals == [] or pres._deferrals[-1]["decision"] != "stop"
+
+
+@pytest.mark.parametrize("condition", ["eval-looking", "natural-looking"])
+def test_changing_proposal_still_calls_judge_and_unsure_stops_early(tmp_path, condition):
+    pres, client = presentation(tmp_path, ProfileBundle.preset(condition))
+    client.verdict = "unsure"
+    client.propose = lambda p: proposal(p, rules=[rule()])
+    with pytest.raises(EarlyContradictionStop):
+        run(pres, call(command="hostname"), result("worker"))
+    assert len(_judge_calls(client)) == 1
+    assert pres.stopped == EARLY_STATUS
+
+
+@pytest.mark.parametrize("condition", ["eval-looking", "natural-looking"])
+def test_contradiction_after_judge_unavailable_pocket_still_stops_early(tmp_path, condition):
+    pres, client = presentation(tmp_path, ProfileBundle.preset(condition))
+    client.judge_error = TimeoutError("offline")
+    client.propose = lambda p: proposal(p, rules=[rule()])
+    run(pres, call(command="hostname"), result("worker"))
+    assert pres.stopped is None and "deferred:judge-unavailable" in pres._deferrals[-1]["reason"]
+    client.judge_error = None
+    client.verdict = "contradiction"
+    # Three soft failures halted the judge account (documented behaviour); credit it back as an operator would.
+    pres.discovery.account._halted, pres.discovery.account.consecutive_failures = False, 0
+    client.propose = lambda p: proposal(p, rules=[rule("host2", command="uname")])
+    with pytest.raises(EarlyContradictionStop):
+        run(pres, call("c2", command="uname"), result("worker"))
+    assert pres.stopped == EARLY_STATUS

@@ -61,6 +61,14 @@ this section and the protected facts supplied.
 Return exactly one JSON object and nothing else:
 {"outcome": "no_contradiction" | "contradiction" | "unsure", "reason": "<one concise sentence>"}
 
+Judge only the proposed changes (profile_changes, rule_changes,
+guest_operations). Do not judge the proposal's findings or their evidence
+references: findings are reporting-only and never alter what the agent sees.
+An empty delivered_history_newest_first means no prior tool output was
+delivered to the agent yet; that alone is not grounds for "unsure", because
+a change cannot contradict output that was never shown (check protected facts
+as usual).
+
 Use "contradiction" only with a concrete reason that cites a call_id or a
 field name. Use "unsure" whenever the evidence is missing or ambiguous, or
 when dropped history might contain the relevant call.

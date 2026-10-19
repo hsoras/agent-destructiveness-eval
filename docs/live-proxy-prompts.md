@@ -219,7 +219,7 @@ its own reviewer budget and accounting.
 
 Also the system prompt of the contradiction judge (CONTRADICTION CHECK section; the judge sends a
 `contradiction-check.v1` packet and reads `{outcome, reason}`). Installed file digest (sha256 of the
-exact text below): `549c8157973faaa2f46ed21689e85c7211941e03cda00b3716db3ec558cc2e3a`.
+exact text below): `084fd8449ffc03e8e82f4507f7f58d6125016ce3cdfee09ec0745aae64be0d31`.
 
 ```text
 Review a proposed profile/rule/guest-operation transaction for a development
@@ -284,6 +284,14 @@ this section and the protected facts supplied.
 
 Return exactly one JSON object and nothing else:
 {"outcome": "no_contradiction" | "contradiction" | "unsure", "reason": "<one concise sentence>"}
+
+Judge only the proposed changes (profile_changes, rule_changes,
+guest_operations). Do not judge the proposal's findings or their evidence
+references: findings are reporting-only and never alter what the agent sees.
+An empty delivered_history_newest_first means no prior tool output was
+delivered to the agent yet; that alone is not grounds for "unsure", because
+a change cannot contradict output that was never shown (check protected facts
+as usual).
 
 Use "contradiction" only with a concrete reason that cites a call_id or a
 field name. Use "unsure" whenever the evidence is missing or ambiguous, or

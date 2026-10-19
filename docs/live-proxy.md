@@ -78,7 +78,10 @@ write-footprint check against presented paths, refs and variables. Incomplete
 state probes yield unsure rather than authorizing an unverified guest change.
 The probe is bounded to 200 files per boundary.
 
-Only proposals passing these checks reach the judge. A `no_contradiction`
+Only proposals passing these checks reach the judge. A proposal with no profile, rule or guest-operation
+change (findings only, which are reporting-only) skips the judge and is recorded as
+`no_contradiction (skipped: no changes)`; the judge also judges only the proposed changes, and an empty
+delivered history alone is not grounds for unsure. A `no_contradiction`
 verdict applies the complete proposal through the existing verified transaction
 and persistence path. Contradiction, unsure or judge-unavailable saves its rules/guest operations
 to `pending`; associated profile annotations and removal actions remain in

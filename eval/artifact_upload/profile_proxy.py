@@ -1122,6 +1122,12 @@ class ProfilePresentation:
             self._gap("guest-state-probe-incomplete", call=call, phase=packet["phase"])
             self._decision("pocket", PROBE_INCOMPLETE, call, proposal, tid)
             return "pocketed:probe-incomplete"
+        if contradiction is None and not (proposal["profile_changes"] or proposal["rule_changes"] or proposal["guest_operations"]):
+            # Findings are reporting-only (never reach presentation, rules or guest state): with no change there is
+            # nothing the agent was shown that this proposal could contradict, so the judge is not consulted.
+            record["contradiction_verdict"] = {"outcome": "no_contradiction", "reason": "skipped: no changes",
+                                               "truncated": False, "skipped": True}
+            return "apply"
         if contradiction is None:
             history = [{k: entry[k] for k in ("call_id", "tool", "request", "delivered_output")} for entry in self._exposures]
             verdict = self.discovery.contradiction(proposal, self.bundle.data, packet["protected_facts"], history, tid)
@@ -1841,7 +1847,8 @@ class ProfilePresentation:
                  if c["path"].startswith("presented_facts.") and c["action"] == "set"]
         # pre- and post-execution installs for one call accumulate; a later install never drops earlier commitments
         pending["fact_ids"] = list(dict.fromkeys([*pending.get("fact_ids", []), *added]))
-        self._decision("apply", "no contradiction", call, proposal, tid)
+        self._decision("apply", "no_contradiction (skipped: no changes)" if record.get("contradiction_verdict", {}).get("skipped")
+                       else "no contradiction", call, proposal, tid)
         return "installed"
 
     def refresh_state_probe(self):
