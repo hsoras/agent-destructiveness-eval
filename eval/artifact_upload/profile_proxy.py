@@ -95,10 +95,12 @@ EXPOSURE_FILE = "exposure-log.jsonl"
 DEFERRAL_FILE = "deferred-changes.jsonl"
 EARLY_STATUS = "stopped:early-contradiction"
 EARLY_MAX_CALLS = 8
-# Per-tool proxy time must stay well under the bridge client's patience (observed ~264 s; the router's fetch has no
-# explicit timeout). Proposer and judge run sequentially inside one tool call, so they share one deadline.
-PROXY_DEADLINE_SECONDS = 150.0  # aggregate proposer + judge (+ reviewer) time per tool call
-PROPOSER_CAP_SECONDS = 120.0    # per proposer call
+# Per-tool proxy time must stay under the bridge client's patience. An earlier run saw the router's fetch give up
+# after ~264 s (runtime default); router.ts now disables the client-side fetch timeout for bridge calls
+# (BRIDGE_FETCH_TIMEOUT_MS there), so the bound is this deadline, not the runtime default.
+# Proposer and judge run sequentially inside one tool call, so they share one deadline.
+PROXY_DEADLINE_SECONDS = 300.0  # aggregate proposer + judge (+ reviewer) time per tool call
+PROPOSER_CAP_SECONDS = 240.0    # per proposer call
 JUDGE_CAP_SECONDS = 30.0        # per reviewer/judge call
 MIN_CALL_SECONDS = 5.0          # below this much remaining time a call is not started (soft failure, coverage gap)
 JUDGE_UNAVAILABLE = "deferred:judge-unavailable"
@@ -459,7 +461,8 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
             return mine
         other = self.account.usage()
         total = dict(mine)
-        for key in ("calls", "reserved_cost_usd", "reported_cost_usd", "unaccounted_calls", "aux_seconds", "aux_soft_failures"):
+        for key in ("calls", "reserved_cost_usd", "reported_cost_usd", "unaccounted_calls", "aux_seconds", "aux_soft_failures",
+                    "no_reply_calls", "usable_reply_calls"):
             total[key] = mine.get(key, 0) + other.get(key, 0)
         total["halted"] = bool(mine["halted"] or other["halted"])
         total["accounts"] = {"proposer": mine, "reviewer": other}
@@ -516,7 +519,7 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
             targets.append(("reviewer", self.account, receipt["reviewer"], self.original_reviewer_budget))
         prepared = []
         fields = {"calls": "_calls", "reserved_cost_usd": "_reserved", "reported_cost_usd": "_actual",
-                  "unaccounted_calls": "_unaccounted", "aux_seconds": "aux_seconds",
+                  "unaccounted_calls": "_unaccounted", "aux_seconds": "aux_seconds", "no_reply_calls": "_no_reply",
                   "aux_soft_failures": "soft_failures", "consecutive_failures": "consecutive_failures"}
         for name, account, budget_data, original in targets:
             saved = accounts.get(name)
@@ -525,7 +528,7 @@ class ProfileDiscovery(_LenientParse, _Timed, LiveDiscovery):
             values = {}
             for key, attr in fields.items():
                 value = saved.get(key, 0)
-                integer = key in {"calls", "unaccounted_calls", "aux_soft_failures", "consecutive_failures"}
+                integer = key in {"calls", "unaccounted_calls", "aux_soft_failures", "consecutive_failures", "no_reply_calls"}
                 if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
                         or (integer and type(value) is not int)):
                     raise ValueError("invalid restored usage: " + key)
@@ -1554,7 +1557,8 @@ class ProfilePresentation:
         if not ok:
             return self._gap("observation-excluded", call=call, phase=phase, reason=why)
         if staged is None and self.discovery.exhausted():
-            return self._gap("llm-coverage-stopped", call=call, phase=phase, reason="auxiliary budget exhausted or halted")
+            stop = self.discovery.stop_reason() or "halted"  # usable-reply-cap | attempt-cap | cost-cap | consecutive-failures | halted
+            return self._gap("llm-coverage-stopped", call=call, phase=phase, reason="auxiliary stopped: " + stop, stop_reason=stop)
         rendered = None
         if result is not None:
             rendered, _ = self.render(self.bundle, call, result)
@@ -1609,7 +1613,8 @@ class ProfilePresentation:
         except Exception as exc:  # noqa: BLE001 - stale/invalid/unsupported: installed bundle untouched
             outcome = "rejected:%s: %s" % (type(exc).__name__, redact(str(exc)))
             if isinstance(exc, ValueError) and "budget" in str(exc):
-                self._gap("llm-coverage-stopped", call=call, phase=phase, reason="budget")
+                self._gap("llm-coverage-stopped", call=call, phase=phase, reason=str(exc)[:120],
+                          stop_reason=(self.discovery.stop_reason() or "halted") if self.discovery is not None else "halted")
             elif isinstance(exc, ProfileError) or (proposal is not None and isinstance(exc, ValueError)):
                 issues.append(classify_error(exc))
         if self.discovery is not None:

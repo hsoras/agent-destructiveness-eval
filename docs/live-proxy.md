@@ -344,15 +344,31 @@ must provide it. Diagnostics manifests use `route.provider_pin`. Recommended
 low-cost pins: target `z-ai/glm-5.3-flash` with `inference-net/fp4`; proposer
 and probes `deepseek/deepseek-v4.1-flash` with `decart/fp4`. `--no-zdr`
 explicitly opts out of both ZDR and the pin requirement.
-- `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.03,
-  "pairs": 2, "seconds": 120, "output_tokens": 16384}`; its reviewer/judge account
+- `<proxy-budget.json>` proposer account: `{"cost_usd": 0.08, "max_call_cost_usd": 0.02,
+  "pairs": 4, "seconds": 240, "output_tokens": 16384}`; its reviewer/judge account
   has `{"cost_usd": 0.04, "max_call_cost_usd": 0.02, "pairs": 2}`. The combined
-  ceiling is $0.12 and each account's pair reservations fit its cost ceiling. `seconds` is the per-call
-  transport timeout (code default 120; proposer calls are capped at 120 and judge/reviewer calls at 30 per attempt). Proposer and judge
-  run sequentially inside one tool call, so they share a 150-second per-tool aggregate proxy deadline
-  (one 120 s proposer call plus a 30 s judge call; the bridge client gave up after roughly 264 s in an earlier run); tool execution time is not charged. A proposer call that times out with no reported usage is settled to an
+  ceiling stays $0.12 (run hard cap unchanged: target $0.45 + $0.12). `pairs` bounds USABLE replies (2*pairs = 8 here).
+  A call that returns no reply (timeout/transport failure) does not use that allowance; independent guards bound it:
+  `max_attempts` (optional; default 3*pairs = 12 dispatched calls), three consecutive soft failures, the
+  cost cap (`cost_usd`; a call is refused unless `reserved + max_call_cost_usd <= cost_usd`, so with realized
+  ~$0.005-0.01/call the cost cap binds first, near 8-10 attempts), and the per-tool deadline. `max_call_cost_usd` is
+  only the pre-dispatch reservation (the largest request, ~55 KB in + 16384 out, prices at ~$0.015), so it is
+  $0.02 rather than $0.03 to leave room for more calls inside $0.08; no spend limit was raised.
+  When discovery stops, the coverage gap `llm-coverage-stopped` carries a machine-readable `stop_reason`
+  (`usable-reply-cap`, `attempt-cap`, `cost-cap`, `consecutive-failures`, `halted`); the same value is
+  `usage.stop_reason` along with `no_reply_calls` / `usable_reply_calls`. `seconds` is the per-call
+  transport timeout (code default 240; proposer calls are capped at 240 and judge/reviewer calls at 30 per attempt).
+  Proposer and judge run sequentially inside one tool call, so they share a 300-second per-tool aggregate proxy
+  deadline (one 240 s proposer call plus a 30 s judge call fits, with margin). The bridge client (router.ts `fetch`,
+  Bun) gave up after roughly 264 s in an earlier run; router.ts now disables that client timeout for bridge calls
+  (changing the staged runtime hash). Proxy wait counts against the `upload` stage `wall_seconds` ledger (3600 s) but
+  not the shell tool timeout, which only times command execution; total proxy wait is `usage.aux_seconds`.
+  Tool execution time is not charged to the proxy deadline. Telemetry for a no-reply call (diagnostics
+  `development_auxiliary_call.failure`): `elapsed_seconds`, `request_bytes`, `timeout_seconds`, `max_tokens`,
+  `no_reply`; the provider-side charge of a timed-out call is unknown (`provider_charge_known: false`). A proposer call that times out with no reported usage is settled to an
   input-only estimate (request bytes + 1024 at the model's input price, capped at the per-call reservation), not the
-  full reservation; the diagnostics record carries `cost_estimated`/`unaccounted` and usage reports `estimated_calls`. A call
+  full reservation; the diagnostics record carries `cost_estimated`/`unaccounted` and usage reports `estimated_calls`
+  (an estimate, not the true provider charge). A call
   gets `min(cap, time left)` seconds and is not started under 5 s left: that is a soft failure, logged as
   coverage gap `deadline`, and the tool result is delivered normally. A client disconnect during the reply is logged
   as `client_disconnected` and does not affect other calls. Three

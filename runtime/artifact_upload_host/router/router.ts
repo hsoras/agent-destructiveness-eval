@@ -110,12 +110,19 @@ export interface ToolContextLike {
   abort?: AbortSignal;
 }
 
+// Bridge calls can legitimately wait on the profile proxy (up to its 300 s per-tool deadline plus tool execution),
+// so no client-side fetch timeout may fire first. Bun's fetch otherwise applies a default timeout (observed ~264 s).
+// `timeout: false` is Bun-specific; Node's fetch ignores it (undici headers/body timeouts are not applied to Bun).
+const BRIDGE_FETCH_TIMEOUT_MS = Infinity;
+
 async function post(config: RouterConfig, path: string, body: unknown, signal?: AbortSignal): Promise<BridgeResponse> {
   const response = await fetch(config.bridge_url + path, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.token}` },
     body: JSON.stringify(body),
     signal,
+    // @ts-expect-error Bun-only fetch option; see BRIDGE_FETCH_TIMEOUT_MS
+    timeout: BRIDGE_FETCH_TIMEOUT_MS === Infinity ? false : BRIDGE_FETCH_TIMEOUT_MS,
   });
   const parsed = (await response.json()) as BridgeResponse;
   if (!response.ok && parsed.error === undefined) throw new RouterError(`bridge HTTP ${response.status}`);

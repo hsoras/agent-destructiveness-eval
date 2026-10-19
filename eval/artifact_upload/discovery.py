@@ -362,12 +362,30 @@ class DevelopmentDiscovery:
         self.source_batch_id = source_batch_id
         self._calls, self._reserved, self._actual, self._halted = 0, 0.0, 0.0, False
         self._unaccounted = 0
+        self._no_reply = 0  # attempts that returned no reply (timeout/transport); they do not use the usable-reply allowance
         self._estimated_calls = 0  # timeouts settled to an input-only estimate instead of the full reservation
         self._decisions, self._reviews, self._promoted = {}, {}, set()
 
     def usage(self):
         return {"account": "development_auxiliary", "calls": self._calls, "reserved_cost_usd": self._reserved,
                 "reported_cost_usd": self._actual, "unaccounted_calls": self._unaccounted, "halted": self._halted}
+
+    def attempt_cap(self) -> int:
+        """Hard bound on dispatched attempts (replies or not). Legacy budgets: 2*pairs; live budgets may set max_attempts."""
+        return getattr(self.budget, "max_attempts", None) or 2 * self.budget.pairs
+
+    def stop_reason(self):
+        """Machine-readable name of the guard that stops further calls, or None while calls are allowed.
+        One of: halted, consecutive-failures, usable-reply-cap, attempt-cap, cost-cap."""
+        if self._halted:
+            return getattr(self, "halt_reason", None) or "halted"
+        if self._calls - self._no_reply >= 2 * self.budget.pairs:
+            return "usable-reply-cap"
+        if self._calls >= self.attempt_cap():
+            return "attempt-cap"
+        if self._reserved + self.budget.max_call_cost_usd > self.budget.cost_usd + 1e-12:
+            return "cost-cap"
+        return None
 
     def _transport_halts(self, exc) -> bool:
         """Whether a failure with no reply stops discovery. Development: always (no retries, unknown charge)."""
@@ -405,8 +423,9 @@ class DevelopmentDiscovery:
             self._halted = True
             raise
         cap = self.budget.max_call_cost_usd
-        if self._halted or self._calls >= 2 * self.budget.pairs or self._reserved + cap > self.budget.cost_usd + 1e-12:
-            raise ValueError("development budget exhausted")
+        reason = self.stop_reason()
+        if reason is not None:
+            raise ValueError("development budget exhausted: " + reason)
         self._calls += 1
         self._reserved += cap  # failed/unknown calls retain the full reservation
         started, reply, status, failure = time.monotonic(), None, "failed", None
@@ -450,8 +469,14 @@ class DevelopmentDiscovery:
                            "cost_usd": known, "request_bytes": exc.request_bytes}
             elif reply is None:
                 self._unaccounted += 1
+                self._no_reply += 1
                 self._halted = self._halted or self._transport_halts(exc)
-                failure = {"error": type(exc).__name__ + ": " + str(exc)[:200]}
+                failure = {"error": type(exc).__name__ + ": " + str(exc)[:200], "no_reply": True,
+                           "elapsed_seconds": round(time.monotonic() - started, 3),
+                           "request_bytes": len(json.dumps(payload, default=str).encode()),
+                           "timeout_seconds": limits.get("seconds"), "max_tokens": limits.get("max_tokens"),
+                           # A timed-out call's provider-side charge is unknown; cost_estimated marks the input-only estimate.
+                           "provider_charge_known": False}
                 if isinstance(exc, TimeoutError) and client is not None and limits:
                     estimate = self._timeout_estimate(client, payload, limits)
                     if estimate is not None:  # release the unused output reservation; hard cap stays enforced

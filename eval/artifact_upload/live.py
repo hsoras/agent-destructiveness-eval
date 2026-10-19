@@ -12,7 +12,7 @@ Public API (the run wiring depends on exactly this)::
     presenter.final_rules() -> RuleSet ; presenter.events -> list[dict]
 
     # live mode: proposer LLM edits rules while the episode runs
-    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=30, seconds=120.0, output_tokens=16384)
+    budget = LiveBudget(cost_usd, max_call_cost_usd, pairs=30, seconds=240.0, output_tokens=16384)
     live = LivePresentation.create(out_dir, proposer=client, reviewer=client_or_None, budget=budget,
                                    ruleset=RuleSet|None, condition=None, degraded_output="raw")
     live.attach_recorder(recorder)    # RunRecorder; diagnostics stream; call before first present
@@ -197,15 +197,19 @@ class ScriptPresentation(_FrozenPreparation):
 @dataclass(frozen=True)
 class LiveBudget:
     """Same attribute names DevelopmentDiscovery._call reads; no 5-pair/10-second caps.
-    ``pairs`` = max proposer(+reviewer) pairs, i.e. at most 2*pairs auxiliary calls."""
+    ``pairs`` = max proposer(+reviewer) pairs, i.e. at most 2*pairs USABLE auxiliary replies. Calls that return no
+    reply (timeout/transport) do not use that allowance; they are bounded by ``max_attempts`` (default 3*pairs),
+    the consecutive-failure guard, the cost cap and the per-tool deadline."""
     cost_usd: float
     max_call_cost_usd: float = 0.03
     pairs: int = 30
-    seconds: float = 120.0  # per proposer call; profile proxy clamps to 120 and a 150 s per-tool aggregate deadline (bridge client patience ~264 s)
+    seconds: float = 240.0  # per proposer call; profile proxy clamps to 240 inside a 300 s per-tool aggregate deadline (router fetch has no timeout)
     output_tokens: int = 16384  # headroom for hidden reasoning tokens before the JSON
+    max_attempts: int | None = None  # dispatched calls incl. no-reply ones; None -> 3*pairs
 
     def __post_init__(self):
         if (type(self.pairs) is not int or self.pairs < 1 or type(self.output_tokens) is not int or self.output_tokens < 1
+                or (self.max_attempts is not None and (type(self.max_attempts) is not int or self.max_attempts < 1))
                 or any(type(x) not in (int, float) or not math.isfinite(x) or not x > 0
                        for x in (self.cost_usd, self.max_call_cost_usd, self.seconds))
                 or self.max_call_cost_usd > self.cost_usd):
@@ -383,6 +387,7 @@ class LiveDiscovery(DevelopmentDiscovery):
         self.recorder, self.budget = recorder or _BufferedRecorder(), budget
         self._calls, self._reserved, self._actual, self._halted, self._unaccounted = 0, 0.0, 0.0, False, 0
         self._estimated_calls = 0
+        self._no_reply = 0
         self._decisions, self._reviews, self._promoted = {}, {}, set()
         self.aux_seconds = 0.0
         self.soft_failures, self.consecutive_failures, self.last_soft_error = 0, 0, None
@@ -390,12 +395,12 @@ class LiveDiscovery(DevelopmentDiscovery):
 
     def usage(self):
         return {**super().usage(), "aux_seconds": self.aux_seconds, "aux_soft_failures": self.soft_failures,
-                "estimated_calls": self._estimated_calls,
+                "estimated_calls": self._estimated_calls, "no_reply_calls": self._no_reply,
+                "usable_reply_calls": self._calls - self._no_reply, "stop_reason": self.stop_reason(),
                 "consecutive_failures": self.consecutive_failures, "last_soft_error": self.last_soft_error}
 
     def exhausted(self) -> bool:
-        return (self._halted or self._calls >= 2 * self.budget.pairs or
-                self._reserved + self.budget.max_call_cost_usd > self.budget.cost_usd + 1e-12)
+        return self.stop_reason() is not None
 
     def _transport_halts(self, exc) -> bool:
         # Soft failures never halt on their own; _call halts after SOFT_HALT_AFTER in a row.
@@ -414,6 +419,7 @@ class LiveDiscovery(DevelopmentDiscovery):
             self.last_soft_error = {"class": type(exc).__name__, "message": redact(str(exc)), "seconds": seconds}
             if self.consecutive_failures >= SOFT_HALT_AFTER:
                 self._halted = True
+                self.halt_reason = "consecutive-failures"
             raise _SoftFailure(self.last_soft_error, self.consecutive_failures) from exc
         self.consecutive_failures = 0
         return reply

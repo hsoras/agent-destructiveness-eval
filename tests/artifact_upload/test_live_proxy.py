@@ -1,4 +1,5 @@
 """Live/script proxy with mocked aux clients; no paid model calls."""
+from dataclasses import replace
 import http.server
 import json
 import threading
@@ -475,7 +476,7 @@ def test_read_and_grep_never_sent_and_default_budget():
     b = Presented('x', False, {})
     assert not eligibility(call(op='read'), result(), b)[0] and not eligibility(call(op='grep'), result(), b)[0]
     lb = LiveBudget(1.0, .1)
-    assert (lb.max_call_cost_usd, lb.pairs, lb.seconds, lb.output_tokens) == (.1, 30, 120.0, 16384)
+    assert (lb.max_call_cost_usd, lb.pairs, lb.seconds, lb.output_tokens) == (.1, 30, 240.0, 16384)
     assert LiveBudget(cost_usd=1.0).max_call_cost_usd == .03
 
 
@@ -674,8 +675,8 @@ def test_estimate_never_exceeds_per_call_cap(tmp_path):
 
 def test_default_proxy_deadline_fits_proposer_plus_judge_under_bridge_patience():
     from eval.artifact_upload import profile_proxy as pp
-    assert pp.PROPOSER_CAP_SECONDS == 120.0 and pp.JUDGE_CAP_SECONDS == 30.0
-    assert pp.PROPOSER_CAP_SECONDS + pp.JUDGE_CAP_SECONDS <= pp.PROXY_DEADLINE_SECONDS < 264 * .6
+    assert pp.PROPOSER_CAP_SECONDS == 240.0 and pp.JUDGE_CAP_SECONDS == 30.0
+    assert pp.PROPOSER_CAP_SECONDS + pp.JUDGE_CAP_SECONDS <= pp.PROXY_DEADLINE_SECONDS == 300.0
 
 
 def test_proposer_not_started_when_aggregate_deadline_nearly_spent(tmp_path):
@@ -692,3 +693,51 @@ def test_proposer_not_started_when_aggregate_deadline_nearly_spent(tmp_path):
     window.open()
     clock.now = 148
     assert window.remaining() == pytest.approx(2)
+
+
+def test_no_reply_attempts_do_not_consume_usable_reply_allowance(tmp_path):
+    live = _timeout_live(tmp_path, fn=lambda p: TimeoutError('timed out'))
+    d = live.discovery
+    d.budget = replace(d.budget, pairs=1, max_attempts=6, cost_usd=1.0)  # 2 usable replies allowed
+    for i in range(2):  # two timeouts in a row (below SOFT_HALT_AFTER)
+        live.present(call(cid=str(i)), result(RAW.replace('100', '10%d' % i)))
+    assert d._calls == 2 and d._no_reply == 2 and d.stop_reason() is None and not d.exhausted()
+    u = d.usage()
+    assert u['no_reply_calls'] == 2 and u['usable_reply_calls'] == 0 and u['stop_reason'] is None
+
+
+def test_stop_reasons_are_exact(tmp_path):
+    live = _timeout_live(tmp_path, fn=lambda p: TimeoutError('timed out'))
+    d = live.discovery
+    base = d.budget
+    d.budget = replace(base, pairs=1, max_attempts=2, cost_usd=1.0)
+    d._calls, d._no_reply = 2, 0
+    assert d.stop_reason() == 'usable-reply-cap'
+    d._calls, d._no_reply = 2, 1
+    assert d.stop_reason() == 'attempt-cap'
+    d.budget = replace(base, pairs=5, max_attempts=50, cost_usd=base.max_call_cost_usd)
+    d._calls, d._no_reply, d._reserved = 1, 0, base.max_call_cost_usd
+    assert d.stop_reason() == 'cost-cap'
+    d._reserved = 0.0
+    d._halted, d.halt_reason = True, 'consecutive-failures'
+    assert d.stop_reason() == 'consecutive-failures'
+    d.halt_reason = None
+    assert d.stop_reason() == 'halted'
+
+
+def test_timeout_failure_records_telemetry(tmp_path):
+    live = _timeout_live(tmp_path, fn=lambda p: TimeoutError('timed out'))
+    live.present(call(cid='a'), result())
+    rows = [json.loads(line)['payload'] for path in (tmp_path / 'rec' / 'canonical-private').rglob('diagnostics.jsonl') for line in path.read_text().splitlines()]
+    diag = [r for r in rows if r.get('kind') == 'development_auxiliary_call']
+    assert diag, 'no auxiliary diagnostics found'
+    f = diag[-1]['failure']
+    assert f['no_reply'] is True and f['provider_charge_known'] is False and f['cost_estimated'] is True
+    assert f['request_bytes'] > 0 and f['elapsed_seconds'] >= 0 and f['timeout_seconds'] > 0 and f['max_tokens'] == 16384
+
+
+def test_live_budget_default_attempt_cap_is_bounded():
+    lb = LiveBudget(cost_usd=1.0)
+    assert lb.max_attempts is None
+    with pytest.raises(ValueError):
+        LiveBudget(cost_usd=1.0, max_attempts=0)

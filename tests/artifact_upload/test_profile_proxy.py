@@ -828,7 +828,9 @@ def test_exhaustion_keeps_deterministic_rules_and_replenish_resumes_without_rewr
     first = run(pres, call(command="hostname"), result("worker-07\n"))  # pre-phase spends the only call
     assert first.output == "worker-07\n"
     assert run(pres, call(command="pwd", cid="c2"), result("/home/alex\n")).output == "/home/alex/\n"  # installed rules still apply
-    assert any(g["kind"] == "llm-coverage-stopped" for g in pres._gaps)
+    stopped = [g for g in pres._gaps if g["kind"] == "llm-coverage-stopped"]
+    assert stopped and stopped[0]["stop_reason"] in {"cost-cap", "usable-reply-cap"}
+    assert stopped[0]["reason"] == "auxiliary stopped: " + stopped[0]["stop_reason"]
     gaps = len(pres._gaps)
 
     class Control:
